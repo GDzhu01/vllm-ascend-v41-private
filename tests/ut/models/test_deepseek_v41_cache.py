@@ -11,6 +11,7 @@ from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41MetadataBuilder,
     compressed_slot_mapping,
     gather_cache_rows,
+    pad_sparse_indices,
     scatter_cache,
     select_candidate_blocks,
     select_index_topk,
@@ -259,6 +260,13 @@ def test_index_topk_is_chronological_and_marks_unreachable_slots():
     assert selected.tolist() == [[0, 1, 2, -1]]
 
 
+def test_sparse_indices_are_padded_for_native_mla():
+    selected = torch.tensor([[2, 7], [1, -1]], dtype=torch.int32)
+    padded = pad_sparse_indices(selected, 4)
+    assert padded.shape == (2, 1, 4)
+    assert padded.tolist() == [[[2, 7, -1, -1]], [[1, -1, -1, -1]]]
+
+
 def test_state_metadata_keeps_original_token_slots(config, runtime):
     specs = collect_specs(runtime)
     spec = specs["model.layers.2.self_attn.compressor.state_cache"]
@@ -275,6 +283,8 @@ def test_state_metadata_keeps_original_token_slots(config, runtime):
     assert metadata.slot_mapping is slots
     assert metadata.compress_ratio == 1
     assert metadata.storage_block_size == 16
+    assert metadata.max_query_len == 2
+    assert metadata.max_seq_len == 17
 
 
 def test_actual_attention_parameter_ownership(config, runtime):

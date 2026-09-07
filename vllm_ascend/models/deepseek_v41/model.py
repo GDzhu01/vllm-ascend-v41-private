@@ -80,10 +80,12 @@ class DeepseekV41SharedAttentionState:
     def __init__(self):
         self.topk_indices = None
         self.candidates = None
+        self.smla_metadata = {}
 
     def reset(self):
         self.topk_indices = None
         self.candidates = None
+        self.smla_metadata.clear()
 
 
 def _as_int_tuple(config: Any, name: str) -> tuple[int, ...]:

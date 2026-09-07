@@ -306,6 +306,77 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_meta(
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(output, softmax_max, softmax_sum);
 }
 
+at::Tensor npu_sparse_flash_mla_metadata_meta(
+    int64_t num_heads_q, int64_t num_heads_kv, int64_t head_dim,
+    const c10::optional<at::Tensor> &cu_seqlens_q,
+    const c10::optional<at::Tensor> &cu_seqlens_ori_kv,
+    const c10::optional<at::Tensor> &cu_seqlens_cmp_kv,
+    const c10::optional<at::Tensor> &seqused_q,
+    const c10::optional<at::Tensor> &seqused_ori_kv,
+    const c10::optional<at::Tensor> &seqused_cmp_kv,
+    const c10::optional<at::Tensor> &cmp_residual_kv,
+    const c10::optional<at::Tensor> &ori_topk_length,
+    const c10::optional<at::Tensor> &cmp_topk_length,
+    int64_t batch_size, int64_t max_seqlen_q,
+    int64_t max_seqlen_ori_kv, int64_t max_seqlen_cmp_kv,
+    int64_t ori_topk, int64_t cmp_topk, int64_t cmp_ratio,
+    int64_t ori_mask_mode, int64_t cmp_mask_mode,
+    int64_t ori_win_left, int64_t ori_win_right,
+    c10::string_view layout_q, c10::string_view layout_kv,
+    bool has_ori_kv, bool has_cmp_kv)
+{
+    return at::empty({1024}, at::TensorOptions().dtype(at::kInt).device(c10::kMeta));
+}
+
+std::tuple<at::Tensor, at::Tensor> npu_sparse_flash_mla_meta(
+    const at::Tensor &q,
+    const c10::optional<at::Tensor> &ori_kv,
+    const c10::optional<at::Tensor> &cmp_kv,
+    const c10::optional<at::Tensor> &ori_sparse_indices,
+    const c10::optional<at::Tensor> &cmp_sparse_indices,
+    const c10::optional<at::Tensor> &ori_block_table,
+    const c10::optional<at::Tensor> &cmp_block_table,
+    const c10::optional<at::Tensor> &cu_seqlens_q,
+    const c10::optional<at::Tensor> &cu_seqlens_ori_kv,
+    const c10::optional<at::Tensor> &cu_seqlens_cmp_kv,
+    const c10::optional<at::Tensor> &seqused_q,
+    const c10::optional<at::Tensor> &seqused_ori_kv,
+    const c10::optional<at::Tensor> &seqused_cmp_kv,
+    const c10::optional<at::Tensor> &cmp_residual_kv,
+    const c10::optional<at::Tensor> &ori_topk_length,
+    const c10::optional<at::Tensor> &cmp_topk_length,
+    const c10::optional<at::Tensor> &sinks,
+    const c10::optional<at::Tensor> &metadata,
+    double softmax_scale, int64_t cmp_ratio, int64_t ori_mask_mode,
+    int64_t cmp_mask_mode, int64_t ori_win_left, int64_t ori_win_right,
+    c10::string_view layout_q, c10::string_view layout_kv,
+    int64_t topk_value_mode, bool return_softmax_lse)
+{
+    auto output = at::empty_symint(q.sym_sizes(), q.options().device(c10::kMeta));
+    if (!return_softmax_lse) {
+        auto lse = at::empty_symint({c10::SymInt(0)},
+                                    q.options().dtype(at::kFloat).device(c10::kMeta));
+        return {output, lse};
+    }
+
+    TORCH_CHECK(ori_kv.has_value() || cmp_kv.has_value(),
+                "ori_kv or cmp_kv is required when return_softmax_lse is true");
+    const auto &kv = ori_kv.has_value() ? ori_kv.value() : cmp_kv.value();
+    const auto layout_q_str = std::string(layout_q);
+    const auto layout_kv_str = std::string(layout_kv);
+    const auto kv_heads = layout_kv_str == "TND" ? kv.sym_size(1) : kv.sym_size(2);
+    c10::SymDimVector lse_shape;
+    if (layout_q_str == "BSND") {
+        lse_shape = {q.sym_size(0), kv_heads, q.sym_size(1), q.sym_size(2) / kv_heads};
+    } else {
+        TORCH_CHECK(layout_q_str == "TND", "layout_q must be BSND or TND");
+        lse_shape = {kv_heads, q.sym_size(0), q.sym_size(1) / kv_heads};
+    }
+    auto lse = at::empty_symint(lse_shape,
+                                q.options().dtype(at::kFloat).device(c10::kMeta));
+    return {output, lse};
+}
+
 at::Tensor npu_sparse_attention_score_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const at::Tensor &select_idx, const at::Tensor &block_table,
@@ -1974,6 +2045,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
     // Sparse flash attention
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
+    ops.impl("npu_sparse_flash_mla_metadata", &vllm_ascend::meta::npu_sparse_flash_mla_metadata_meta);
+    ops.impl("npu_sparse_flash_mla", &vllm_ascend::meta::npu_sparse_flash_mla_meta);
     ops.impl("npu_sparse_attention_score", &vllm_ascend::meta::npu_sparse_attention_score_meta);
     ops.impl("npu_k2q_csr", &vllm_ascend::meta::npu_k2q_csr_meta);
     ops.impl("npu_sparse_attention_score_prefill",

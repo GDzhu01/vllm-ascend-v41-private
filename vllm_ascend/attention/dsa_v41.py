@@ -44,6 +44,8 @@ class DeepseekV41Metadata(AttentionMetadata):
     num_actual_tokens: int = 0
     num_input_tokens: int = 0
     num_reqs: int = 0
+    max_query_len: int = 0
+    max_seq_len: int = 0
 
 
 @dataclass(frozen=True)
@@ -146,6 +148,19 @@ def select_index_topk(logits, compress_lens, index_topk):
     topk = min(index_topk, width)
     indices = logits.topk(topk, dim=-1, sorted=False).indices.sort(-1).values
     return torch.where(indices < compress_lens, indices, -1).int()
+
+
+def pad_sparse_indices(indices: torch.Tensor, topk: int) -> torch.Tensor:
+    """Convert V4.1's compact [T, K] selection into SMLA [T, 1, topk]."""
+    if indices.ndim != 2:
+        raise ValueError(f"V4.1 sparse indices must be rank 2, got {indices.shape}")
+    if indices.shape[-1] > topk:
+        raise ValueError(
+            f"V4.1 sparse indices width {indices.shape[-1]} exceeds operator topk {topk}"
+        )
+    if indices.shape[-1] < topk:
+        indices = F.pad(indices, (0, topk - indices.shape[-1]), value=-1)
+    return indices.unsqueeze(1).contiguous().int()
 
 
 def small_op_attention(
@@ -384,6 +399,17 @@ class DeepseekV41EagerAttentionImpl:
             source_cache = get_forward_context().no_compile_layers[
                 self.long_kv_source_prefix
             ].kv_cache[0]
+        # The supplied A2/A3 kernel implements the V4.1 ratio-2 CSA path and
+        # the SWA-only path. Ratio-1 CSA remains on the correctness fallback
+        # until the operator's host checker and numerical matrix support it.
+        if self.role.compress_ratio in (0, 2):
+            return self._native_attention(
+                attn,
+                q,
+                metadata,
+                source_cache=source_cache,
+                compressed_indices=compressed_indices,
+            )
         return small_op_attention(
             q,
             positions,
@@ -398,6 +424,105 @@ class DeepseekV41EagerAttentionImpl:
             sinks=attn.attn_sink,
             softmax_scale=attn.softmax_scale,
         )
+
+    def _native_attention(
+        self,
+        attn,
+        q,
+        metadata,
+        *,
+        source_cache,
+        compressed_indices,
+    ):
+        """Run SparseFlashMla with the same PA metadata for both operator stages."""
+        if attn.head_dim != 512:
+            raise ValueError(f"SparseFlashMla requires head_dim 512, got {attn.head_dim}")
+        if attn.window_size != 128:
+            raise ValueError(
+                f"A2/A3 SparseFlashMla requires sliding_window 128, got {attn.window_size}"
+            )
+        if not 1 <= attn.n_local_heads <= 128 or attn.n_local_heads & (attn.n_local_heads - 1):
+            raise ValueError(
+                "A2/A3 SparseFlashMla requires the local query-head count to be "
+                f"a power of two in [1, 128], got {attn.n_local_heads}"
+            )
+        has_compressed = self.role.compress_ratio == 2
+        ratio = 2 if has_compressed else 1
+        num_reqs = metadata.swa.num_reqs
+        query_start_loc = metadata.swa.query_start_loc[: num_reqs + 1].int()
+        seq_lens = metadata.swa.seq_lens[:num_reqs].int()
+        ori_block_table = metadata.swa.block_table[:num_reqs].int()
+        cmp_block_table = None
+        cmp_seq_lens = None
+        cmp_residual = None
+        cmp_indices = None
+        cmp_topk = 0
+        if has_compressed:
+            if source_cache is None or metadata.long_kv is None or compressed_indices is None:
+                raise RuntimeError("V4.1 ratio-2 attention is missing compressed KV or TopK metadata")
+            cmp_block_table = metadata.long_kv.block_table[:num_reqs].int()
+            cmp_seq_lens = torch.div(seq_lens, ratio, rounding_mode="floor")
+            cmp_residual = seq_lens.remainder(ratio)
+            cmp_topk = self.topology.index_topk
+            if cmp_topk not in (512, 1024):
+                raise ValueError(f"SparseFlashMla only supports TopK 512 or 1024, got {cmp_topk}")
+            cmp_indices = pad_sparse_indices(compressed_indices, cmp_topk)
+
+        shared = attn.shared_state
+        if shared is None:
+            raise RuntimeError("V4.1 shared attention state is not initialized")
+        op_metadata = shared.smla_metadata.get(ratio)
+        if op_metadata is None:
+            op_metadata = torch.ops._C_ascend.npu_sparse_flash_mla_metadata(
+                attn.n_local_heads,
+                1,
+                attn.head_dim,
+                cu_seqlens_q=query_start_loc,
+                seqused_ori_kv=seq_lens,
+                seqused_cmp_kv=cmp_seq_lens,
+                cmp_residual_kv=cmp_residual,
+                batch_size=num_reqs,
+                max_seqlen_q=metadata.swa.max_query_len,
+                max_seqlen_ori_kv=metadata.swa.max_seq_len,
+                max_seqlen_cmp_kv=metadata.swa.max_seq_len // ratio,
+                ori_topk=0,
+                cmp_topk=cmp_topk,
+                cmp_ratio=ratio,
+                ori_mask_mode=4,
+                cmp_mask_mode=3 if has_compressed else 0,
+                ori_win_left=attn.window_size - 1,
+                ori_win_right=0,
+                layout_q="TND",
+                layout_kv="PA_BBND",
+                has_ori_kv=True,
+                has_cmp_kv=has_compressed,
+            )
+            shared.smla_metadata[ratio] = op_metadata
+        output, _ = torch.ops._C_ascend.npu_sparse_flash_mla(
+            q,
+            ori_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0],
+            cmp_kv=source_cache,
+            cmp_sparse_indices=cmp_indices,
+            ori_block_table=ori_block_table,
+            cmp_block_table=cmp_block_table,
+            cu_seqlens_q=query_start_loc,
+            seqused_ori_kv=seq_lens,
+            seqused_cmp_kv=cmp_seq_lens,
+            cmp_residual_kv=cmp_residual,
+            sinks=attn.attn_sink,
+            metadata=op_metadata,
+            softmax_scale=attn.softmax_scale,
+            cmp_ratio=ratio,
+            ori_mask_mode=4,
+            cmp_mask_mode=3 if has_compressed else 0,
+            ori_win_left=attn.window_size - 1,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+            topk_value_mode=1,
+            return_softmax_lse=False,
+        )
+        return output
 
     def forward(self, attn, positions, hidden_states):
         forward_context = get_forward_context()
@@ -464,6 +589,13 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         if cache_kind == "swa" and positions is not None:
             positions = positions[: common.num_input_tokens].long()
             cos, sin = get_cos_and_sin_dsa(positions)
+        max_query_len = getattr(common, "max_query_len", None)
+        if max_query_len is None:
+            query_lens = common.query_start_loc[1:] - common.query_start_loc[:-1]
+            max_query_len = int(query_lens.max().item())
+        max_seq_len = getattr(common, "max_seq_len", None)
+        if max_seq_len is None:
+            max_seq_len = int(common.seq_lens.max().item())
         return DeepseekV41Metadata(
             common.block_table_tensor,
             common.query_start_loc,
@@ -479,6 +611,8 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             num_actual_tokens=int(getattr(common, "num_actual_tokens", slots.shape[0])),
             num_input_tokens=int(getattr(common, "num_input_tokens", slots.shape[0])),
             num_reqs=int(getattr(common, "num_reqs", common.seq_lens.shape[0])),
+            max_query_len=int(max_query_len),
+            max_seq_len=int(max_seq_len),
         )
 
 

@@ -3,7 +3,10 @@
 
 import pytest
 
-from vllm_ascend.models.deepseek_v41.model import build_layer_plan
+from vllm_ascend.models.deepseek_v41.model import (
+    DeepseekV41SharedAttentionState,
+    build_layer_plan,
+)
 
 
 @pytest.fixture
@@ -53,6 +56,15 @@ def test_source_roles_and_engram_slots(text_config: dict):
     assert topology.layer(1).engram_slot == 0
     assert topology.layer(14).engram_slot == 1
     assert topology.layer(0).kv_source_layer is None
+
+
+def test_shared_state_resets_sparse_attention_metadata():
+    state = DeepseekV41SharedAttentionState()
+    state.smla_metadata[2] = object()
+
+    state.reset()
+
+    assert state.smla_metadata == {}
 
 
 def test_rejects_ratio_mismatch(text_config: dict):
