@@ -12,10 +12,12 @@ Its companion `QuantLightningIndexerV2Metadata` is built and registered too.
 scale. Head weights and K scales are FP16. Existing source-owned K-cache
 updates remain unchanged.
 
-The operator consumes `TND` Q and `PA_BBND` index K directly. The Torch adapter
-passes the actual leading strides of K and its scale cache to ACLNN, preserving
-Hybrid cache page padding and nonzero storage offsets without gathering the
-whole context into a dense tensor.
+The operator consumes `TND` Q and `PA_BBND` index K directly. Aurora's
+four-slot layer-outermost allocator packs index K and FP16 scales after KV
+inside each shared page. C2 uses 64-row views with a 131072-byte block stride;
+C1 uses 128-row views with a 147712-byte block stride. The Torch adapter passes
+their actual leading strides to ACLNN.
+Neither layout requires gathering the whole context into a dense tensor.
 
 Metadata receives original query boundaries, compressed K lengths, and the
 original sequence length modulo the compression ratio. The residual tensor
@@ -67,6 +69,14 @@ boundaries, paged views, mixed requests, 2048 candidate blocks, 64 heads, empty
 contexts and Meta shapes against an independent CPU reference. Ties at the
 TopK cutoff use score validity, uniqueness and count rather than arbitrary
 index ordering.
+
+The mixed-request model-indexer cases allocate the actual four-slot cache
+configuration, including the null ID, and test source/consumer selection on
+its strided index K/scale views. The SparseFlashMla suite also compares the
+slot-backed BF16 views against the earlier block-outermost layout for ratios
+0/1/2 and decode, prefill and mixed requests. These updated tests have not yet
+been executed; remote torch/NPU verification is deferred. The end-to-end
+results below describe the original layout.
 
 The imported host tiling needed one semantic fix: TND candidate size is
 `T * N_k * blocks`, because T already includes every request. Multiplying by
