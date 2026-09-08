@@ -32,6 +32,33 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
 class TestDummyRunSlotInvalidation(unittest.TestCase):
+    def test_padded_dummy_preserves_other_dp_token_counts(self):
+        for token_counts in ([24, 8], [8, 24], [8, 8]):
+            with self.subTest(token_counts=token_counts):
+                runner = NPUModelRunner.__new__(NPUModelRunner)
+                runner.uniform_decode_query_len = 1
+                runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=32, max_num_seqs=4)
+                runner.dynamic_eplb = False
+                runner.dcp_size = 1
+                agreed_counts = torch.tensor(token_counts, dtype=torch.int32)
+                runner._determine_batch_execution_and_padding = MagicMock(
+                    return_value=(
+                        CUDAGraphMode.NONE,
+                        SimpleNamespace(num_tokens=8, num_reqs=1),
+                        False,
+                        agreed_counts,
+                        None,
+                    )
+                )
+
+                def check_agreed_counts(agreed_counts=agreed_counts, token_counts=token_counts):
+                    torch.testing.assert_close(agreed_counts, torch.tensor(token_counts, dtype=torch.int32))
+                    raise RuntimeError("DP token counts checked")
+
+                runner.synchronize_input_prep = check_agreed_counts
+                with self.assertRaisesRegex(RuntimeError, "DP token counts checked"):
+                    runner._dummy_run(1, uniform_decode=True)
+
     def test_backend_metadata_sees_invalidated_dummy_slots(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)
         runner.uniform_decode_query_len = 1

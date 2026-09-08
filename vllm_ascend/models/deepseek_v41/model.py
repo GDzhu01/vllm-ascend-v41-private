@@ -18,7 +18,6 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheBackend,
     DeepseekV41CacheLayer,
-    DeepseekV41EagerAttentionImpl,
 )
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41FullSpec,
@@ -223,7 +222,7 @@ class AscendDeepseekV41SWACache(AscendDeepseekV4SWACache):
 
 
 class DeepseekV41Attention(DeepseekV4Attention):
-    """V4 projections plus V4.1 source-owned cache and fused DSA execution."""
+    """V4.1 source-shared attention using V4 projections and CP adapters."""
 
     swa_cache_cls = AscendDeepseekV41SWACache
 
@@ -328,7 +327,9 @@ class DeepseekV41Attention(DeepseekV4Attention):
         self.long_kv_source_prefix = f"{source}.long_kv_cache" if role.has_long_context else None
         self.index_k_source_prefix = f"{source}.indexer.k_cache" if role.has_long_context else None
         self.index_source_layer = role.index_source_layer
-        self.v41_impl = DeepseekV41EagerAttentionImpl(
+        from vllm_ascend.attention.context_parallel.dsa_v41_cp import get_v41_cp_classes
+
+        self.v41_impl = get_v41_cp_classes()[1](
             prefix=prefix,
             role=role,
             topology=topology,

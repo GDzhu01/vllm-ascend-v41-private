@@ -134,6 +134,8 @@ class DeepseekV41Metadata(AttentionMetadata):
     c2_source_cos: torch.Tensor | None = None
     c2_source_sin: torch.Tensor | None = None
     c2_metadata_group_id: int | None = None
+    global_metadata: "DeepseekV41Metadata | None" = None
+    cp_token_range: tuple[int, int, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -280,11 +282,9 @@ class DeepseekV41EagerAttentionImpl:
         )
 
     @staticmethod
-    def _project_q_kv(attn, hidden_states, cos, sin):
-        q_a = attn.wq_a(hidden_states)
-        qr = attn.q_norm(q_a)
-        q = attn.wq_b(qr).unflatten(-1, (attn.n_local_heads, attn.head_dim))
-        kv = attn.kv_norm(attn.wkv(hidden_states))
+    def _project_q(attn, hidden_states, cos, sin):
+        qr = attn.q_norm(attn.wq_a(hidden_states))
+        q = attn.wq_b(qr).unflatten(-1, (-1, attn.head_dim))
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             q.unsqueeze(1),
             cos,
@@ -292,7 +292,11 @@ class DeepseekV41EagerAttentionImpl:
             rotary_mode="interleave",
             partial_slice=[attn.nope_head_dim, attn.head_dim],
         )
-        kv = kv.view(-1, 1, attn.head_dim)
+        return q.to(hidden_states.dtype), qr
+
+    @staticmethod
+    def _project_kv(attn, hidden_states, cos, sin):
+        kv = attn.kv_norm(attn.wkv(hidden_states)).view(-1, 1, attn.head_dim)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             kv.unsqueeze(1),
             cos,
@@ -300,7 +304,36 @@ class DeepseekV41EagerAttentionImpl:
             rotary_mode="interleave",
             partial_slice=[attn.nope_head_dim, attn.head_dim],
         )
-        return q.to(hidden_states.dtype), qr, kv.squeeze(1)
+        return kv.squeeze(1)
+
+    @classmethod
+    def _project_q_kv(cls, attn, hidden_states, cos, sin):
+        q, qr = cls._project_q(attn, hidden_states, cos, sin)
+        return q, qr, cls._project_kv(attn, hidden_states, cos, sin)
+
+    def _update_caches(self, attn, hidden_states, metadata):
+        if hidden_states.shape[0] == 0:
+            return
+        positions = metadata.positions[: hidden_states.shape[0]]
+        cos, sin = metadata.rope(attn.rotary_emb.layername, hidden_states.shape[0])
+        kv = self._project_kv(attn, hidden_states, cos, sin)
+        scatter_cache_v2(attn.dsa_attn.swa_cache_layer.kv_cache[0], metadata.swa.slot_mapping, kv)
+        if self.role.is_kv_source:
+            self._write_compressed_source(attn, hidden_states, positions, cos, sin, metadata)
+
+    def _prepare_inputs_and_caches(self, attn, hidden_states, metadata, metadata_by_prefix):
+        local_hidden_states = hidden_states[: metadata.swa.num_actual_tokens]
+        self._update_caches(attn, local_hidden_states, metadata)
+        return local_hidden_states
+
+    def _project_output(self, attn, output, hidden_states, metadata):
+        padded = output
+        if output.shape[0] != hidden_states.shape[0]:
+            padded = output.new_zeros((hidden_states.shape[0], output.shape[1], output.shape[2]))
+            padded[: output.shape[0]] = output
+        projected = torch.empty_like(hidden_states)
+        attn.dsa_attn.dsa_attn.impl._forward_o_proj(padded, projected)
+        return projected
 
     def preprocess(self, attn, hidden_states, cos, sin, swa_metadata):
         """Project Q/KV and populate this layer's SWA cache on the current stream."""
@@ -505,11 +538,14 @@ class DeepseekV41EagerAttentionImpl:
         if attn.head_dim != 512:
             raise ValueError(f"SparseFlashMla requires head_dim 512, got {attn.head_dim}")
         if attn.window_size != 128:
-            raise ValueError(f"A2/A3 SparseFlashMla requires sliding_window 128, got {attn.window_size}")
-        if not 1 <= attn.n_local_heads <= 128 or attn.n_local_heads & (attn.n_local_heads - 1):
+            raise ValueError(
+                f"A2/A3 SparseFlashMla requires sliding_window 128, got {attn.window_size}"
+            )
+        num_heads = q.shape[1]
+        if not 1 <= num_heads <= 128 or num_heads & (num_heads - 1):
             raise ValueError(
                 "A2/A3 SparseFlashMla requires the local query-head count to be "
-                f"a power of two in [1, 128], got {attn.n_local_heads}"
+                f"a power of two in [1, 128], got {num_heads}"
             )
         has_compressed = self.role.compress_ratio in (1, 2)
         ratio = self.role.compress_ratio if has_compressed else 0
@@ -583,30 +619,29 @@ class DeepseekV41EagerAttentionImpl:
             output.zero_()
             return output
         metadata = self._get_layer_metadata(forward_context.attn_metadata)
-        positions = metadata.positions[: hidden_states.shape[0]]
-        cos, sin = metadata.rope(attn.rotary_emb.layername, hidden_states.shape[0])
-        v1_impl = attn.dsa_attn.dsa_attn.impl
-        preprocess = self.multistream_preprocess if v1_impl.multistream_dsv4_dsa_overlap else self.preprocess
-        q, qr = preprocess(attn, hidden_states, cos, sin, metadata.swa)
-        if self.role.is_kv_source:
-            self._write_compressed_source(
-                attn,
-                hidden_states,
-                positions,
-                cos,
-                sin,
-                metadata,
-            )
-        compressed_indices = self._select_sparse_indices(attn, hidden_states, qr, positions, cos, sin, metadata)
-        attention_output = self._attention(attn, q, metadata, compressed_indices)
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            attention_output.unsqueeze(1),
-            cos,
-            -sin,
-            rotary_mode="interleave",
-            partial_slice=[attn.nope_head_dim, attn.head_dim],
+        local_hidden_states = self._prepare_inputs_and_caches(
+            attn, hidden_states, metadata, forward_context.attn_metadata
         )
-        attn.dsa_attn.dsa_attn.impl._forward_o_proj(attention_output, output)
+        num_tokens = local_hidden_states.shape[0]
+        if num_tokens:
+            positions = metadata.positions[:num_tokens]
+            cos, sin = metadata.rope(attn.rotary_emb.layername, num_tokens)
+            q, qr = self._project_q(attn, local_hidden_states, cos, sin)
+            compressed_indices = self._select_sparse_indices(
+                attn, local_hidden_states, qr, positions, cos, sin, metadata
+            )
+            attention_output = self._attention(attn, q, metadata, compressed_indices)
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                attention_output.unsqueeze(1),
+                cos,
+                -sin,
+                rotary_mode="interleave",
+                partial_slice=[attn.nope_head_dim, attn.head_dim],
+            )
+        else:
+            heads = attn.n_heads if getattr(attn, "enable_dsa_cp", False) else attn.n_local_heads
+            attention_output = hidden_states.new_empty((0, heads, attn.head_dim))
+        output.copy_(self._project_output(attn, attention_output, hidden_states, metadata))
         return output
 
 
@@ -1065,7 +1100,9 @@ class DeepseekV41CacheBackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls():
-        return DeepseekV41MetadataBuilder
+        from vllm_ascend.attention.context_parallel.dsa_v41_cp import get_v41_cp_classes
+
+        return get_v41_cp_classes()[0]
 
     @staticmethod
     def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str="auto"):

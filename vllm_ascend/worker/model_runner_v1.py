@@ -3689,8 +3689,9 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
         if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
-            # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
-            num_tokens_across_dp[:] = num_tokens_padded
+            # The dispatcher already synchronized each DP rank's padded count.
+            # Preserve peer counts: DSA CP can pad only this dummy rank, and
+            # MoE communication selection must see the same global maximum.
             num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
 
         if self.dynamic_eplb:

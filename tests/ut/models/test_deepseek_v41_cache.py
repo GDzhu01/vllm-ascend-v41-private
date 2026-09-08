@@ -1212,3 +1212,111 @@ def test_interleaved_request_state_isolation(config):
     actual = compressor_ratio2_reference(compressor, first[1:], 1, state, [1])
     expected = compressor_ratio2_reference(compressor, first, 0, state, [1])
     torch.testing.assert_close(actual, expected)
+
+
+class _CPCommon(SimpleNamespace):
+    def replace(self, **kwargs):
+        return type(self)(**(vars(self) | kwargs))
+
+
+def _cp_common():
+    # The second request resumes in the middle of a ratio-2 pair.
+    return _CPCommon(
+        slot_mapping=torch.tensor([0, 1, 2, 68]),
+        block_table_tensor=torch.tensor([[0, 1], [1, 2]]),
+        query_start_loc=torch.tensor([0, 3, 4], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 3, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([3, 5], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([3, 5], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=4,
+        num_input_tokens=4,
+        max_query_len=3,
+        max_seq_len=5,
+        positions=torch.tensor([0, 1, 2, 4]),
+        is_prefilling=torch.tensor([True, True]),
+        causal=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "rank,size,query_offsets,seq_lens,positions",
+    [
+        (0, 2, [0, 2, 2], [2, 0], [0, 1]),
+        (1, 2, [0, 1, 2], [3, 5], [2, 4]),
+        (5, 8, [0, 0, 0], [0, 0], []),
+    ],
+)
+def test_v41_cp_metadata_preserves_global_compression_and_local_causality(
+    runtime, monkeypatch, rank, size, query_offsets, seq_lens, positions
+):
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
+
+    monkeypatch.setattr(
+        "vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
+        lambda: SimpleNamespace(world_size=size, rank_in_group=rank),
+    )
+    spec = collect_specs(runtime)["model.layers.2.self_attn.long_kv_cache"]
+    builder = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    metadata = builder.build(0, _cp_common())
+    assert metadata.query_start_loc.tolist() == query_offsets
+    assert metadata.seq_lens.tolist() == seq_lens
+    assert metadata.positions.tolist() == positions
+    assert metadata.global_metadata.seq_lens.tolist() == [3, 5]
+    assert metadata.global_metadata.cache_seq_lens.tolist() == [1, 2]
+    assert metadata.global_metadata.slot_mapping.tolist() == [-1, 0, -1, -1]
+    assert metadata.num_actual_tokens == len(positions)
+
+
+def test_v41_cp_empty_query_rank_still_exchanges_output(monkeypatch):
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
+
+    impl = DeepseekV41CPImpl("layer", SimpleNamespace(is_kv_source=False), None, None, None)
+    calls = []
+    monkeypatch.setattr("vllm_ascend.attention.context_parallel.dsa_v41_cp.get_tp_group", lambda: None)
+
+    def exchange(tensor, group):
+        calls.append(tensor)
+        return torch.ones((4, 2, 3))
+
+    monkeypatch.setattr("vllm_ascend.attention.context_parallel.dsa_v41_cp.restore_tp_heads", exchange)
+    projection = SimpleNamespace(_forward_o_proj=lambda tensor: tensor.flatten(1))
+    attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=projection)))
+    output = impl._project_output(
+        attn,
+        torch.empty((0, 4, 3)),
+        torch.empty((3, 6)),
+        SimpleNamespace(swa=SimpleNamespace(cp_token_range=(3, 4, 1, 4))),
+    )
+    assert calls[0].shape == (1, 4, 3)
+    assert torch.count_nonzero(calls[0]) == 0
+    assert output.shape == (3, 6)
+
+
+def test_v41_cp_consumers_reuse_local_topk_and_candidates():
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
+
+    impl = DeepseekV41CPImpl(
+        "layer", SimpleNamespace(is_kv_source=False, has_long_context=True, is_index_source=False), None, None, None
+    )
+    indices = torch.tensor([[0, 2], [1, 3]])
+    candidates = torch.tensor([[True, False]])
+    shared = SimpleNamespace(topk_indices=indices, candidates=candidates)
+    actual = impl._select_sparse_indices(SimpleNamespace(shared_state=shared), None, None, None, None, None, None)
+    assert actual is indices
+    assert shared.candidates is candidates
+
+
+@pytest.mark.parametrize("cp", [False, True])
+def test_v41_backend_routes_metadata_and_execution_together(monkeypatch, cp):
+    from vllm_ascend.attention.context_parallel import dsa_v41_cp
+    from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheBackend
+
+    monkeypatch.setattr(dsa_v41_cp, "enable_pcp", lambda: False)
+    monkeypatch.setattr(dsa_v41_cp, "enable_dsa_cp", lambda: cp)
+    builder, impl = dsa_v41_cp.get_v41_cp_classes()
+    assert DeepseekV41CacheBackend.get_builder_cls() is builder
+    if cp:
+        assert issubclass(impl, dsa_v41_cp.DeepseekV41CPImpl)
+    else:
+        assert impl is dsa_v41_cp.DeepseekV41EagerAttentionImpl
