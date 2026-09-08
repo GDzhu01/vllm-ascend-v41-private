@@ -311,8 +311,8 @@ def reshape_cache(raw: torch.Tensor, spec, *, num_blocks, offset, block_stride):
 
 
 def validate_cache_runtime(vllm_config):
-    if vllm_config.use_v2_model_runner:
-        raise NotImplementedError("V4.1 cache initialization currently requires model runner V1")
+    if vllm_config.use_v2_model_runner and not vllm_config.model_config.enforce_eager:
+        raise NotImplementedError("V4.1 model runner V2 currently requires enforce_eager")
     cudagraph_mode = getattr(
         vllm_config.compilation_config,
         "cudagraph_mode",
@@ -342,10 +342,17 @@ def validate_cache_runtime(vllm_config):
         for name in (
             "pipeline_parallel_size",
             "decode_context_parallel_size",
-            "prefill_context_parallel_size",
         )
     ):
-        raise NotImplementedError("V4.1 initial runtime requires PP=DCP=PCP=1")
+        raise NotImplementedError("V4.1 runtime requires PP=DCP=1")
+    pcp_size = getattr(parallel, "prefill_context_parallel_size", 1)
+    if pcp_size > 1:
+        if not vllm_config.use_v2_model_runner:
+            raise NotImplementedError("V4.1 PCP requires model runner V2")
+        from vllm_ascend.utils import enable_dsa_cp
+
+        if enable_dsa_cp():
+            raise ValueError("Legacy DSACP and PCP cannot be enabled at the same time.")
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         raise ValueError("V4.1 requires the hybrid KV cache manager")
     if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16"):
@@ -354,3 +361,30 @@ def validate_cache_runtime(vllm_config):
         # Aurora's planes are always BF16. Pin the inherited DSV4 draft
         # backend to the same layout, including on hardware where auto is FP8.
         vllm_config.cache_config.cache_dtype = "bfloat16"
+
+
+def allocate_packed_cache(kv_cache_config, layer_kv_cache_spec, device):
+    """Allocate one backing for every V4.1 block-strided cache descriptor."""
+    kv_cache_raw_tensors = {}
+    if not all(is_v41_spec(spec) for spec in layer_kv_cache_spec.values()):
+        raise ValueError("Mixed V4.1 cache allocation is not supported")
+    packed_backing = None
+    packed_size = None
+    for allocation in kv_cache_config.kv_cache_tensors:
+        if allocation.block_stride <= 0:
+            raise ValueError("V4.1 requires a packed block-strided allocation")
+        if packed_backing is None:
+            packed_backing = torch.zeros(
+                allocation.size,
+                dtype=torch.uint8,
+                device=device,
+            )
+            packed_size = allocation.size
+        elif allocation.size != packed_size:
+            raise ValueError("V4.1 packed descriptors disagree on backing size")
+        for name in allocation.shared_by:
+            kv_cache_raw_tensors[name] = packed_backing
+    expected = set(layer_kv_cache_spec)
+    if set(kv_cache_raw_tensors) != expected:
+        raise ValueError("V4.1 packed descriptors do not cover every resource")
+    return kv_cache_raw_tensors

@@ -135,6 +135,7 @@ class DeepseekV41Metadata(AttentionMetadata):
     c2_source_sin: torch.Tensor | None = None
     c2_metadata_group_id: int | None = None
     global_metadata: "DeepseekV41Metadata | None" = None
+    hidden_restore_idx: torch.Tensor | None = None
     cp_token_range: tuple[int, int, int, int] | None = None
 
 
@@ -893,6 +894,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             int(_config_value(text_config, "num_attention_heads"))
             // self.vllm_config.parallel_config.tensor_parallel_size
         )
+        n_local_heads = int(kwargs.get("num_query_heads", n_local_heads))
         head_dim = int(_config_value(text_config, "head_dim"))
         index_topk = int(_config_value(text_config, "index_topk"))
         operator_ratio = 0 if cache_kind == "swa" else ratio
@@ -1103,6 +1105,11 @@ class DeepseekV41CacheBackend(AttentionBackend):
         from vllm_ascend.attention.context_parallel.dsa_v41_cp import get_v41_cp_classes
 
         return get_v41_cp_classes()[0]
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        # Execution is owned by the model's V4.1 adapter, not get_impl_cls().
+        return True
 
     @staticmethod
     def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str="auto"):
