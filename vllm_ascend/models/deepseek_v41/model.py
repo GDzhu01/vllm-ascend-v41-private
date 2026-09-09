@@ -13,12 +13,12 @@ from transformers import AutoTokenizer
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheBackend,
     DeepseekV41CacheLayer,
     DeepseekV41EagerAttentionImpl,
 )
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41FullSpec,
     DeepseekV41SWASpec,
@@ -419,8 +419,8 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
             self.hc_ffn_base,
             attn_pre,
         )
-        x = self.post_attention_layernorm(x)
-        x = self.mlp(x, input_ids)
+        x, x_fp32 = self.rms_norm_cast(x)
+        x = self.mlp(x, input_ids=input_ids, hidden_states_fp32=x_fp32)
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
         return hidden_states, ffn_pre
 
@@ -468,7 +468,10 @@ class DeepseekV41Model(DeepseekV4Model):
             query_group = EngramQueryGroup.from_vllm(vllm_config.parallel_config)
             for layer_id, rows in zip(config.engram_layer_ids, config.engram_num_embeddings):
                 self.layers[layer_id].engram.embed = NodeShardedEngram(
-                    rows, config.engram_head_dim, query_group, storage_format=storage_format,
+                    rows,
+                    config.engram_head_dim,
+                    query_group,
+                    storage_format=storage_format,
                 )
         self.engram_history = None
         self._engram_input_buffers = None
@@ -549,18 +552,23 @@ class DeepseekV41Model(DeepseekV4Model):
         buffers, mask_buffer = self._engram_input_buffers
         padded_mask = mask_buffer[:output_tokens]
         padded_mask.zero_()
-        padded_mask[:mask.numel()].copy_(mask)
+        padded_mask[: mask.numel()].copy_(mask)
         padded_lookups = {}
         for layer, values in lookups.items():
             padded = buffers[layer][:output_tokens]
             padded.zero_()
-            padded[:values.shape[0]].copy_(values)
+            padded[: values.shape[0]].copy_(values)
             padded_lookups[layer] = padded
         return {"engram_lookups": padded_lookups, "engram_mask": padded_mask}
 
     def forward(
-        self, input_ids, positions, intermediate_tensors, inputs_embeds=None,
-        engram_lookups=None, engram_mask=None,
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors,
+        inputs_embeds=None,
+        engram_lookups=None,
+        engram_mask=None,
     ):
         if not get_pp_group().is_first_rank or not get_pp_group().is_last_rank:
             raise NotImplementedError("V4.1 eager milestone currently requires PP=1")
@@ -617,12 +625,21 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
         return self.model.prepare_engram_inputs(input_ids, positions, padded_tokens)
 
     def forward(
-        self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None,
-        engram_lookups=None, engram_mask=None,
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        engram_lookups=None,
+        engram_mask=None,
     ):
         return self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds,
-            engram_lookups=engram_lookups, engram_mask=engram_mask,
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            engram_lookups=engram_lookups,
+            engram_mask=engram_mask,
         )
 
     @classmethod
@@ -633,9 +650,7 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         if not get_ascend_config().enable_engram:
-            return super().load_weights(
-                (name, tensor) for name, tensor in weights if ".engram." not in name
-            )
+            return super().load_weights((name, tensor) for name, tensor in weights if ".engram." not in name)
         engram_loaded = set()
 
         def milestone_weights() -> Iterator[tuple[str, torch.Tensor]]:

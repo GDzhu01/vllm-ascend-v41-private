@@ -2,9 +2,11 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from tests.deepseek_v41_reference import hc_mixes_reference, hc_post_reference
+from vllm_ascend.models.deepseek_v4 import model as deepseek_v4_module
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41DecoderLayer
 
 
@@ -76,19 +78,54 @@ def test_v41_forward_threads_pre_mix_through_fused_hc_pre():
         ]
     )
     layer.input_layernorm = MagicMock(side_effect=lambda value: value)
-    layer.post_attention_layernorm = MagicMock(side_effect=lambda value: value)
+    normalized = torch.randn_like(collapsed)
+    normalized_fp32 = normalized.float()
+    layer.rms_norm_cast = MagicMock(return_value=(normalized, normalized_fp32))
     layer.self_attn = MagicMock(side_effect=lambda _positions, value, _scaling: value)
-    layer.mlp = MagicMock(side_effect=lambda value, _input_ids: value)
+    layer.mlp = MagicMock(side_effect=lambda value, **_kwargs: value)
     layer.hc_post = MagicMock(side_effect=lambda _x, residual, _post, _comb: residual)
 
-    output, next_pre = layer.forward(
-        torch.arange(2), hidden_states, incoming_pre, input_ids=None
-    )
+    input_ids = torch.tensor([11, 22])
+    output, next_pre = layer.forward(torch.arange(2), hidden_states, incoming_pre, input_ids=input_ids)
 
     assert output is hidden_states
     assert next_pre is ffn_pre
     assert layer.hc_pre.call_args_list[0].args[-1] is incoming_pre
     assert layer.hc_pre.call_args_list[1].args[-1] is attn_pre
+    layer.rms_norm_cast.assert_called_once_with(collapsed)
+    layer.mlp.assert_called_once_with(normalized, input_ids=input_ids, hidden_states_fp32=normalized_fp32)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("custom_op_enabled", [False, True])
+def test_v41_rms_norm_cast_preserves_rounded_routing_input(monkeypatch, dtype, custom_op_enabled):
+    layer = _layer()
+    x = torch.randn(2, 8, dtype=dtype)
+    normalized = torch.randn_like(x)
+    normalized_fp32 = normalized.float()
+    norm = MagicMock(return_value=normalized)
+    norm.weight = torch.ones(8, dtype=dtype)
+    norm.variance_epsilon = 1e-6
+    layer.post_attention_layernorm = norm
+    monkeypatch.setattr(deepseek_v4_module, "enable_custom_op", lambda: custom_op_enabled)
+
+    with patch.object(
+        torch.ops._C_ascend,
+        "npu_rms_norm_cast",
+        create=True,
+        return_value=(normalized, normalized_fp32),
+    ) as op:
+        actual, actual_fp32 = layer.rms_norm_cast(x)
+
+    assert actual is normalized
+    torch.testing.assert_close(actual_fp32, normalized.float(), rtol=0, atol=0)
+    if custom_op_enabled:
+        op.assert_called_once_with(x, norm.weight, norm.variance_epsilon)
+        assert actual_fp32 is normalized_fp32
+        norm.assert_not_called()
+    else:
+        op.assert_not_called()
+        norm.assert_called_once_with(x)
 
 
 def test_v41_hc_reference_supports_hidden_size_5120():
@@ -117,17 +154,15 @@ def test_v41_hc_reference_supports_hidden_size_5120():
 
 def test_v41_hc_post_matches_reference_equation():
     torch.manual_seed(11)
-    layer = _layer()
     x = torch.randn(3, 5, dtype=torch.bfloat16)
     residual = torch.randn(3, 4, 5, dtype=torch.bfloat16)
     post = torch.randn(3, 4, dtype=torch.float32)
     comb = torch.randn(3, 4, 4, dtype=torch.float32)
 
     actual = hc_post_reference(x, residual, post, comb)
-    expected = (
-        post.unsqueeze(-1) * x.unsqueeze(-2)
-        + (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(dim=-3)
-    ).to(x.dtype)
+    expected = (post.unsqueeze(-1) * x.unsqueeze(-2) + (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(dim=-3)).to(
+        x.dtype
+    )
     torch.testing.assert_close(actual, expected)
 
 

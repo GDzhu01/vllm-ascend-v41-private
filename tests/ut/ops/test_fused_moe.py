@@ -1434,6 +1434,50 @@ def test_forward_impl_returns_current_runner_contract(monkeypatch, has_shared_ex
         ascend_shared_experts.forward.assert_not_called()
 
 
+@pytest.mark.parametrize("has_shared_experts", [False, True])
+@pytest.mark.parametrize("has_fp32_input", [False, True])
+def test_internal_router_reuses_fused_fp32_input(monkeypatch, has_shared_experts, has_fp32_input):
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    nn.Module.__init__(runner)
+    hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
+    router_input = hidden_states.float() if has_fp32_input else hidden_states
+    input_ids = torch.tensor([11, 22])
+    weight = torch.randn(3, 4)
+    routed_out = torch.randn_like(hidden_states)
+    shared_out = torch.randn_like(hidden_states)
+    events = FusedMoEEvents(None, None, None, None, None)
+    runner.routed_experts = SimpleNamespace(
+        forward_impl=MagicMock(return_value=(routed_out, events) if has_shared_experts else routed_out)
+    )
+    runner.ascend_shared_experts = (
+        SimpleNamespace(
+            prepare_input_before_routed_experts=MagicMock(return_value=(hidden_states, None)),
+            forward=MagicMock(return_value=shared_out),
+        )
+        if has_shared_experts
+        else None
+    )
+    runner._sequence_parallel_context = MagicMock(return_value=nullcontext())
+    runner.gate = SimpleNamespace(weight_fp32=weight)
+    monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: True))
+    monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", MagicMock())
+    linear = MagicMock(wraps=F.linear)
+    monkeypatch.setattr(fused_moe_module.F, "linear", linear)
+
+    runner._forward_impl(hidden_states, router_input, shared_experts_input=None, input_ids=input_ids)
+
+    linear.assert_called_once()
+    assert linear.call_args.args[0].dtype == torch.float32
+    if has_fp32_input:
+        assert linear.call_args.args[0] is router_input
+    routed_kwargs = runner.routed_experts.forward_impl.call_args.kwargs
+    assert routed_kwargs["hidden_states"] is hidden_states
+    assert routed_kwargs["input_ids"] is input_ids
+    torch.testing.assert_close(routed_kwargs["router_logits"], hidden_states.float() @ weight.T)
+    if has_shared_experts:
+        runner.ascend_shared_experts.prepare_input_before_routed_experts.assert_called_once_with(hidden_states)
+
+
 def test_forward_impl_keeps_full_width_input_for_shared_experts(monkeypatch):
     runner = AscendMoERunner.__new__(AscendMoERunner)
     nn.Module.__init__(runner)
