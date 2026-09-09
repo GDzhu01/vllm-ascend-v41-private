@@ -84,7 +84,6 @@ from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
 from vllm_ascend.utils import (
-    enable_custom_op,
     enable_dsa_cp,
     extract_dsv4_layer_index,
     get_dsv4_compress_ratio,
@@ -732,14 +731,11 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     def rms_norm_cast(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Normalize once and provide the exact FP32 routing input."""
-        if enable_custom_op():
-            return torch.ops._C_ascend.npu_rms_norm_cast(
-                hidden_states,
-                self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.variance_epsilon,
-            )
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        return hidden_states, hidden_states.float()
+        return torch.ops._C_ascend.npu_rms_norm_cast(
+            hidden_states,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
+        )
 
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         y, post, comb, _ = torch.ops._C_ascend.npu_hc_pre_v2(

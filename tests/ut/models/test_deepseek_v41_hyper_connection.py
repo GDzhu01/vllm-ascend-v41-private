@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from tests.deepseek_v41_reference import hc_mixes_reference, hc_post_reference
-from vllm_ascend.models.deepseek_v4 import model as deepseek_v4_module
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41DecoderLayer
 
 
@@ -97,8 +96,7 @@ def test_v41_forward_threads_pre_mix_through_fused_hc_pre():
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("custom_op_enabled", [False, True])
-def test_v41_rms_norm_cast_preserves_rounded_routing_input(monkeypatch, dtype, custom_op_enabled):
+def test_v41_rms_norm_cast_preserves_rounded_routing_input(dtype):
     layer = _layer()
     x = torch.randn(2, 8, dtype=dtype)
     normalized = torch.randn_like(x)
@@ -107,7 +105,6 @@ def test_v41_rms_norm_cast_preserves_rounded_routing_input(monkeypatch, dtype, c
     norm.weight = torch.ones(8, dtype=dtype)
     norm.variance_epsilon = 1e-6
     layer.post_attention_layernorm = norm
-    monkeypatch.setattr(deepseek_v4_module, "enable_custom_op", lambda: custom_op_enabled)
 
     with patch.object(
         torch.ops._C_ascend,
@@ -119,13 +116,9 @@ def test_v41_rms_norm_cast_preserves_rounded_routing_input(monkeypatch, dtype, c
 
     assert actual is normalized
     torch.testing.assert_close(actual_fp32, normalized.float(), rtol=0, atol=0)
-    if custom_op_enabled:
-        op.assert_called_once_with(x, norm.weight, norm.variance_epsilon)
-        assert actual_fp32 is normalized_fp32
-        norm.assert_not_called()
-    else:
-        op.assert_not_called()
-        norm.assert_called_once_with(x)
+    op.assert_called_once_with(x, norm.weight, norm.variance_epsilon)
+    assert actual_fp32 is normalized_fp32
+    norm.assert_not_called()
 
 
 def test_v41_hc_reference_supports_hidden_size_5120():
