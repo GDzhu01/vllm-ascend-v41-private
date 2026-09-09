@@ -37,6 +37,18 @@ class AscendCircularBufferSpec(AttentionSpec):
         return self.block_size * self.num_kv_heads * self.head_size * self.dtype.itemsize
 
     @property
+    def page_size_bytes(self):
+        """Return the single-plane ring size expected by this cache spec.
+
+        Newer vLLM ``AttentionSpec`` versions derive ``page_size_bytes`` from
+        separate K/V head sizes.  Circular scratch state is one packed plane,
+        so inheriting that implementation both doubles the allocation and may
+        read an unset ``head_size_v`` when a specialized spec overrides
+        ``__post_init__``.
+        """
+        return self.real_page_size_bytes
+
+    @property
     def prefix_cacheable(self):
         return False
 
