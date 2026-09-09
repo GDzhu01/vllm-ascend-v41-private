@@ -404,6 +404,11 @@ QUANT_MODEL_PREFIX_MAPPINGS = {
         # V4.1 ModelSlim descriptions keep the original checkpoint names,
         # while the runtime reuses the V4 module tree. Map runtime prefixes
         # back to the checkpoint namespace for quant-scheme lookup.
+        "language_model.model.layers.": "layers.",
+        "language_model.model.embed_tokens.": "embed.",
+        "language_model.model.embed_tokens": "embed",
+        "language_model.lm_head.": "head.",
+        "language_model.lm_head": "head",
         "model.layers.": "layers.",
         "model.embed_tokens.": "embed.",
         "model.embed_tokens": "embed",
