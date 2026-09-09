@@ -883,7 +883,8 @@ def test_compressor_chunk_boundary_matches_vector_reference(config, chunks):
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 3, 5])
 @pytest.mark.parametrize("start", [0, 1])
-def test_ring_source_reuses_prepared_store_coordinates(monkeypatch, num_tokens, start):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_ring_source_reuses_prepared_store_coordinates(monkeypatch, num_tokens, start, dtype):
     from vllm_ascend.attention import dsa_v41
 
     positions = torch.arange(start, start + num_tokens)
@@ -899,9 +900,16 @@ def test_ring_source_reuses_prepared_store_coordinates(monkeypatch, num_tokens, 
         c2_source_sin=rope,
     )
     events = []
+    hidden_states = torch.randn(num_tokens, 8, dtype=dtype)
+    original_hidden_states = hidden_states.clone()
 
     def pool(kv, score, metadata):
         assert kv.dtype == score.dtype == torch.float32
+        # Identity projections must receive the same FP32 conversion.
+        assert kv is score
+        torch.testing.assert_close(kv, hidden_states.float(), rtol=0, atol=0)
+        if dtype == torch.float32:
+            assert kv is hidden_states
         assert metadata is state
         events.append("pool")
         return kv.to(torch.bfloat16)
@@ -936,7 +944,7 @@ def test_ring_source_reuses_prepared_store_coordinates(monkeypatch, num_tokens, 
     DeepseekV41EagerAttentionImpl._write_compressed_source(
         SimpleNamespace(role=SimpleNamespace(compress_ratio=2)),
         attn,
-        torch.zeros(num_tokens, 8, dtype=torch.bfloat16),
+        hidden_states,
         positions,
         rope,
         rope,
@@ -944,6 +952,7 @@ def test_ring_source_reuses_prepared_store_coordinates(monkeypatch, num_tokens, 
     )
     assert events == ["wait", "pool", "index", "kv"]
     torch.testing.assert_close(slots, original_slots)
+    torch.testing.assert_close(hidden_states, original_hidden_states, rtol=0, atol=0)
 
 
 def test_state_uses_one_ring_page_and_block_table_entry(config, runtime):

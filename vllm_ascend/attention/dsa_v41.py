@@ -465,8 +465,9 @@ class DeepseekV41EagerAttentionImpl:
             if state_metadata.c2_ring_metadata is None or state_metadata.c2_metadata_group_id is None:
                 raise RuntimeError("V4.1 ring compressor metadata is missing")
             wait_for_device_metadata(DeviceMetadataStage.COMPRESSOR, state_metadata.c2_metadata_group_id)
-            kv = compressor.wkv(hidden_states.float())
-            score = compressor.wgate(hidden_states.float())
+            hidden_states_fp32 = hidden_states.float()
+            kv = compressor.wkv(hidden_states_fp32)
+            score = compressor.wgate(hidden_states_fp32)
             latent = compressor.pool_projected(kv, score, state_metadata)
             source_cos = state_metadata.c2_source_cos
             source_sin = state_metadata.c2_source_sin
