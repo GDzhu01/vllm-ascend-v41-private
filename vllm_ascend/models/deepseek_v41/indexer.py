@@ -12,6 +12,7 @@ from vllm_ascend.attention.dsa_v41 import (
     scatter_cache_v2,
 )
 from vllm_ascend.core.deepseek_v41 import DeepseekV41IndexerSpec
+from vllm_ascend.ops.triton.quantize_indexer_query import quantize_indexer_query
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
     wait_for_device_metadata,
@@ -44,6 +45,7 @@ class DeepseekV41Indexer(nn.Module):
         self.rope_width = int(_read(config, "qk_rope_head_dim"))
         self.index_topk = int(_read(config, "index_topk"))
         self.softmax_scale = self.width**-0.5
+        self.weights_scale = self.softmax_scale * self.n_heads**-0.5
         self.wq_b = ReplicatedLinear(
             _read(config, "q_lora_rank"),
             self.n_heads * self.width,
@@ -137,7 +139,7 @@ class DeepseekV41Indexer(nn.Module):
             partial_slice=[self.width - self.rope_width, self.width],
         )
         weights = self._output(self.weights_proj, hidden_states)
-        weights = weights.float() * (self.softmax_scale * self.n_heads**-0.5)
+        weights = weights.float() * self.weights_scale
 
         return self.select_projected(
             query,
@@ -199,10 +201,7 @@ class DeepseekV41Indexer(nn.Module):
                 candidates = torch.full(candidate_shape, -1, dtype=torch.int32, device=query.device)
             return selected, candidates
 
-        # Use a representable FP16 scale, including all-zero query heads.
-        min_fp16_scale = 2.0**-24
-        query_scale = (query.float().abs().amax(-1) / 127.0).to(torch.float16).clamp_min_(min_fp16_scale)
-        quantized_query = (query.float() / query_scale.float().unsqueeze(-1)).round().clamp(-127, 127).to(torch.int8)
+        quantized_query, query_scale = quantize_indexer_query(query)
         weights = weights.to(torch.float16)
         key, key_scale = source_cache
         key_scale = key_scale.squeeze(-1)  # Preserve the Hybrid cache page stride.
