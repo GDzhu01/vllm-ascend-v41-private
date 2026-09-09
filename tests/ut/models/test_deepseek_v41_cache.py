@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch_npu
 from vllm.config import CUDAGraphMode
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -38,6 +39,16 @@ from vllm_ascend.core.deepseek_v41 import (
 )
 from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
 from vllm_ascend.models.deepseek_v41.model import build_layer_plan, build_v41_cache_specs
+
+
+@pytest.fixture(autouse=True)
+def mock_npu_rms_norm(monkeypatch):
+    # Keep cache/state tests on CPU; operator accuracy is covered on NPU.
+    def rms_norm(x, gamma, epsilon=1e-6):
+        rstd = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + epsilon)
+        return (x.float() * rstd).to(x.dtype) * gamma, rstd
+
+    monkeypatch.setattr(torch_npu, "npu_rms_norm", rms_norm)
 
 
 @pytest.fixture

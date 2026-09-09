@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""FP32 C2 ring compressor, ratio-1 path, and reference RMS normalization."""
+"""FP32 C2 ring compressor, ratio-1 path, and fused RMS normalization."""
 
 from typing import Any
 
 import torch
+import torch_npu
 from torch import nn
 
 from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheLayer
@@ -53,8 +54,7 @@ class DeepseekV41RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        normalized = x.float() * torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + self.eps)
-        return normalized.to(x.dtype) * self.weight
+        return torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
 
 
 class DeepseekV41Compressor(nn.Module):
