@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""NPU coverage for the shared compressor and indexer K normalization."""
+"""NPU coverage for V4.1 weighted and weightless RMSNorm calls."""
+
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch_npu
 
+from vllm_ascend.models.deepseek_v41 import model as v41_model
 from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41RMSNorm
 from vllm_ascend.models.deepseek_v41.engram_gate import engram_gate
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41DecoderLayer
@@ -75,6 +78,39 @@ def test_rmsnorm_graph_replay_uses_new_input(width, has_weight, dtype):
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("engram_enabled", [False, True])
+def test_weightless_norm_buffers_are_initialized_and_move_with_layer(monkeypatch, engram_enabled):
+    def init_parent(self, *args, **kwargs):
+        torch.nn.Module.__init__(self)
+        self.layer_idx = 0
+
+    # Exercise the real V4.1 constructor without loading attention/MoE weights.
+    monkeypatch.setattr(DeepseekV41DecoderLayer.__bases__[0], "__init__", init_parent)
+    monkeypatch.setattr(v41_model, "get_ascend_config", lambda: SimpleNamespace(enable_engram=engram_enabled))
+    config = SimpleNamespace(
+        hc_mult=4,
+        hidden_size=5120,
+        engram_layer_ids=[0],
+        engram_max_ngram_size=2,
+        engram_n_heads=1,
+        engram_head_dim=32,
+    )
+    layer = DeepseekV41DecoderLayer(SimpleNamespace(model_config=SimpleNamespace(hf_config=config)), "layers.0")
+    layer.npu()
+    expected_buffers = {"hc_norm_gamma": config.hc_mult * config.hidden_size}
+    if engram_enabled:
+        expected_buffers["engram.norm_gamma"] = config.hidden_size
+    else:
+        assert layer.engram is None
+    for name, width in expected_buffers.items():
+        gamma = layer.get_buffer(name)
+        assert gamma.device.type == "npu" and gamma.dtype == torch.float32
+        torch.testing.assert_close(gamma.cpu(), torch.ones(width), rtol=0, atol=0)
+        assert name not in layer.state_dict()
+        assert name not in dict(layer.named_parameters())
+
+
+@torch.inference_mode()
 def test_weightless_hc_mixes_matches_reference():
     torch.manual_seed(43)
     width, hc_mult = 5120, 4
@@ -82,6 +118,7 @@ def test_weightless_hc_mixes_matches_reference():
     torch.nn.Module.__init__(layer)
     layer.hc_mult, layer.hc_sinkhorn_iters = hc_mult, 3
     layer.norm_eps, layer.hc_eps = 1e-6, 1e-6
+    layer.register_buffer("hc_norm_gamma", torch.ones(hc_mult * width), persistent=False)
     x = torch.randn(32, hc_mult, width, dtype=torch.bfloat16)
     hc_fn = torch.randn(2 * hc_mult + hc_mult**2, width * hc_mult) / width
     scale, base = torch.randn(3), torch.randn(2 * hc_mult + hc_mult**2)
@@ -127,9 +164,10 @@ def test_weightless_engram_gate_matches_reference_and_replays(scale):
 
     h_npu, k_npu = hidden.npu(), key.npu()
     v_npu, w_npu, rotation_npu, mask_npu = value.npu(), channel_weight.npu(), rotation.npu(), mask.npu()
+    norm_gamma = torch.ones(width, dtype=torch.float32, device="npu")
 
     def run():
-        return engram_gate(h_npu, k_npu, v_npu, w_npu, rotation_npu, mask_npu, eps)
+        return engram_gate(h_npu, k_npu, v_npu, w_npu, rotation_npu, mask_npu, norm_gamma, eps)
 
     torch.testing.assert_close(run().cpu(), reference(hidden, key), rtol=0.016, atol=1e-3)
     torch.npu.synchronize()

@@ -223,7 +223,7 @@ def test_gate_preserves_masked_rows(mock_npu_rms_norm):
     key = torch.randn(3, 4, 32).bfloat16()
     value = torch.randn(3, 32).bfloat16()
     out = gate(hidden, key, value, torch.randn(4, 32), torch.eye(32),
-               torch.tensor([True, False, True]), 1e-5)
+               torch.tensor([True, False, True]), torch.ones(32), 1e-5)
     assert torch.equal(out[1], hidden[1])
     assert torch.isfinite(out.float()).all()
 

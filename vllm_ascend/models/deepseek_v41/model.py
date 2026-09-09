@@ -414,6 +414,11 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
     def __init__(self, vllm_config, prefix, **kwargs):
         super().__init__(vllm_config, prefix, **kwargs)
         config = vllm_config.model_config.hf_config
+        self.register_buffer(
+            "hc_norm_gamma",
+            torch.ones(config.hc_mult * config.hidden_size, dtype=torch.float32),
+            persistent=False,
+        )
         engram_enabled = get_ascend_config().enable_engram
         if engram_enabled and self.layer_idx in config.engram_layer_ids:
             self.engram = torch.nn.Module()
@@ -429,6 +434,9 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
             self.engram.k_weight = torch.nn.Parameter(
                 torch.empty(config.hc_mult, config.hidden_size, dtype=torch.bfloat16)
             )
+            self.engram.register_buffer(
+                "norm_gamma", torch.ones(config.hidden_size, dtype=torch.float32), persistent=False
+            )
         else:
             self.engram = None
 
@@ -436,9 +444,7 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
         x_float = x.float()
         flat = x_float.flatten(-2)
         mixes = torch.nn.functional.linear(flat, hc_fn)
-        _, rstd = torch_npu.npu_rms_norm(
-            flat, torch.ones(flat.shape[-1], dtype=flat.dtype, device=flat.device), epsilon=self.norm_eps
-        )
+        _, rstd = torch_npu.npu_rms_norm(flat, self.hc_norm_gamma, epsilon=self.norm_eps)
         mixes *= rstd
         pre, post, comb = mixes.split(
             [self.hc_mult, self.hc_mult, self.hc_mult * self.hc_mult], -1
@@ -675,6 +681,7 @@ class DeepseekV41Model(DeepseekV4Model):
                     layer.engram.q_weight.float() * layer.engram.k_weight.float(),
                     self.engram_rotation,
                     active_mask,
+                    layer.engram.norm_gamma,
                     self.config.rms_norm_eps,
                 )
             hidden_states, pre_mix = layer(
