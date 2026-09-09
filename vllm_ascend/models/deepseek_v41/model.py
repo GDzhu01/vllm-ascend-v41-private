@@ -543,9 +543,8 @@ class DeepseekV41Model(DeepseekV4Model):
         ascend_config = get_ascend_config()
         storage_format = ascend_config.engram_storage
         query_group = EngramQueryGroup.from_vllm(vllm_config.parallel_config)
-        for layer_id, rows in zip(config.engram_layer_ids, config.engram_num_embeddings):
-            if not ascend_config.enable_engram:
-                break
+        if ascend_config.enable_engram:
+            for layer_id, rows in zip(config.engram_layer_ids, config.engram_num_embeddings):
                 self.layers[layer_id].engram.embed = NodeShardedEngram(
                     rows, config.engram_head_dim, query_group, storage_format=storage_format,
                 )
