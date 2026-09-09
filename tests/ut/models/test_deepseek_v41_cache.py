@@ -229,12 +229,24 @@ def test_unsupported_runtime_fails_before_registration(runtime, feature):
     elif feature == "v2":
         runtime.use_v2_model_runner = True
     else:
+        from vllm.config import CUDAGraphMode
+
         runtime.model_config.enforce_eager = False
+        runtime.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
     with pytest.raises(NotImplementedError):
         from vllm_ascend.core.deepseek_v41 import validate_cache_runtime
 
         validate_cache_runtime(runtime)
     assert not runtime.compilation_config.static_forward_context
+
+
+def test_full_decode_runtime_reaches_cache_registration(runtime):
+    from vllm.config import CUDAGraphMode
+    from vllm_ascend.core.deepseek_v41 import validate_cache_runtime
+
+    runtime.model_config.enforce_eager = False
+    runtime.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    validate_cache_runtime(runtime)
 
 
 def test_compression_slot_mapping():

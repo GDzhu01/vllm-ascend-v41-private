@@ -9,7 +9,9 @@ path.  A future fused AscendC implementation can therefore replace the small
 operators here without moving cache or scheduler knowledge back into the model.
 """
 
-from dataclasses import dataclass
+import os
+from pathlib import Path
+from dataclasses import dataclass, fields
 from typing import Any
 
 import torch
@@ -17,7 +19,12 @@ import torch.nn.functional as F
 from torch import nn
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata, AttentionMetadataBuilder
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionCGSupport,
+    AttentionMetadata,
+    AttentionMetadataBuilder,
+)
 
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41CompressorStateSpec,
@@ -26,6 +33,7 @@ from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41SWASpec,
 )
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
+from vllm_ascend.ops.triton.v41_cache import scatter_cache_rows
 
 
 @dataclass
@@ -208,15 +216,27 @@ def _request_counts(common: Any, num_reqs: int):
 
 
 def scatter_cache(cache: torch.Tensor, slots: torch.Tensor, values: torch.Tensor) -> None:
-    """Write valid rows into one V4.1 paged cache using ordinary tensor ops."""
-    cache = cache.squeeze(-2)
+    """Write valid rows without a host-side reduction or dynamic indexing.
+
+    ``valid.any()`` on an NPU tensor synchronizes the copy stream and is not
+    legal while ACLGraph is being captured.  The Triton kernel masks negative
+    slots in device code, so the same operation is graph-safe for both eager
+    and capture paths.
+    """
     slots = slots[: values.shape[0]].long()
-    valid = slots >= 0
-    if valid.any():
-        physical = slots[valid]
-        pages = torch.div(physical, cache.shape[1], rounding_mode="floor")
-        rows = physical.remainder(cache.shape[1])
-        cache[pages, rows] = values[valid].to(cache.dtype)
+    if values.dtype != cache.dtype:
+        values = values.to(cache.dtype)
+    # Keep the host/unit-test path independent of the Ascend Triton backend.
+    if cache.device.type != "npu":
+        cache_view = cache.squeeze(-2)
+        valid = slots >= 0
+        if valid.any():
+            physical = slots[valid]
+            pages = torch.div(physical, cache_view.shape[1], rounding_mode="floor")
+            rows = physical.remainder(cache_view.shape[1])
+            cache_view[pages, rows] = values[valid]
+        return
+    scatter_cache_rows(cache, slots, values)
 
 
 def gather_cache_rows(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
@@ -458,21 +478,24 @@ class DeepseekV41EagerAttentionImpl:
                 state_rows,
             )
             completed = positions.remainder(ratio) == ratio - 1
-            completed_slots = compressor_metadata.state.slot_mapping[
-                : positions.shape[0]
-            ][completed].long()
-            current = gather_cache_rows(state_cache, completed_slots)
-            previous = gather_cache_rows(state_cache, completed_slots - 1)
+            completed_slots = compressor_metadata.state.slot_mapping[: positions.shape[0]].long()
+            # Keep a static row count during ACLGraph capture.  Invalid
+            # (non-completed) rows use a safe gather slot and are masked before
+            # publishing; boolean indexing would lower to dynamic nonzero.
+            safe_slots = completed_slots.clamp_min(0)
+            current = gather_cache_rows(state_cache, safe_slots)
+            previous = gather_cache_rows(state_cache, (safe_slots - 1).clamp_min(0))
             pair = torch.stack((previous, current), 1)
             latent = (
                 pair[..., : attn.head_dim]
                 * pair[..., attn.head_dim :].softmax(1)
             ).sum(1)
             latent = compressor.norm(latent.to(hidden_states.dtype))
-        if latent.shape[0] == 0:
-            return
+            latent = torch.where(completed.unsqueeze(-1), latent, torch.zeros_like(latent))
 
-        source_positions = positions[completed] + 1 - ratio
+        source_positions = torch.where(
+            completed, positions + 1 - ratio, torch.zeros_like(positions)
+        )
         source_cos, source_sin = get_cos_and_sin_dsa(source_positions)
         source_cos = source_cos[attn.rotary_emb.layername]
         source_sin = source_sin[attn.rotary_emb.layername]
@@ -480,7 +503,11 @@ class DeepseekV41EagerAttentionImpl:
             raise RuntimeError("V4.1 KV source is missing its indexer")
         attn.indexer.update_keys(
             latent,
-            indexer_metadata.cache.slot_mapping[: positions.shape[0]][completed],
+            torch.where(
+                completed,
+                indexer_metadata.cache.slot_mapping[: positions.shape[0]].long(),
+                torch.full_like(positions, -1),
+            ),
             source_cos,
             source_sin,
         )
@@ -494,7 +521,11 @@ class DeepseekV41EagerAttentionImpl:
         )
         scatter_cache(
             attn.long_kv_cache.kv_cache[0],
-            compressor_metadata.cache.slot_mapping[: positions.shape[0]][completed],
+            torch.where(
+                completed,
+                compressor_metadata.cache.slot_mapping[: positions.shape[0]].long(),
+                torch.full_like(positions, -1),
+            ),
             latent.squeeze(1),
         )
 
@@ -680,6 +711,33 @@ class DeepseekV41EagerAttentionImpl:
             attn, hidden_states, qr, positions, cos, sin, metadata
         )
         output = self._attention(attn, q, positions, metadata, compressed_indices)
+        dump_root = os.environ.get("VLLM_V41_ATTENTION_DUMP")
+        if dump_root and self.role.layer_idx == 24 and hidden_states.shape[0] == 188:
+            rank = torch.distributed.get_rank()
+            path = Path(dump_root) / f"layer24-rank{rank}.pt"
+            if rank % 8 == 0 and not path.exists():
+                def cpu_meta(meta):
+                    return {field.name: (getattr(meta, field.name).detach().cpu()
+                            if isinstance(getattr(meta, field.name), torch.Tensor)
+                            else getattr(meta, field.name)) for field in fields(meta)}
+                source = forward_context.no_compile_layers[self.long_kv_source_prefix].kv_cache[0]
+                payload = {
+                    "hidden": hidden_states.detach().cpu(),
+                    "q": q.detach().cpu(), "qr": qr.detach().cpu(),
+                    "kv": kv.detach().cpu(), "positions": positions.detach().cpu(),
+                    "cos": cos.detach().cpu(), "sin": sin.detach().cpu(),
+                    "swa_cache": attn.dsa_attn.swa_cache_layer.kv_cache[0].detach().cpu(),
+                    "source_cache": source.detach().cpu(),
+                    "indices": compressed_indices.detach().cpu(),
+                    "sinks": attn.attn_sink.detach().cpu(),
+                    "output": output.detach().cpu(),
+                    "swa_metadata": cpu_meta(metadata.swa),
+                    "source_metadata": cpu_meta(metadata.attention),
+                    "scale": attn.softmax_scale,
+                }
+                path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(payload, path)
+                print(f"V41_ATTENTION_DUMP {path}", flush=True)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             output.unsqueeze(1),
             cos,
@@ -688,13 +746,16 @@ class DeepseekV41EagerAttentionImpl:
             partial_slice=[attn.nope_head_dim, attn.head_dim],
         )
         projected = torch.empty_like(hidden_states)
-        attn.dsa_attn.dsa_attn.impl._forward_o_proj(output, projected)
+        projected = attn.project_output(output, projected)
         return projected
 
 
 class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
+    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._decode_buffers = {}
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         if common_prefix_len:
@@ -723,11 +784,18 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             else compressed_slot_mapping(common.slot_mapping, ratio)
         )
         coordinates = _cache_coordinates(common, ratio, compressed)
+        # Some Ascend scheduler paths omit the host mirrors.  Materialize
+        # them while building metadata (before model/ACLGraph execution), so
+        # Engram routing never calls ``.cpu()`` on a graph/replay tensor.
+        if coordinates["query_start_loc_cpu"] is None:
+            coordinates["query_start_loc_cpu"] = common.query_start_loc.detach().cpu()
+        if coordinates["seq_lens_cpu"] is None:
+            coordinates["seq_lens_cpu"] = common.seq_lens.detach().cpu()
         positions = getattr(common, "positions", None)
         cos = sin = None
         if cache_kind == "swa" and positions is not None:
             positions = positions[: common.num_input_tokens].long()
-            cos, sin = get_cos_and_sin_dsa(positions)
+            cos, sin = get_cos_and_sin_dsa(positions, use_cache=True)
         num_reqs = int(getattr(common, "num_reqs", common.seq_lens.shape[0]))
         (
             num_decodes,
@@ -737,7 +805,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         ) = _request_counts(common, num_reqs)
         text_config = self.vllm_config.model_config.hf_text_config
         window_size = int(getattr(text_config, "sliding_window", 0))
-        return DeepseekV41Metadata(
+        metadata = DeepseekV41Metadata(
             block_table=common.block_table_tensor[:num_reqs],
             slot_mapping=slots,
             compress_ratio=ratio,
@@ -766,6 +834,22 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             **coordinates,
         )
 
+        # FULL decode graphs capture addresses of metadata tensors built outside
+        # the graph. Keep each batch shape alive and refresh it before replay.
+        if metadata.max_query_len == 1:
+            key = (metadata.num_input_tokens, metadata.num_reqs)
+            buffers = self._decode_buffers.setdefault(key, {})
+            for field in fields(metadata):
+                value = getattr(metadata, field.name)
+                if not isinstance(value, torch.Tensor) or value.device.type == "cpu":
+                    continue
+                if field.name not in buffers:
+                    buffers[field.name] = value.clone()
+                else:
+                    buffers[field.name].copy_(value)
+                setattr(metadata, field.name, buffers[field.name])
+        return metadata
+
 
 class DeepseekV41CacheBackend(AttentionBackend):
     """Cache-only backend: supplies layout and metadata, not an AttentionImpl."""
@@ -773,6 +857,12 @@ class DeepseekV41CacheBackend(AttentionBackend):
     @staticmethod
     def get_name():
         return "ASCEND_DSA_V41_CACHE"
+
+    # The V4.1 implementation has a fixed single-token decode contract. The
+    # actual attention executes in the model layer, while this backend only
+    # supplies metadata; declaring the narrow support lets the outer Ascend
+    # ACLGraph capture FULL_DECODE_ONLY without claiming prefill support.
+    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     @staticmethod
     def get_impl_cls():

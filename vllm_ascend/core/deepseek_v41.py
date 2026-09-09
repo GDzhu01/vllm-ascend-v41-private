@@ -6,6 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 import torch
+from vllm.config import CUDAGraphMode
 from vllm.v1.core.kv_cache_utils import may_override_num_blocks
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheTensor, UniformTypeKVCacheSpecs
 
@@ -234,8 +235,11 @@ def reshape_cache(raw: torch.Tensor, spec, num_blocks=None, offset=0, block_stri
 def validate_cache_runtime(vllm_config):
     if vllm_config.use_v2_model_runner:
         raise NotImplementedError("V4.1 cache initialization currently requires model runner V1")
-    if not vllm_config.model_config.enforce_eager:
-        raise NotImplementedError("V4.1 cache initialization currently requires enforce_eager")
+    if (
+        not vllm_config.model_config.enforce_eager
+        and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
+    ):
+        raise NotImplementedError("V4.1 graph runtime requires FULL_DECODE_ONLY")
     if vllm_config.cache_config.enable_prefix_caching:
         raise NotImplementedError("V4.1 prefix state restoration is not implemented")
     if vllm_config.speculative_config is not None or vllm_config.kv_transfer_config is not None:
