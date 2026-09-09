@@ -4460,8 +4460,6 @@ class NPUModelRunner(GPUModelRunner):
         alignment = 2 * 1024 * 1024
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
         if any(is_v41_spec(spec) for spec in layer_kv_cache_spec.values()):
-            if not all(is_v41_spec(spec) for spec in layer_kv_cache_spec.values()):
-                raise ValueError("Mixed V4.1 cache allocation is not supported")
             slots = plan_cache_slots(layer_kv_cache_spec)
             if len(kv_cache_config.kv_cache_tensors) != len(slots):
                 raise ValueError("V4.1 requires one allocation per layer slot")

@@ -15,10 +15,11 @@ from vllm_ascend.core.deepseek_v41 import (
     pool_bytes_per_block,
     reshape_cache,
 )
+from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
 from vllm_ascend.models.deepseek_v41.model import build_v41_cache_specs
 
 
-def make_cache_config(num_blocks, *, block_size=128, head_size=512, index_size=128):
+def make_cache_config(num_blocks, *, block_size=128, head_size=512, index_size=128, draft_layers=0):
     config = dict(
         num_hidden_layers=40,
         compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
@@ -35,6 +36,16 @@ def make_cache_config(num_blocks, *, block_size=128, head_size=512, index_size=1
     )
     runtime = SimpleNamespace(cache_config=SimpleNamespace(block_size=block_size, num_gpu_blocks_override=None))
     specs = build_v41_cache_specs(config, runtime)
+    for stage in range(draft_layers):
+        specs[f"model.layers.{40 + stage}.self_attn.swa_cache"] = AscendSlidingWindowMLASpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=head_size,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+            cache_dtype_str="auto",
+            model_version="deepseek_v4",
+        )
     groups = make_cache_groups(group_cache_specs(specs))
     blocks, tensors = allocate_cache_config(runtime, groups, num_blocks * pool_bytes_per_block(groups))
     return KVCacheConfig(num_blocks=blocks, kv_cache_tensors=tensors, kv_cache_groups=groups)

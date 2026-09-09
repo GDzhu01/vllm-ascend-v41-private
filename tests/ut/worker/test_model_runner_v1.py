@@ -425,6 +425,17 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "allocation disagrees"):
             runner._allocate_kv_cache_tensors(config)
 
+    def test_v41_dspark_allocates_independent_draft_slots(self):
+        runner = self._build_runner()
+        config = make_cache_config(3, draft_layers=3)
+
+        raw = runner._allocate_kv_cache_tensors(config)
+
+        draft_names = [f"model.layers.{40 + stage}.self_attn.swa_cache" for stage in range(3)]
+        assert len({id(value) for value in raw.values()}) == 7
+        assert len({id(raw[name]) for name in draft_names}) == 3
+        assert all(raw[name] is not raw["model.layers.2.self_attn.long_kv_cache"] for name in draft_names)
+
     def test_allocate_kv_cache_uses_layer_spec_for_draft_gqa(self):
         runner = self._build_runner()
         runner.sparse_kv_offload_enabled = False
