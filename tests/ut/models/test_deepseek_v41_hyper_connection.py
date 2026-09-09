@@ -237,7 +237,9 @@ def test_v41_dspark_propagates_delayed_mix_and_collapses_final_stream():
     seen = []
 
     class Layer(torch.nn.Module):
-        def forward(self, positions, hidden, pre_mix, input_ids=None):
+        hc_collapse = staticmethod(DeepseekV41DecoderLayer.hc_collapse)
+
+        def forward(self, positions, hidden, pre_mix, llama_4_scaling=None, input_ids=None):
             seen.append(pre_mix.clone())
             return hidden + 1, pre_mix.flip(-1)
 
@@ -252,7 +254,7 @@ def test_v41_dspark_propagates_delayed_mix_and_collapses_final_stream():
     assert [x[0].tolist() for x in seen] == [[1, 0], [0, 1], [1, 0]]
 
 
-def test_v41_target_emits_selected_aux_and_updates_persistent_mtp_buffer():
+def test_v41_target_emits_input_residual_for_selected_aux_layers():
     from vllm_ascend.models.deepseek_v41.model import DeepseekV41Model
 
     model = DeepseekV41Model.__new__(DeepseekV41Model)
@@ -261,8 +263,6 @@ def test_v41_target_emits_selected_aux_and_updates_persistent_mtp_buffer():
     model.embed_tokens = torch.nn.Embedding(4, 3)
     model.norm = torch.nn.Identity()
     model.shared_attention_state = MagicMock()
-    model._mtp_hidden_buffer = torch.full((5, 6), -10.0)
-    ptr = model._mtp_hidden_buffer.data_ptr()
     model._set_aux_hidden_state_layers((1, 3))
 
     class Layer(torch.nn.Module):
@@ -283,36 +283,34 @@ def test_v41_target_emits_selected_aux_and_updates_persistent_mtp_buffer():
     embedded = model.embed_tokens(ids)
     torch.testing.assert_close(output, embedded + 3)
     assert len(aux) == 2
-    torch.testing.assert_close(aux[0], embedded + 1)
-    torch.testing.assert_close(aux[1], embedded + 3)
-    assert model._mtp_hidden_buffer.data_ptr() == ptr
-    torch.testing.assert_close(model._mtp_hidden_buffer[:2], (embedded + 3).unsqueeze(1).repeat(1, 2, 1).flatten(1))
-    assert (model._mtp_hidden_buffer[2:] == -10).all()
+    torch.testing.assert_close(aux[0], embedded)
+    torch.testing.assert_close(aux[1], embedded + 2)
 
 
 def test_v41_dspark_decoder_uses_draft_experts_instead_of_target_config():
     from contextlib import ExitStack
     from types import SimpleNamespace
 
-    import vllm_ascend.models.deepseek_v4.dspark as shared
+    import vllm_ascend.models.deepseek_v41.dspark as shared
     from vllm_ascend.models.deepseek_v41.dspark import DeepseekV41DSparkModel
 
     draft = SimpleNamespace(
-        hc_mult=4, hidden_size=8, dspark_block_size=5,
+        hc_mult=4, hidden_size=8, dspark_block_size=5, num_nextn_predict_layers=3,
         dspark_target_layer_ids=[37, 38, 39], num_hidden_layers=40,
         vocab_size=16, rms_norm_eps=1e-6, hc_eps=1e-6,
         n_routed_experts=128, num_experts_per_tok=3,
     )
     config = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=SimpleNamespace(n_routed_experts=384)),
-        speculative_config=SimpleNamespace(draft_model_config=SimpleNamespace(hf_config=draft)),
+        speculative_config=SimpleNamespace(draft_model_config=SimpleNamespace(hf_text_config=draft)),
         quant_config=None,
     )
     factory = MagicMock(side_effect=lambda *args, **kwargs: torch.nn.Module())
     with ExitStack() as stack:
         for name in ("VocabParallelEmbedding", "ColumnParallelLinear", "RMSNorm", "DSparkMarkovHead", "DSparkConfidenceHead"):
             stack.enter_context(patch.object(shared, name, side_effect=lambda *args, **kwargs: torch.nn.Identity()))
-        stack.enter_context(patch.object(DeepseekV41DSparkModel, "decoder_layer_cls", factory))
+        stack.enter_context(patch.object(shared, "DeepseekV41DSparkDecoderLayer", factory))
+        stack.enter_context(patch.object(shared, "validate_cache_runtime"))
         model = DeepseekV41DSparkModel(vllm_config=config)
     assert len(model.layers) == factory.call_count == 3
     for call in factory.call_args_list:

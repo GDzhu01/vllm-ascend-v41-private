@@ -323,8 +323,15 @@ class DeepseekV41EagerAttentionImpl:
 
     def _prepare_inputs_and_caches(self, attn, hidden_states, metadata, metadata_by_prefix):
         local_hidden_states = hidden_states[: metadata.swa.num_actual_tokens]
-        self._update_caches(attn, local_hidden_states, metadata)
         return local_hidden_states
+
+    def _prepare_queries(self, attn, hidden_states, positions, cos, sin, metadata):
+        v1_impl = attn.dsa_attn.dsa_attn.impl
+        preprocess = self.multistream_preprocess if v1_impl.multistream_dsv4_dsa_overlap else self.preprocess
+        q, qr = preprocess(attn, hidden_states, cos, sin, metadata.swa)
+        if self.role.is_kv_source:
+            self._write_compressed_source(attn, hidden_states, positions, cos, sin, metadata)
+        return q, qr
 
     def _project_output(self, attn, output, hidden_states, metadata):
         padded = output
@@ -626,7 +633,7 @@ class DeepseekV41EagerAttentionImpl:
         if num_tokens:
             positions = metadata.positions[:num_tokens]
             cos, sin = metadata.rope(attn.rotary_emb.layername, num_tokens)
-            q, qr = self._project_q(attn, local_hidden_states, cos, sin)
+            q, qr = self._prepare_queries(attn, local_hidden_states, positions, cos, sin, metadata)
             compressed_indices = self._select_sparse_indices(
                 attn, local_hidden_states, qr, positions, cos, sin, metadata
             )

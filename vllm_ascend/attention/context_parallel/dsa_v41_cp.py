@@ -135,6 +135,10 @@ class DeepseekV41CPImpl(DeepseekV41EagerAttentionImpl):
         start, _, _, _ = metadata.swa.cp_token_range
         return hidden_states[start : start + metadata.swa.num_actual_tokens]
 
+    def _prepare_queries(self, attn, hidden_states, positions, cos, sin, metadata):
+        # Replicated caches were updated before the TP token slice.
+        return self._project_q(attn, hidden_states, cos, sin)
+
     def _project_output(self, attn, output, hidden_states, metadata):
         _, _, per_rank, _ = metadata.swa.cp_token_range
         padded = output.new_zeros((per_rank, output.shape[1], output.shape[2]))

@@ -279,7 +279,7 @@ def test_request_accounting_counts_merged_full_context_once(runtime):
 def test_mixed_layouts_rejected(config, runtime):
     specs = collect_specs(runtime)
     specs["foreign"] = object()
-    with pytest.raises(ValueError, match="DSpark SWA"):
+    with pytest.raises(ValueError, match="foreign resources"):
         group_cache_specs(specs)
 
 
@@ -1413,38 +1413,6 @@ def test_v41_backend_routes_metadata_and_execution_together(monkeypatch, pcp, cp
         assert issubclass(impl, dsa_v41_cp.DeepseekV41CPImpl)
 
 
-def test_dspark_caches_have_separate_contiguous_backing(runtime):
-    from vllm_ascend.core.deepseek_v41 import allocate_packed_cache
-    from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
-
-    specs = collect_specs(runtime)
-    target_groups = make_cache_groups(group_cache_specs(specs))
-    target_stride = pool_bytes_per_block(target_groups)
-    draft = AscendSlidingWindowMLASpec(
-        block_size=64, num_kv_heads=1, head_size=8, dtype=torch.bfloat16,
-        sliding_window=128, compress_ratio=1,
-    )
-    for i in range(3):
-        specs[f"mtp.{i}.self_attn.swa_cache"] = draft
-    groups = make_cache_groups(group_cache_specs(specs))
-    assert len(groups) == len(target_groups) + 3
-    bytes_per_block = target_stride + 3 * draft.page_size_bytes
-    assert pool_bytes_per_block(groups) == bytes_per_block
-    num_blocks, tensors = allocate_cache_config(runtime, groups, bytes_per_block * 7)
-    assert num_blocks == 7
-    raw = allocate_packed_cache(SimpleNamespace(kv_cache_tensors=tensors, num_blocks=num_blocks), specs, torch.device("cpu"))
-    draft_tensors = [t for t in tensors if t.block_stride == 0]
-    assert len(draft_tensors) == 3
-    draft_ptrs = set()
-    for t in draft_tensors:
-        assert t.size == 7 * draft.page_size_bytes
-        backing = raw[t.shared_by[0]]
-        assert backing.is_contiguous()
-        draft_ptrs.add(backing.data_ptr())
-    assert len(draft_ptrs) == 3
-    assert raw["model.layers.0.self_attn.swa_cache"].data_ptr() not in draft_ptrs
-
-
 def test_v41_cp_accepts_async_seq_lens_mirror(runtime, monkeypatch):
     from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
 
@@ -1485,3 +1453,40 @@ def test_v41_runtime_rejects_pcp_and_mrv2(runtime, v2, pcp):
     runtime.parallel_config.prefill_context_parallel_size = pcp
     with pytest.raises(NotImplementedError, match="runner V1" if v2 else "PCP=1"):
         validate_cache_runtime(runtime)
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_v41_query_preparation_keeps_mainline_preprocess(overlap):
+    from unittest.mock import Mock
+    from vllm_ascend.attention.dsa_v41 import DeepseekV41EagerAttentionImpl
+
+    impl = DeepseekV41EagerAttentionImpl.__new__(DeepseekV41EagerAttentionImpl)
+    impl.role = SimpleNamespace(is_kv_source=True)
+    impl.preprocess = Mock(return_value=("q", "qr"))
+    impl.multistream_preprocess = Mock(return_value=("q", "qr"))
+    impl._write_compressed_source = Mock()
+    attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(
+        impl=SimpleNamespace(multistream_dsv4_dsa_overlap=overlap))))
+    metadata = SimpleNamespace(swa=object())
+    assert impl._prepare_queries(attn, "hidden", "positions", "cos", "sin", metadata) == ("q", "qr")
+    selected = impl.multistream_preprocess if overlap else impl.preprocess
+    other = impl.preprocess if overlap else impl.multistream_preprocess
+    selected.assert_called_once_with(attn, "hidden", "cos", "sin", metadata.swa)
+    other.assert_not_called()
+    impl._write_compressed_source.assert_called_once_with(attn, "hidden", "positions", "cos", "sin", metadata)
+
+
+def test_v41_cp_query_preparation_does_not_rewrite_global_caches():
+    from unittest.mock import Mock
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
+
+    impl = DeepseekV41CPImpl.__new__(DeepseekV41CPImpl)
+    impl._project_q = Mock(return_value=("q", "qr"))
+    impl.preprocess = Mock()
+    impl.multistream_preprocess = Mock()
+    impl._write_compressed_source = Mock()
+    assert impl._prepare_queries("attn", "local", "positions", "cos", "sin", "metadata") == ("q", "qr")
+    impl._project_q.assert_called_once_with("attn", "local", "cos", "sin")
+    impl.preprocess.assert_not_called()
+    impl.multistream_preprocess.assert_not_called()
+    impl._write_compressed_source.assert_not_called()

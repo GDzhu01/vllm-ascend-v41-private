@@ -140,7 +140,6 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.core.circular_buffer import is_circular_spec
 from vllm_ascend.core.deepseek_v41 import (
-    allocate_packed_cache,
     is_v41_spec,
     plan_cache_slots,
     reshape_cache,
