@@ -1265,9 +1265,36 @@ def test_v41_cp_metadata_preserves_global_compression_and_local_causality(
     assert metadata.positions.tolist() == positions
     assert metadata.global_metadata.seq_lens.tolist() == [3, 5]
     assert metadata.global_metadata.cache_seq_lens.tolist() == [1, 2]
-    assert metadata.global_metadata.slot_mapping.tolist() == [-1, 0, -1, -1]
+    assert metadata.global_metadata.slot_mapping.tolist() == [[-1, -1], [0, 0], [-1, -1], [-1, -1]]
     assert metadata.num_actual_tokens == len(positions)
 
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_v41_cp_uses_device_seq_lens_when_cpu_mirror_is_upper_bound(runtime, monkeypatch, rank):
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
+
+    monkeypatch.setattr(
+        "vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
+        lambda: SimpleNamespace(world_size=2, rank_in_group=rank),
+    )
+    # A speculative rejection has corrected device lengths and positions;
+    # the host mirror still describes the optimistic upper bound.
+    common = _cp_common().replace(
+        seq_lens=torch.tensor([7, 9], dtype=torch.int32),
+        seq_lens_cpu=None,
+        _seq_lens_cpu=torch.tensor([9, 11], dtype=torch.int32),
+        positions=torch.tensor([4, 5, 6, 8]),
+        max_seq_len=11,
+    )
+    spec = collect_specs(runtime)["model.layers.2.self_attn.long_kv_cache"]
+    builder = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    metadata = builder.build(0, common)
+    expected = [6, 0] if rank == 0 else [7, 9]
+    assert metadata.global_metadata.seq_lens.tolist() == [7, 9]
+    assert metadata.seq_lens.tolist() == expected
+    assert metadata.cache_seq_lens.tolist() == [n // 2 for n in expected]
+    assert metadata.cmp_residual.tolist() == [n % 2 for n in expected]
 
 
 @pytest.mark.parametrize("rank", [0, 1, 3, 7])
@@ -1355,8 +1382,8 @@ def test_v41_pcp_uses_canonical_metadata_and_rank_local_slot_view(runtime, monke
         global_batch=SimpleNamespace(is_dummy=False), hidden_restore_idx=torch.tensor([0, 1, 2, 3])
     )
     metadata = builder.build(0, local_common, pcp_context=context, pcp_cache_group_idx=0)
-    assert metadata.slot_mapping.tolist() == [-1, -1]
-    assert metadata.global_metadata.slot_mapping.tolist() == [-1, 0, -1, -1]
+    assert metadata.slot_mapping.tolist() == [[-1, -1], [-1, -1]]
+    assert metadata.global_metadata.slot_mapping.tolist() == [[-1, -1], [0, 0], [-1, -1], [-1, -1]]
     assert metadata.positions.tolist() == [2, 4]
     assert metadata.hidden_restore_idx.tolist() == [0, 1, 2, 3]
 
@@ -1434,7 +1461,7 @@ def test_v41_cp_consumers_reuse_local_topk_and_candidates():
     assert shared.candidates is candidates
 
 
-def test_v41_v2_packed_cache_keeps_one_backing_and_scale_views(runtime, monkeypatch):
+def test_v41_v2_packed_cache_keeps_four_backings_and_scale_views(runtime, monkeypatch):
     from vllm_ascend.worker.v2.attn_utils import _allocate_kv_cache, _reshape_kv_cache_v2
 
     specs = collect_specs(runtime)
@@ -1444,7 +1471,7 @@ def test_v41_v2_packed_cache_keeps_one_backing_and_scale_views(runtime, monkeypa
     cache_config = SimpleNamespace(kv_cache_groups=groups, kv_cache_tensors=tensors, num_blocks=num_blocks)
     monkeypatch.setattr("vllm_ascend.worker.v2.attn_utils.get_current_vllm_config", lambda: runtime)
     raw = _allocate_kv_cache(cache_config, {}, torch.device("cpu"))
-    assert len({tensor.data_ptr() for tensor in raw.values()}) == 1
+    assert len({tensor.data_ptr() for tensor in raw.values()}) == 4
     attn_groups = [
         SimpleNamespace(
             kv_cache_group_id=i,
@@ -1459,8 +1486,9 @@ def test_v41_v2_packed_cache_keeps_one_backing_and_scale_views(runtime, monkeypa
     key, scale = views[index_name]
     assert key.dtype == torch.int8
     assert scale.dtype == torch.float16
-    assert key.stride(0) == stride
-    assert scale.stride(0) * scale.element_size() == stride
+    index_stride = next(t.block_stride for t in tensors if index_name in t.shared_by)
+    assert key.stride(0) == index_stride
+    assert scale.stride(0) * scale.element_size() == index_stride
     assert key.untyped_storage().data_ptr() == scale.untyped_storage().data_ptr()
 
 
@@ -1501,17 +1529,19 @@ def test_v41_pcp_ratio2_pairs_tokens_across_rank_segments(monkeypatch):
     impl = DeepseekV41PCPImpl("layer", SimpleNamespace(is_kv_source=True, compress_ratio=2), None, None, None)
     state = SimpleNamespace(
         slot_mapping=torch.arange(4),
-        c2_complete_mask=None,
-        c2_current_state_slots=None,
-        c2_previous_state_slots=None,
+        c2_complete_mask=torch.tensor([False, True, False, True]),
+        c2_ring_metadata=torch.zeros((5, 1), dtype=torch.int32),
+        c2_metadata_group_id=0,
+        c2_source_cos=torch.ones((4, 1)),
+        c2_source_sin=torch.zeros((4, 1)),
         c2_source_positions=None,
     )
     # Incomplete rows are redirected to the reserved null slot after the
     # graph-safe scatter change. Live compressed rows must not use slot zero.
-    compressed = SimpleNamespace(slot_mapping=torch.tensor([-1, 2, -1, 3]))
+    compressed = SimpleNamespace(slot_mapping=torch.tensor([[-1, -1], [0, 2], [-1, -1], [0, 3]]))
     swa = SimpleNamespace(
         positions=torch.arange(4),
-        slot_mapping=torch.arange(4),
+        slot_mapping=torch.tensor([[0, 0], [0, 1], [0, 2], [0, 3]]),
         cos={"layer.attn": torch.ones((4, 1))},
         sin={"layer.attn": torch.zeros((4, 1))},
     )
@@ -1521,7 +1551,21 @@ def test_v41_pcp_ratio2_pairs_tokens_across_rank_segments(monkeypatch):
         DeepseekV41CompressorMetadata(compressed, state),
         DeepseekV41IndexerMetadata(compressed),
     )
+    def scatter(cache, coordinates, values):
+        valid = (coordinates >= 0).all(dim=1)
+        cache[coordinates[valid, 0], coordinates[valid, 1], 0] = values[valid].reshape(-1, cache.shape[-1])
+
+    monkeypatch.setattr("vllm_ascend.attention.dsa_v41.scatter_cache_v2", scatter)
     index_writes = []
+
+    def pool(kv, score, metadata):
+        # Adjacent global rows span the rank-local segments in this fixture.
+        torch.testing.assert_close(kv, gathered[torch.tensor([0, 2, 3, 1])])
+        latent = kv.clone()
+        latent[1::2] = (kv[0::2] + kv[1::2]) / 2
+        return latent
+
+    monkeypatch.setattr("vllm_ascend.attention.dsa_v41.wait_for_device_metadata", lambda *args: None)
     attn = SimpleNamespace(
         head_dim=2,
         nope_head_dim=2,
@@ -1531,6 +1575,7 @@ def test_v41_pcp_ratio2_pairs_tokens_across_rank_segments(monkeypatch):
         compressor=SimpleNamespace(
             wkv=lambda tensor: tensor,
             wgate=torch.zeros_like,
+            pool_projected=pool,
             norm=lambda tensor: tensor,
             state_cache=SimpleNamespace(kv_cache=[torch.zeros((1, 16, 1, 4))]),
         ),
@@ -1600,12 +1645,12 @@ def test_dspark_caches_have_separate_contiguous_backing(runtime):
     for i in range(3):
         specs[f"mtp.{i}.self_attn.swa_cache"] = draft
     groups = make_cache_groups(group_cache_specs(specs))
-    assert len(groups) == 20
+    assert len(groups) == len(target_groups) + 3
     bytes_per_block = target_stride + 3 * draft.page_size_bytes
     assert pool_bytes_per_block(groups) == bytes_per_block
     num_blocks, tensors = allocate_cache_config(runtime, groups, bytes_per_block * 7)
     assert num_blocks == 7
-    raw = allocate_packed_cache(SimpleNamespace(kv_cache_tensors=tensors), specs, torch.device("cpu"))
+    raw = allocate_packed_cache(SimpleNamespace(kv_cache_tensors=tensors, num_blocks=num_blocks), specs, torch.device("cpu"))
     draft_tensors = [t for t in tensors if t.block_stride == 0]
     assert len(draft_tensors) == 3
     draft_ptrs = set()

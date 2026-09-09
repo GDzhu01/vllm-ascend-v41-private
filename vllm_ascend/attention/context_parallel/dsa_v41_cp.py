@@ -4,6 +4,8 @@
 
 from dataclasses import replace
 
+import torch
+
 from vllm.distributed import get_pcp_group, get_tp_group
 
 from vllm_ascend.attention.context_parallel.dsa_common import (
@@ -111,10 +113,17 @@ class DeepseekV41CPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
         qsl = qsl.clamp_max(actual_end - actual_start).to(self._cp_query_start_loc.dtype)
         query_start_loc = self._cp_query_start_loc[: qsl.numel()]
         query_start_loc.copy_(qsl)
+        # Device lengths are authoritative after speculative rejection; the
+        # CPU mirror may still be an upper bound. Remove only the query suffix
+        # beyond this rank's token interval from each request's device length.
+        query_ends = common.query_start_loc_cpu[1 : common.num_reqs + 1]
+        suffix = query_ends - query_ends.clamp(min=actual_start, max=actual_end)
+        local_seq_lens = (common.seq_lens[: common.num_reqs] - suffix.to(common.seq_lens.device)).clamp_min(0)
+        local_seq_lens = torch.where(query_start_loc[1:] > query_start_loc[:-1], local_seq_lens, 0)
         local_common = common.replace(
             query_start_loc=query_start_loc,
             query_start_loc_cpu=qsl,
-            seq_lens=seq_lens.to(common.seq_lens.device),
+            seq_lens=local_seq_lens,
             seq_lens_cpu=seq_lens,
             num_actual_tokens=actual_end - actual_start,
             num_input_tokens=actual_end - actual_start,

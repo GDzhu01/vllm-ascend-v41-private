@@ -33,8 +33,12 @@ class AscendCircularBufferSpec(AttentionSpec):
         return self.block_size
 
     @property
+    def state_content_size_bytes(self):
+        return self.head_size * self.dtype.itemsize
+
+    @property
     def real_page_size_bytes(self):
-        return self.block_size * self.num_kv_heads * self.head_size * self.dtype.itemsize
+        return self.block_size * self.num_kv_heads * self.state_content_size_bytes
 
     @property
     def prefix_cacheable(self):
