@@ -90,6 +90,9 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
             }
         )
 
+        self.needs_moe_input_ids = any(
+            layer.mlp.gate.tid2eid is not None or layer.mlp.gate.bias_vl is not None for layer in self.layers.values()
+        )
         first_layer = self.layers[str(self.mtp_start_layer_idx)]
         self.main_proj = ColumnParallelLinear(
             config.hidden_size * len(self.target_layer_ids),
@@ -117,6 +120,9 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
         pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
         pre_mix[:, 0] = 1.0
         last_layer = None
+        moe_input_ids = input_ids
+        if self.needs_moe_input_ids:
+            moe_input_ids = torch.where(input_ids == -1, 0, input_ids)
         for layer in self.layers.values():
             last_layer = layer
             hidden_states, pre_mix = layer(
@@ -124,7 +130,7 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
                 hidden_states,
                 pre_mix,
                 llama_4_scaling=None,
-                input_ids=input_ids,
+                input_ids=moe_input_ids,
             )
         assert last_layer is not None
         return last_layer.hc_collapse(hidden_states, pre_mix)

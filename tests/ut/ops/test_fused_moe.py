@@ -627,8 +627,9 @@ def test_routing_replay_disabled_keeps_ascend_routing_unchanged(monkeypatch):
 
 
 @pytest.mark.parametrize("hidden_dtype", [torch.float16, torch.bfloat16])
-def test_hash_router_preserves_fp32_weights_and_explicit_input_ids(monkeypatch, hidden_dtype):
-    input_ids = torch.tensor([11, 22], dtype=torch.int32)
+@pytest.mark.parametrize("input_dtype", [torch.int32, torch.int64])
+def test_hash_router_preserves_fp32_weights_and_explicit_input_ids(monkeypatch, hidden_dtype, input_dtype):
+    input_ids = torch.tensor([0, 22], dtype=input_dtype)
     hidden_states = torch.randn(2, 4, dtype=hidden_dtype)
     router_logits = torch.randn(2, 4)
     topk_weights = torch.randn(2, 2)
@@ -673,6 +674,8 @@ def test_hash_router_preserves_fp32_weights_and_explicit_input_ids(monkeypatch, 
     assert weights.dtype == torch.float32
     assert ids is topk_ids
     torch.testing.assert_close(hash_op.call_args.kwargs["input_ids"], input_ids.to(torch.int64))
+    if input_dtype == torch.int64:
+        assert hash_op.call_args.kwargs["input_ids"] is input_ids
     prepare_finalize.all_gather_input_id_with_dp_group.assert_called_once()
 
     with pytest.raises(ValueError, match="hash MoE routing requires input_ids"):

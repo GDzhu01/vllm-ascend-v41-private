@@ -828,6 +828,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             lambda prefix: self.decoder_layer_cls(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
             prefix=f"{prefix}.layers",
         )
+        self.needs_moe_input_ids = any(
+            layer.mlp.gate.tid2eid is not None or layer.mlp.gate.bias_vl is not None
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+        )
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -933,13 +937,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         if pp_group.is_first_rank:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
+        moe_input_ids = input_ids
+        if self.needs_moe_input_ids:
+            moe_input_ids = torch.where(input_ids == -1, 0, input_ids)
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
                 llama_4_scaling,
-                input_ids=input_ids,
+                input_ids=moe_input_ids,
             )
             if layer.layer_idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states.mean(dim=1))

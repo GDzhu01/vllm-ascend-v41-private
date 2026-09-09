@@ -583,6 +583,9 @@ class DeepseekV41Model(DeepseekV4Model):
         pre_mix[:, 0] = 1.0
         last_layer = None
         aux_hidden_states = []
+        moe_input_ids = input_ids
+        if self.needs_moe_input_ids:
+            moe_input_ids = torch.where(input_ids == -1, 0, input_ids)
         for layer in self.layers:
             last_layer = layer
             # DSpark consumes the residual stream entering its configured
@@ -606,7 +609,7 @@ class DeepseekV41Model(DeepseekV4Model):
                     active_mask,
                     self.config.rms_norm_eps,
                 )
-            hidden_states, pre_mix = layer(positions, hidden_states, pre_mix, None, input_ids=input_ids)
+            hidden_states, pre_mix = layer(positions, hidden_states, pre_mix, None, input_ids=moe_input_ids)
         assert last_layer is not None
         hidden_states = last_layer.hc_collapse(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)

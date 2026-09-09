@@ -145,6 +145,9 @@ class DeepseekV4DSparkModel(nn.Module):
             }
         )
 
+        self.needs_moe_input_ids = any(
+            layer.mlp.gate.tid2eid is not None or layer.mlp.gate.bias_vl is not None for layer in self.layers.values()
+        )
         first_layer = self.layers[str(self.mtp_start_layer_idx)]
 
         _model_quant_cfg = getattr(config, "quantization_config", None)
@@ -262,13 +265,16 @@ class DeepseekV4DSparkModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids).unsqueeze(-2).repeat(1, self.hc_mult, 1)
         residual = None
+        moe_input_ids = input_ids
+        if self.needs_moe_input_ids:
+            moe_input_ids = torch.where(input_ids == -1, 0, input_ids)
         for layer in self.layers.values():
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
                 llama_4_scaling=None,
-                input_ids=input_ids,
+                input_ids=moe_input_ids,
             )
         head_hidden = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
         return head_hidden
