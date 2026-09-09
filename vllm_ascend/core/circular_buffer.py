@@ -37,6 +37,11 @@ class AscendCircularBufferSpec(AttentionSpec):
         return self.block_size * self.num_kv_heads * self.head_size * self.dtype.itemsize
 
     @property
+    def unpadded_page_size_bytes(self):
+        """Expose the packed ring size through the current AttentionSpec API."""
+        return self.real_page_size_bytes
+
+    @property
     def prefix_cacheable(self):
         return False
 
