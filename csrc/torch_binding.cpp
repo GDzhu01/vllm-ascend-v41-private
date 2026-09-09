@@ -715,7 +715,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_hash(
     int64_t group_select_mode,
     int64_t renorm,
     int64_t norm_type,
-    bool out_flag)
+    bool out_flag,
+    const c10::optional<at::Tensor>& bias_vl_opt,
+    int64_t image_sentinel_lo,
+    int64_t image_sentinel_count)
 {
 
     TORCH_CHECK(x.dim() == 2, "x must be 2D, but got dim=", x.dim());
@@ -773,9 +776,25 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_hash(
         TORCH_CHECK(tid2eid.dim() >= 1, "tid2eid must have dim>=1, but got dim=", tid2eid.dim());
     }
 
+    if (bias_vl_opt.has_value() && bias_vl_opt->defined()) {
+        const auto& bias_vl = *bias_vl_opt;
+        TORCH_CHECK(input_ids_opt.has_value() && input_ids_opt->defined(),
+                    "input_ids is required when bias_vl is present");
+        TORCH_CHECK(bias_vl.dim() == 1, "bias_vl must be 1D, but got dim=", bias_vl.dim());
+        TORCH_CHECK(bias_vl.size(0) == expert_num,
+                    "bias_vl.size(0) must equal expert_num. bias_vl.size(0)=",
+                    bias_vl.size(0), ", expert_num=", expert_num);
+        TORCH_CHECK(bias_vl.scalar_type() == x.scalar_type(),
+                    "bias_vl dtype must equal x dtype. x=", x.scalar_type(),
+                    ", bias_vl=", bias_vl.scalar_type());
+        TORCH_CHECK(image_sentinel_count > 0,
+                    "image_sentinel_count must be > 0, but got ", image_sentinel_count);
+    }
+
     const at::Tensor& bias = c10::value_or_else(bias_opt, [] { return at::Tensor(); });
     const at::Tensor& input_ids = c10::value_or_else(input_ids_opt, [] { return at::Tensor(); });
     const at::Tensor& tid2eid = c10::value_or_else(tid2eid_opt, [] { return at::Tensor(); });
+    const at::Tensor& bias_vl = c10::value_or_else(bias_vl_opt, [] { return at::Tensor(); });
 
     at::Tensor y = at::empty({rows, k}, x.options());
     at::Tensor expert_idx = at::empty({rows, k}, x.options().dtype(at::kInt));
@@ -786,6 +805,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_hash(
                  bias,
                  input_ids,
                  tid2eid,
+                 bias_vl,
                  k,
                  k_group,
                  group_count,
@@ -795,6 +815,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_hash(
                  renorm,
                  norm_type,
                  out_flag,
+                 image_sentinel_lo,
+                 image_sentinel_count,
                  y,
                  expert_idx,
                  out);
@@ -2417,7 +2439,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "int group_select_mode=0, "
         "int renorm=0, "
         "int norm_type=0, "
-        "bool out_flag=False"
+        "bool out_flag=False, "
+        "Tensor? bias_vl=None, "
+        "int image_sentinel_lo=129257, "
+        "int image_sentinel_count=5"
         ") -> (Tensor y, Tensor expert_idx, Tensor out)"
         );
     ops.impl("moe_gating_top_k_hash", torch::kPrivateUse1,&vllm_ascend::moe_gating_top_k_hash);
