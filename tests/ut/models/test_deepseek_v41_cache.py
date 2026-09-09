@@ -25,6 +25,7 @@ from vllm_ascend.core.deepseek_v41 import (
     pool_bytes_per_block,
     reshape_cache,
 )
+from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
 from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
 from vllm_ascend.models.deepseek_v41.model import build_layer_plan, build_v41_cache_specs
 
@@ -184,6 +185,32 @@ def test_packed_strided_views_support_row_io_without_cross_resource_corruption(c
     torch.testing.assert_close(gather_cache_rows(long_cache, slots), value)
     assert not index_k.any()
     assert not index_scale.any()
+
+
+def test_dspark_adds_one_group_and_three_independent_slots(config, runtime):
+    runtime.cache_config.block_size = 128
+    specs = build_v41_cache_specs(dict(config, head_dim=512, index_head_dim=128), runtime)
+    for stage in range(3):
+        specs[f"model.layers.{40 + stage}.self_attn.swa_cache"] = (
+            AscendSlidingWindowMLASpec(
+                block_size=128,
+                num_kv_heads=1,
+                head_size=512,
+                dtype=torch.bfloat16,
+                sliding_window=128,
+                cache_dtype_str="auto",
+                model_version="deepseek_v4",
+            )
+        )
+    groups = make_cache_groups(group_cache_specs(specs))
+    assert len(groups) == 18
+    assert len(groups[-1].layer_names) == 3
+    assert pool_bytes_per_block(groups) == 540928 + 3 * 131072
+    blocks, tensors = allocate_cache_config(
+        runtime, groups, pool_bytes_per_block(groups) * 3
+    )
+    assert blocks == 3 and len(tensors) == 7
+    assert all(len(t.shared_by) == 1 for t in tensors[-3:])
 
 
 def test_mixed_layouts_rejected(config, runtime):

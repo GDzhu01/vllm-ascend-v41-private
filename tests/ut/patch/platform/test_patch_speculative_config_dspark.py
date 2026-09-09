@@ -76,3 +76,53 @@ def test_deepseek_v4_vision_dspark_restores_draft_architecture():
     assert draft_model_config.model_arch_config.is_mm_prefix_lm is False
     assert draft_model_config._architecture == "DSparkDraftModel"
     registry.inspect_model_cls.assert_called_once_with(["DSparkDraftModel"], draft_model_config)
+
+
+def test_deepseek_v41_dspark_selects_v41_drafter_and_expert_shape():
+    hf_config = SimpleNamespace(
+        model_type="deepseek_v4.1",
+        architectures=["DeepseekV41ForConditionalGeneration"],
+        dspark_target_layer_ids=[37, 38, 39],
+        dspark_n_routed_experts=128,
+        dspark_n_activated_experts=3,
+        num_nextn_predict_layers=3,
+    )
+    hf_config.update = lambda values: hf_config.__dict__.update(values)
+    model_arch_config = ModelArchitectureConfig(
+        architectures=["DeepseekV41ForConditionalGeneration"],
+        model_type="deepseek_v4.1",
+        text_model_type="deepseek_v4.1_text",
+        hidden_size=5120,
+        total_num_hidden_layers=43,
+        total_num_attention_heads=64,
+        head_size=512,
+        vocab_size=129280,
+        total_num_kv_heads=1,
+        num_experts=384,
+        num_experts_per_token=6,
+        quantization_config=None,
+        is_deepseek_mla=True,
+        is_mm_prefix_lm=True,
+        rswa_window=128,
+        derived_max_model_len_and_key=(1048576, "max_position_embeddings"),
+    )
+    registry = MagicMock()
+    registry.inspect_model_cls.return_value = (
+        "model-info",
+        "DeepseekV41DSparkDraftModel",
+    )
+    draft_model_config = SimpleNamespace(
+        hf_config=hf_config,
+        model_arch_config=model_arch_config,
+        registry=registry,
+    )
+
+    _normalize_deepseek_v4_dspark_draft(draft_model_config)
+
+    assert hf_config.architectures == ["DeepseekV41DSparkDraftModel"]
+    assert hf_config.n_routed_experts == 128
+    assert hf_config.num_experts_per_tok == 3
+    assert hf_config.n_mtp_layers == 3
+    registry.inspect_model_cls.assert_called_once_with(
+        ["DeepseekV41DSparkDraftModel"], draft_model_config
+    )

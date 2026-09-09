@@ -85,14 +85,24 @@ def group_cache_specs(specs):
     """Build the fixed V4.1 ownership graph used by the hybrid manager."""
     if not any(is_v41_spec(s) for s in specs.values()):
         return None
-    if not all(is_v41_spec(s) for s in specs.values()):
-        raise ValueError("V4.1 mixed draft/foreign cache resources are not supported yet")
+    target_specs = {name: spec for name, spec in specs.items() if is_v41_spec(spec)}
+    draft_specs = {name: spec for name, spec in specs.items() if not is_v41_spec(spec)}
+    invalid_draft_names = [
+        name
+        for name, spec in draft_specs.items()
+        if not isinstance(spec, AscendSlidingWindowMLASpec)
+    ]
+    if invalid_draft_names:
+        raise ValueError(
+            "V4.1 mixed cache supports only dSPark SWA draft resources; "
+            f"unsupported resources: {', '.join(sorted(invalid_draft_names))}"
+        )
 
     ratio_groups = {}
     for ratio in (2, 1):
         members = {
             name: spec
-            for name, spec in specs.items()
+            for name, spec in target_specs.items()
             if isinstance(spec, (DeepseekV41FullSpec, DeepseekV41IndexerSpec))
             and spec.compress_ratio == ratio
         }
@@ -100,14 +110,14 @@ def group_cache_specs(specs):
 
     state = {
         name: spec
-        for name, spec in specs.items()
+        for name, spec in target_specs.items()
         if isinstance(spec, DeepseekV41CompressorStateSpec)
     }
     groups = [ratio_groups[2], ratio_groups[1], _uniform(state, "state")]
 
     swa = [
         (name, spec)
-        for name, spec in specs.items()
+        for name, spec in target_specs.items()
         if isinstance(spec, DeepseekV41SWASpec)
     ]
     if len(swa) != 40:
@@ -120,6 +130,8 @@ def group_cache_specs(specs):
     )
     if len(groups) != 17:
         raise AssertionError(f"V4.1 must form 17 cache groups, got {len(groups)}")
+    if draft_specs:
+        groups.append(_uniform(draft_specs, "dspark"))
     return groups
 
 
@@ -242,8 +254,11 @@ def validate_cache_runtime(vllm_config):
         raise NotImplementedError("V4.1 graph runtime requires FULL_DECODE_ONLY")
     if vllm_config.cache_config.enable_prefix_caching:
         raise NotImplementedError("V4.1 prefix state restoration is not implemented")
-    if vllm_config.speculative_config is not None or vllm_config.kv_transfer_config is not None:
-        raise NotImplementedError("V4.1 speculative decoding and KV transfer are not implemented")
+    speculative = vllm_config.speculative_config
+    if speculative is not None and not speculative.use_dspark():
+        raise NotImplementedError("V4.1 currently supports only dSPark speculative decoding")
+    if vllm_config.kv_transfer_config is not None:
+        raise NotImplementedError("V4.1 KV transfer is not implemented")
     parallel = vllm_config.parallel_config
     if any(
         getattr(parallel, name, 1) != 1

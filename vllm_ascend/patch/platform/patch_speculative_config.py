@@ -53,16 +53,29 @@ def _normalize_deepseek_v4_dspark_draft(draft_model_config) -> None:
     hf_config = getattr(draft_model_config, "hf_config", None)
     if (
         hf_config is None
-        or getattr(hf_config, "model_type", None) != "deepseek_v4"
+        or getattr(hf_config, "model_type", None) not in ("deepseek_v4", "deepseek_v4.1")
         or getattr(hf_config, "dspark_target_layer_ids", None) is None
     ):
         return
 
-    hf_config.update({"architectures": ["DSparkDraftModel"]})
+    is_v41 = hf_config.model_type == "deepseek_v4.1"
+    architecture = "DeepseekV41DSparkDraftModel" if is_v41 else "DSparkDraftModel"
+    if is_v41:
+        # The Aurora target and draft experts intentionally have different
+        # widths.  SpeculativeConfig owns a private config copy, so adapting
+        # these fields cannot alter the target model.
+        hf_config.update(
+            {
+                "n_routed_experts": hf_config.dspark_n_routed_experts,
+                "num_experts_per_tok": hf_config.dspark_n_activated_experts,
+                "n_mtp_layers": getattr(hf_config, "num_nextn_predict_layers", 3),
+            }
+        )
+    hf_config.update({"architectures": [architecture]})
     draft_model_config.model_arch_config = replace(
         draft_model_config.model_arch_config,
-        architectures=["DSparkDraftModel"],
-        model_type="deepseek_v4",
+        architectures=[architecture],
+        model_type=hf_config.model_type,
         is_mm_prefix_lm=False,
     )
     model_info, architecture = draft_model_config.registry.inspect_model_cls(

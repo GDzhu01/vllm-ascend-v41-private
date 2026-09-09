@@ -654,6 +654,7 @@ class DeepseekV41Model(DeepseekV4Model):
         )
         pre_mix[:, 0] = 1.0
         last_layer = None
+        aux_hidden_states = []
         for layer in self.layers:
             last_layer = layer
             if layer.engram is not None and token_mask.numel():
@@ -673,12 +674,19 @@ class DeepseekV41Model(DeepseekV4Model):
                     active_mask,
                     self.config.rms_norm_eps,
                 )
+            # Aurora dSPark conditions each draft block on the residual stream
+            # entering target layers 37/38/39.  ModelRunner expresses those
+            # zero-based checkpoint ids as one-based aux layer ids.
+            if layer.layer_idx + 1 in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states.mean(dim=1))
             hidden_states, pre_mix = layer(
                 positions, hidden_states, pre_mix, None, input_ids=input_ids
             )
         assert last_layer is not None
         hidden_states = last_layer.hc_collapse(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
