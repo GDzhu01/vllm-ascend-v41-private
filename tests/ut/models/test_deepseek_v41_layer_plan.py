@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
 import pytest
+import torch
 
 from vllm_ascend.models.deepseek_v41.model import (
     DeepseekV41SharedAttentionState,
@@ -59,12 +60,14 @@ def test_source_roles_and_engram_slots(text_config: dict):
 
 
 def test_shared_state_resets_sparse_attention_metadata():
-    state = DeepseekV41SharedAttentionState()
-    state.smla_metadata[2] = object()
+    topk_indices = torch.zeros((4, 1, 512), dtype=torch.int32)
+    candidates = torch.zeros((4, 1, 16), dtype=torch.int32)
+    state = DeepseekV41SharedAttentionState(topk_indices, candidates)
 
     state.reset()
 
-    assert state.smla_metadata == {}
+    assert state.topk_indices is topk_indices
+    assert state.candidates is candidates
 
 
 def test_rejects_ratio_mismatch(text_config: dict):

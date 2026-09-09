@@ -109,7 +109,7 @@ def test_v41_hc_reference_supports_hidden_size_5120():
     assert comb.dtype == torch.float32
     torch.testing.assert_close(comb.sum(-2), torch.ones(2, 4), atol=2e-5, rtol=2e-5)
 
-    restored = layer.hc_post(y, x, post, comb)
+    restored = layer.hc_post_reference(y, x, post, comb)
     assert restored.shape == x.shape
     assert restored.dtype == x.dtype
 
@@ -122,9 +122,39 @@ def test_v41_hc_post_matches_reference_equation():
     post = torch.randn(3, 4, dtype=torch.float32)
     comb = torch.randn(3, 4, 4, dtype=torch.float32)
 
-    actual = layer.hc_post(x, residual, post, comb)
+    actual = layer.hc_post_reference(x, residual, post, comb)
     expected = (
         post.unsqueeze(-1) * x.unsqueeze(-2)
         + (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(dim=-3)
     ).to(x.dtype)
     torch.testing.assert_close(actual, expected)
+
+
+def test_v41_hc_post_dispatches_fused_operator_with_batch_dimension():
+    layer = _layer()
+    x = torch.randn(3, 5, dtype=torch.bfloat16)
+    residual = torch.randn(3, 4, 5, dtype=torch.bfloat16)
+    post = torch.randn(3, 4, dtype=torch.float32)
+    comb = torch.randn(3, 4, 4, dtype=torch.float32)
+    expected = torch.randn_like(residual).unsqueeze(0)
+
+    with patch.object(
+        torch.ops._C_ascend,
+        "npu_hc_post",
+        create=True,
+        return_value=expected,
+    ) as op:
+        actual = layer.hc_post(x, residual, post, comb)
+
+    torch.testing.assert_close(actual, expected.squeeze(0))
+    op.assert_called_once()
+    for actual_arg, expected_arg in zip(
+        op.call_args.args,
+        (
+            x.unsqueeze(0),
+            residual.unsqueeze(0),
+            post.unsqueeze(0),
+            comb.unsqueeze(0),
+        ),
+    ):
+        torch.testing.assert_close(actual_arg, expected_arg)

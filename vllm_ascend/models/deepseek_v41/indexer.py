@@ -11,6 +11,10 @@ from vllm_ascend.attention.dsa_v41 import (
     scatter_cache,
 )
 from vllm_ascend.core.deepseek_v41 import DeepseekV41IndexerSpec
+from vllm_ascend.worker.device_metadata import (
+    DeviceMetadataStage,
+    wait_for_device_metadata,
+)
 
 from .compressor import DeepseekV41RMSNorm, _read
 
@@ -180,10 +184,11 @@ class DeepseekV41Indexer(nn.Module):
         candidate_shape = (query.shape[0], 1, candidate_topk_blocks)
         if uses_candidate_filter and (candidates.shape != candidate_shape or candidates.dtype != torch.int32):
             raise ValueError("Candidate consumer requires INT32 block IDs with matching query rows")
-        max_key_len = source_metadata.max_cache_seq_len
-        topk = min(self.index_topk, max_key_len)
-        if query.shape[0] == 0 or topk == 0:
-            selected = torch.empty((query.shape[0], 0), dtype=torch.int32, device=query.device)
+        topk = self.index_topk
+        if query.shape[0] == 0:
+            selected = torch.full(
+                (0, topk), -1, dtype=torch.int32, device=query.device
+            )
             if is_candidate_source:
                 candidates = torch.full(candidate_shape, -1, dtype=torch.int32, device=query.device)
             return selected, candidates
@@ -195,13 +200,9 @@ class DeepseekV41Indexer(nn.Module):
         weights = weights.to(torch.float16)
         key, key_scale = source_cache
         key_scale = key_scale.squeeze(-1)  # Preserve the Hybrid cache page stride.
-        cu_seqlens_q = source_metadata.query_start_loc.to(torch.int32)
-        seqused_k = source_metadata.cache_seq_lens.to(torch.int32)
-        residual = (
-            source_metadata.seq_lens.remainder(self.compress_ratio).to(torch.int32)
-            if self.compress_ratio != 1
-            else None
-        )
+        cu_seqlens_q = source_metadata.query_start_loc
+        seqused_k = source_metadata.cache_seq_lens
+        residual = source_metadata.cmp_residual
         common = dict(
             cu_seqlens_q=cu_seqlens_q,
             seqused_k=seqused_k,
@@ -212,16 +213,10 @@ class DeepseekV41Indexer(nn.Module):
             mask_mode=3,
             cmp_ratio=self.compress_ratio,
         )
-        op_metadata = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
-            self.n_heads,
-            1,
-            self.width,
-            topk,
-            2,
-            batch_size=cu_seqlens_q.shape[0] - 1,
-            max_seqlen_k=max_key_len,
-            **common,
-        )
+        op_metadata = source_metadata.qli_metadata
+        if op_metadata is None:
+            raise RuntimeError("V4.1 QLI metadata was not built")
+        wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(op_metadata))
         mode = 1 if is_candidate_source else 2 if uses_candidate_filter else 3
         selected, _, candidate_out = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
             quantized_query,

@@ -63,7 +63,9 @@ def test_v41_hc_pre_handoff_5120_on_npu():
             rtol=5e-3,
         )
 
-    expected_post = _layer().hc_post(expected[0], x, expected[1], expected[2])
+    expected_post = _layer().hc_post_reference(
+        expected[0], x, expected[1], expected[2]
+    )
     actual_post = _layer().hc_post(actual[0], x.npu(), actual[1], actual[2])
     torch.testing.assert_close(
         actual_post.cpu().float(), expected_post.float(), atol=2e-2, rtol=2e-2

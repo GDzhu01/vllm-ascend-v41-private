@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 import torch_npu  # noqa: F401
 
+from tests.deepseek_v41_cache_utils import allocate_cache_views, make_cache_config
 from vllm_ascend.utils import enable_custom_op, is_950
 
 enable_custom_op()
@@ -21,12 +22,12 @@ RTOL = 1e-3
 ATOL = 1e-5
 
 
-def _paged(value, *, strided=True):
-    pages = (value.shape[0] + PAGE - 1) // PAGE
-    shape = (pages, PAGE, *value.shape[1:])
+def _paged(value, *, strided=True, page_size=PAGE):
+    pages = (value.shape[0] + page_size - 1) // page_size
+    shape = (pages, page_size, *value.shape[1:])
     dense = torch.zeros(shape, dtype=value.dtype)
     order = torch.arange(pages - 1, -1, -1)
-    padded = F.pad(value.flatten(1), (0, 0, 0, pages * PAGE - value.shape[0])).reshape(shape)
+    padded = F.pad(value.flatten(1), (0, 0, 0, pages * page_size - value.shape[0])).reshape(shape)
     dense[order] = padded
     dense = dense.npu()
     if strided:
@@ -38,15 +39,15 @@ def _paged(value, *, strided=True):
     return dense, order.to(torch.int32).unsqueeze(0).npu()
 
 
-def _data(length, qlen=5, heads=HEADS, seed=41, strided=True):
+def _data(length, qlen=5, heads=HEADS, seed=41, strided=True, page_size=PAGE):
     gen = torch.Generator().manual_seed(seed)
     q = torch.randint(-8, 9, (qlen, heads, WIDTH), dtype=torch.int8, generator=gen)
     k = torch.randint(-8, 9, (length, 1, WIDTH), dtype=torch.int8, generator=gen)
     w = (torch.rand(qlen, heads, generator=gen) * 2 - 0.5).half()
     qs = (torch.rand(qlen, heads, generator=gen) / 32 + 0.01).half()
     ks = (torch.rand(length, 1, generator=gen) / 16 + 0.01).half()
-    key, table = _paged(k, strided=strided)
-    scale, _ = _paged(ks, strided=strided)
+    key, table = _paged(k, strided=strided, page_size=page_size)
+    scale, _ = _paged(ks, strided=strided, page_size=page_size)
     return q, k, w, qs, ks, key, scale, table
 
 
@@ -239,12 +240,23 @@ def _quant_query_reference(query):
 
 @pytest.mark.parametrize("ratio,zero_first", [(1, False), (2, False), (2, True)])
 def test_model_indexer_mixed_batch(ratio, zero_first):
-    parts = [_data(7, qlen=2, seed=11), _data(1025, qlen=3, seed=29)]
+    page_size = 128 // ratio
+    parts = [_data(7, qlen=2, seed=11, page_size=page_size), _data(1025, qlen=3, seed=29, page_size=page_size)]
     key = torch.cat([d[5] for d in parts])
     scale = torch.cat([d[6] for d in parts]).unsqueeze(-1)
+    config = make_cache_config(key.shape[0] + 1)
+    _, caches = allocate_cache_views(config, "npu")
+    source = 2 if ratio == 2 else 20
+    slot_key, slot_scale = caches[f"model.layers.{source}.self_attn.indexer.k_cache"]
+    slot_key[1:].copy_(key)
+    slot_scale[1:].copy_(scale)
+    key, scale = slot_key, slot_scale
+    assert key.shape[1] == page_size
+    assert not key.is_contiguous() and not scale.is_contiguous()
+    assert not key[0].any() and not scale[0].any()
     table = torch.zeros(2, parts[1][7].shape[1], dtype=torch.int32, device="npu")
-    table[0, : parts[0][7].shape[1]] = parts[0][7][0]
-    table[1] = parts[1][7][0] + parts[0][5].shape[0]
+    table[0, : parts[0][7].shape[1]] = parts[0][7][0] + 1
+    table[1] = parts[1][7][0] + parts[0][5].shape[0] + 1
     lengths = [0 if zero_first else 7, 1025]
     original = [lengths[0] * ratio + (ratio - 1), 1025 * ratio + (ratio - 1)]
     # A zero-key request must still represent a valid original token range.
