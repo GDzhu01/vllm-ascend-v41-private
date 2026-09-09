@@ -10,11 +10,17 @@ from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutpu
 from vllm_ascend.ops.fused_moe.dataclass.router_input import MoeRouterInput
 from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import MoEAllGatherCombineMetadata, MoETokenDispatchOutput
 from vllm_ascend.ops.fused_moe.moe_comm_method import (
+    _MoECommMethods,
+    _MoECommMethodsByConfig,
     AllGatherCommImpl,
     AlltoAllCommImpl,
     FusedMC2CommImpl,
     MC2CommImpl,
+    activate_moe_comm_method,
+    get_moe_comm_method,
+    setup_moe_comm_method,
 )
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithMC2
 from vllm_ascend.quantization.methods.base import QuantType
 
@@ -73,6 +79,62 @@ class TestMoECommMethod(TestBase):
         self._patch_get_ascend_config.stop()
         self._patch_get_ascend_config_module.stop()
         self._patch_get_ascend_config_forward_context.stop()
+
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.AllGatherCommImpl")
+    def test_comm_methods_are_cached_by_expert_shape(self, mock_impl):
+        _MoECommMethods.clear()
+        _MoECommMethodsByConfig.clear()
+        target = self.moe_config
+        draft = MagicMock(spec=FusedMoEConfig)
+        for field in (
+            "hidden_dim",
+            "intermediate_size_per_partition",
+            "tp_size",
+            "dp_size",
+            "pcp_size",
+            "ep_size",
+        ):
+            setattr(draft, field, getattr(target, field, 1))
+        draft.num_experts = 4
+        draft.num_local_experts = 1
+        draft.experts_per_token = 1
+
+        setup_moe_comm_method(target)
+        target_method = get_moe_comm_method(MoECommType.ALLGATHER, target)
+        setup_moe_comm_method(draft)
+        draft_method = get_moe_comm_method(MoECommType.ALLGATHER, draft)
+
+        self.assertIsNot(target_method, draft_method)
+        self.assertEqual(mock_impl.call_count, 2)
+        setup_moe_comm_method(target)
+        self.assertEqual(mock_impl.call_count, 2)
+
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method._EXTRA_CTX")
+    def test_activate_comm_method_rebinds_forward_context(self, mock_ctx):
+        _MoECommMethods.clear()
+        _MoECommMethodsByConfig.clear()
+        method = MagicMock()
+        key = (
+            MoECommType.ALLGATHER,
+            tuple(
+                int(getattr(self.moe_config, field, 0) or 0)
+                for field in (
+                    "num_experts",
+                    "num_local_experts",
+                    "experts_per_token",
+                    "hidden_dim",
+                    "intermediate_size_per_partition",
+                    "ep_size",
+                    "tp_size",
+                    "dp_size",
+                    "pcp_size",
+                )
+            ),
+        )
+        _MoECommMethodsByConfig[key] = method
+
+        self.assertIs(activate_moe_comm_method(MoECommType.ALLGATHER, self.moe_config), method)
+        self.assertIs(mock_ctx.moe_comm_method, method)
 
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_mc2_group")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.logger.warning_once")
