@@ -79,13 +79,20 @@ def test_deepseek_v4_vision_dspark_restores_draft_architecture():
 
 
 def test_deepseek_v41_dspark_selects_v41_drafter_and_expert_shape():
-    hf_config = SimpleNamespace(
-        model_type="deepseek_v4.1",
-        architectures=["DeepseekV41ForConditionalGeneration"],
+    text_config = SimpleNamespace(
+        model_type="deepseek_v4.1_text",
         dspark_target_layer_ids=[37, 38, 39],
         dspark_n_routed_experts=128,
         dspark_n_activated_experts=3,
         num_nextn_predict_layers=3,
+    )
+    text_config.update = lambda values: text_config.__dict__.update(values)
+    # vLLM's generic DeepSeek-V4 dSPark normalization has already rewritten
+    # the composite root before the Ascend post-init hook runs.
+    hf_config = SimpleNamespace(
+        model_type="deepseek_v4",
+        architectures=["DSparkDraftModel"],
+        text_config=text_config,
     )
     hf_config.update = lambda values: hf_config.__dict__.update(values)
     model_arch_config = ModelArchitectureConfig(
@@ -120,9 +127,12 @@ def test_deepseek_v41_dspark_selects_v41_drafter_and_expert_shape():
     _normalize_deepseek_v4_dspark_draft(draft_model_config)
 
     assert hf_config.architectures == ["DeepseekV41DSparkDraftModel"]
-    assert hf_config.n_routed_experts == 128
-    assert hf_config.num_experts_per_tok == 3
-    assert hf_config.n_mtp_layers == 3
+    assert hf_config.model_type == "deepseek_v4.1"
+    assert text_config.n_routed_experts == 128
+    assert text_config.num_experts_per_tok == 3
+    assert text_config.n_mtp_layers == 3
+    assert draft_model_config.model_arch_config.num_experts == 128
+    assert draft_model_config.model_arch_config.num_experts_per_token == 3
     registry.inspect_model_cls.assert_called_once_with(
         ["DeepseekV41DSparkDraftModel"], draft_model_config
     )

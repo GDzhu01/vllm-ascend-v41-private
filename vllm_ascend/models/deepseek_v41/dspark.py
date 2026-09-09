@@ -34,7 +34,8 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
         torch.nn.Module.__init__(self)
         assert vllm_config.speculative_config is not None
         self.vllm_config = vllm_config
-        config = vllm_config.speculative_config.draft_model_config.hf_config
+        draft_model_config = vllm_config.speculative_config.draft_model_config
+        config = draft_model_config.hf_text_config
         self.config = config
         self.hc_mult = config.hc_mult
         self.hidden_size = config.hidden_size
@@ -113,7 +114,7 @@ class DSparkDeepseekV41ForCausalLM(DSparkDeepseekV4ForCausalLM):
     def __init__(self, *, vllm_config, prefix="") -> None:
         torch.nn.Module.__init__(self)
         assert vllm_config.speculative_config is not None
-        self.config = vllm_config.speculative_config.draft_model_config.hf_config
+        self.config = vllm_config.speculative_config.draft_model_config.hf_text_config
 
         from vllm_ascend.utils import get_rotation_path
 

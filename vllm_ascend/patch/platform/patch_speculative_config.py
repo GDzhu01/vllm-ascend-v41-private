@@ -51,32 +51,50 @@ def _normalize_deepseek_v4_dspark_draft(draft_model_config) -> None:
     multimodal architecture conversion.
     """
     hf_config = getattr(draft_model_config, "hf_config", None)
+    text_config = getattr(hf_config, "text_config", None)
+    draft_hf_config = text_config if text_config is not None else hf_config
+    root_model_type = getattr(hf_config, "model_type", None)
+    text_model_type = getattr(draft_hf_config, "model_type", None)
+    is_v41 = root_model_type == "deepseek_v4.1" or text_model_type == "deepseek_v4.1_text"
     if (
         hf_config is None
-        or getattr(hf_config, "model_type", None) not in ("deepseek_v4", "deepseek_v4.1")
-        or getattr(hf_config, "dspark_target_layer_ids", None) is None
+        or root_model_type not in ("deepseek_v4", "deepseek_v4.1")
+        or getattr(draft_hf_config, "dspark_target_layer_ids", None) is None
     ):
         return
 
-    is_v41 = hf_config.model_type == "deepseek_v4.1"
     architecture = "DeepseekV41DSparkDraftModel" if is_v41 else "DSparkDraftModel"
     if is_v41:
         # The Aurora target and draft experts intentionally have different
         # widths.  SpeculativeConfig owns a private config copy, so adapting
         # these fields cannot alter the target model.
-        hf_config.update(
+        draft_hf_config.update(
             {
-                "n_routed_experts": hf_config.dspark_n_routed_experts,
-                "num_experts_per_tok": hf_config.dspark_n_activated_experts,
-                "n_mtp_layers": getattr(hf_config, "num_nextn_predict_layers", 3),
+                "n_routed_experts": draft_hf_config.dspark_n_routed_experts,
+                "num_experts_per_tok": draft_hf_config.dspark_n_activated_experts,
+                "n_mtp_layers": getattr(draft_hf_config, "num_nextn_predict_layers", 3),
             }
         )
-    hf_config.update({"architectures": [architecture]})
+    normalized_model_type = "deepseek_v4.1" if is_v41 else root_model_type
+    hf_config.update(
+        {
+            "architectures": [architecture],
+            "model_type": normalized_model_type,
+        }
+    )
+    arch_updates = dict(
+        architectures=[architecture],
+        model_type=normalized_model_type,
+        is_mm_prefix_lm=False,
+    )
+    if is_v41:
+        arch_updates.update(
+            num_experts=draft_hf_config.n_routed_experts,
+            num_experts_per_token=draft_hf_config.num_experts_per_tok,
+        )
     draft_model_config.model_arch_config = replace(
         draft_model_config.model_arch_config,
-        architectures=[architecture],
-        model_type=hf_config.model_type,
-        is_mm_prefix_lm=False,
+        **arch_updates,
     )
     architectures = draft_model_config.model_arch_config.architectures
     model_info, architecture = draft_model_config.registry.inspect_model_cls(
