@@ -574,8 +574,13 @@ class DeepseekV41Model(DeepseekV4Model):
         pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
         pre_mix[:, 0] = 1.0
         last_layer = None
+        aux_hidden_states = []
         for layer in self.layers:
             last_layer = layer
+            # DSpark consumes the residual stream entering its configured
+            # target layers. The runner expresses checkpoint IDs as one-based.
+            if layer.layer_idx + 1 in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states.mean(dim=1))
             if layer.engram is not None and token_mask.numel():
                 n = hidden_states.shape[0]
                 # Graph captures keep lookup buffers at static capacity; the
@@ -596,7 +601,10 @@ class DeepseekV41Model(DeepseekV4Model):
             hidden_states, pre_mix = layer(positions, hidden_states, pre_mix, None, input_ids=input_ids)
         assert last_layer is not None
         hidden_states = last_layer.hc_collapse(hidden_states, pre_mix)
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
