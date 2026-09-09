@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 
+from vllm_ascend.core.circular_buffer import prefix_cacheable
 from vllm_ascend.utils import vllm_version_is
 
 USE_MULTI_GROUPS_KV_CACHE = True
@@ -165,7 +166,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 assert all(
                     self._get_effective_block_size(g.kv_cache_spec) % hash_block_size == 0
                     for g in kv_cache_config.kv_cache_groups
-                    if getattr(g.kv_cache_spec, "participates_in_prefix_caching", True)
+                    if prefix_cacheable(g.kv_cache_spec)
                 ), "block_size must be divisible by hash_block_size"
             self.enable_partial_hash_hits = dcp_world_size == 1 and any(
                 isinstance(g.kv_cache_spec, MambaSpec)
@@ -278,7 +279,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 assert all(
                     self._get_effective_block_size(g.kv_cache_spec) % hash_block_size == 0
                     for g in kv_cache_config.kv_cache_groups
-                    if getattr(g.kv_cache_spec, "participates_in_prefix_caching", True)
+                    if prefix_cacheable(g.kv_cache_spec)
                 ), "block_size must be divisible by hash_block_size"
             self.enable_partial_hash_hits = dcp_world_size == 1 and any(
                 isinstance(g.kv_cache_spec, MambaSpec)
@@ -320,6 +321,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         """
         self.attention_groups: list[SpecGroup] = []
         for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
+            if not prefix_cacheable(g.kv_cache_spec):
+                continue
             manager_cls = self.single_type_managers[i].__class__
             spec = g.kv_cache_spec
             use_eagle = i in self.eagle_group_ids
@@ -340,7 +343,10 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         # example, when every V4.1 layer temporarily runs the SWA path).  The
         # Ascend coordinator's grouped lookup works for this degenerate case,
         # so do not reject it merely because the unique-spec count is one.
-        assert self.attention_groups, "KV cache coordinator requires at least one attention group."
+        if not self.attention_groups:
+            self.full_attention_group_id = None
+            self.lcm_block_size = self.scheduler_block_size
+            return
 
         # Put full attention first: its efficient left-to-right scan provides
         # a tighter initial bound, reducing work for subsequent groups.
@@ -414,6 +420,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             return block_hashes
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
+        if not self.attention_groups:
+            return tuple([] for _ in range(num_groups)), 0
         hit_length = max_cache_hit_length
         longest_hit_length = 0
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups

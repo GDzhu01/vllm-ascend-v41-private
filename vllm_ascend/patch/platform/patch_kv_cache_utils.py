@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 import math
 from collections import defaultdict
+from dataclasses import replace
 
 import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
@@ -22,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 
+from vllm_ascend.core.circular_buffer import prefix_cacheable
 from vllm_ascend.core.deepseek_v41 import (
     allocate_cache_config as allocate_v41_cache_config,
 )
@@ -66,6 +68,7 @@ def _ascend_max_memory_from_groups(vllm_config, groups):
 
 def _ascend_max_concurrency(vllm_config, kv_cache_config):
     groups = kv_cache_config.kv_cache_groups
+
     if has_v41_groups(groups):
         return max(0, kv_cache_config.num_blocks - 1) / v41_request_blocks(vllm_config, groups)
     return _orig_max_concurrency(vllm_config, kv_cache_config)
@@ -108,6 +111,18 @@ def _ascend_resolve_kv_cache_block_sizes(
     cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
+
+    cacheable_groups = [g for g in groups if prefix_cacheable(g.kv_cache_spec)]
+    if len(cacheable_groups) != len(groups):
+        scheduler_block_size = math.lcm(*(g.kv_cache_spec.block_size for g in groups)) * dcp
+        if not cache_config.enable_prefix_caching or not cacheable_groups:
+            return scheduler_block_size, scheduler_block_size
+        filtered = replace(kv_cache_config, kv_cache_groups=cacheable_groups)
+        if dcp == 1:
+            _, hash_block_size = _orig_resolve_kv_cache_block_sizes(filtered, vllm_config)
+        else:
+            hash_block_size = math.gcd(*(g.kv_cache_spec.block_size for g in cacheable_groups))
+        return scheduler_block_size, hash_block_size
 
     if len(groups) <= 1:
         bs = cache_config.block_size * dcp
@@ -375,9 +390,12 @@ def _get_kv_cache_config_deepseek_v4(
     per (tuple_idx, bucket) whose shared_by is the union of per-group
     layers at that slot.
     """
-    if any(is_v41_spec(s) for g in kv_cache_groups
-           if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
-           for s in g.kv_cache_spec.kv_cache_specs.values()):
+    if any(
+        is_v41_spec(s)
+        for g in kv_cache_groups
+        if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for s in g.kv_cache_spec.kv_cache_specs.values()
+    ):
         return allocate_v41_cache_config(vllm_config, kv_cache_groups, available_memory)
     full_mla_spec = kv_cache_groups[0].kv_cache_spec
     assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)

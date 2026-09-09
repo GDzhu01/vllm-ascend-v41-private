@@ -16,6 +16,7 @@
 
 import os
 
+import vllm_ascend.patch.platform.patch_circular_buffer  # noqa
 import vllm_ascend.patch.platform.patch_deepseek_v4_vision  # noqa
 import vllm_ascend.patch.platform.patch_deepseek_v41_config  # noqa
 import vllm_ascend.patch.platform.patch_distributed  # noqa

@@ -15,6 +15,7 @@ from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41EagerAttentionImpl,
 )
 from vllm_ascend.core.deepseek_v41 import (
+    STATE_RING_ROWS,
     DeepseekV41CompressorStateSpec,
     DeepseekV41FullSpec,
     DeepseekV41IndexerSpec,
@@ -228,11 +229,10 @@ def build_v41_cache_specs(config: Any, vllm_config: Any, prefix: str = "model"):
         )
         if role.compress_ratio == 2:
             specs[f"{attn_prefix}.compressor.state_cache"] = DeepseekV41CompressorStateSpec(
-                block_size=16,
+                block_size=STATE_RING_ROWS,
                 num_kv_heads=1,
                 head_size=2 * width,
                 dtype=torch.float32,
-                sliding_window=2,
             )
     return specs
 
@@ -388,7 +388,6 @@ class DeepseekV41Attention(DeepseekV4Attention):
         return output
 
 
-
 class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
     """V4.1 block with the checkpoint's delayed mHC coefficient handoff."""
 
@@ -399,17 +398,11 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
         flat = x_float.flatten(-2)
         mixes = torch.nn.functional.linear(flat, hc_fn)
         mixes *= torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
-        pre, post, comb = mixes.split(
-            [self.hc_mult, self.hc_mult, self.hc_mult * self.hc_mult], -1
-        )
+        pre, post, comb = mixes.split([self.hc_mult, self.hc_mult, self.hc_mult * self.hc_mult], -1)
         pre = torch.sigmoid(pre * hc_scale[0] + hc_base[: self.hc_mult]) + self.hc_eps
-        post = 2 * torch.sigmoid(
-            post * hc_scale[1] + hc_base[self.hc_mult : 2 * self.hc_mult]
-        )
+        post = 2 * torch.sigmoid(post * hc_scale[1] + hc_base[self.hc_mult : 2 * self.hc_mult])
         comb = comb.unflatten(-1, (self.hc_mult, self.hc_mult))
-        comb = comb * hc_scale[2] + hc_base[2 * self.hc_mult :].view(
-            self.hc_mult, self.hc_mult
-        )
+        comb = comb * hc_scale[2] + hc_base[2 * self.hc_mult :].view(self.hc_mult, self.hc_mult)
         comb = comb.softmax(-1) + self.hc_eps
         comb = comb / (comb.sum(-2, keepdim=True) + self.hc_eps)
         for _ in range(self.hc_sinkhorn_iters - 1):
@@ -515,16 +508,12 @@ class DeepseekV41Model(DeepseekV4Model):
         hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
         self.shared_attention_state.reset()
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        pre_mix = hidden_states.new_zeros(
-            hidden_states.shape[0], self.hc_mult, dtype=torch.float32
-        )
+        pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
         pre_mix[:, 0] = 1.0
         last_layer = None
         for layer in self.layers:
             last_layer = layer
-            hidden_states, pre_mix = layer(
-                positions, hidden_states, pre_mix, None, input_ids=input_ids
-            )
+            hidden_states, pre_mix = layer(positions, hidden_states, pre_mix, None, input_ids=input_ids)
         assert last_layer is not None
         hidden_states = last_layer.hc_collapse(hidden_states, pre_mix)
         return self.norm(hidden_states)

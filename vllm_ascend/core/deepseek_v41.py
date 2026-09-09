@@ -9,7 +9,10 @@ from vllm.config import CUDAGraphMode
 from vllm.v1.core.kv_cache_utils import may_override_num_blocks
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheTensor, UniformTypeKVCacheSpecs
 
+from vllm_ascend.core.circular_buffer import AscendCircularBufferSpec
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+
+STATE_RING_ROWS = 32
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -45,18 +48,16 @@ class DeepseekV41SWASpec(AscendSlidingWindowMLASpec):
 
 
 @dataclass(frozen=True, kw_only=True)
-class DeepseekV41CompressorStateSpec(AscendSlidingWindowMLASpec):
-    """V4-style FP32 KV/score rows, retained by SlidingWindowManager.
+class DeepseekV41CompressorStateSpec(AscendCircularBufferSpec):
+    """One private FP32 KV/score ring page for each active request."""
 
-    State is not compressed: one row per original token, two vectors per row.
-    Only pooling has ratio2; the storage compression ratio remains one.
-    """
+    compress_ratio: int = 1
 
-    def is_uniform_with_collection(self, specs):
-        return all(
-            isinstance(s, DeepseekV41CompressorStateSpec) and s.sliding_window == self.sliding_window
-            for s in specs.values()
-        )
+    def __post_init__(self):
+        if self.dtype != torch.float32 or self.block_size != STATE_RING_ROWS or self.compress_ratio != 1:
+            raise ValueError("Aurora state requires a 32-row FP32 uncompressed ring")
+        if self.num_kv_heads != 1:
+            raise ValueError("Aurora state requires one packed KV/score plane")
 
 
 def is_v41_spec(spec):
@@ -243,6 +244,8 @@ def reshape_cache(raw: torch.Tensor, spec, *, num_blocks, offset, block_stride):
     plane_sizes = _cache_plane_sizes(spec)
     if offset < 0 or offset + sum(plane_sizes) > block_stride:
         raise ValueError("V4.1 cache component exceeds its slot page")
+    if isinstance(spec, DeepseekV41CompressorStateSpec) and sum(plane_sizes) != block_stride:
+        raise ValueError("Aurora circular state must fill its slot with 32 contiguous FP32 rows")
 
     def view(dtype, width, byte_offset):
         dtype_size = dtype.itemsize
