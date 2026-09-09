@@ -487,6 +487,65 @@ def test_c2_builder_keeps_fixed_rows_for_mixed_parity_and_padding(config, runtim
     assert not idle.c2_complete_mask.any()
 
 
+@pytest.mark.parametrize("full_graph_mode", [False, True])
+@pytest.mark.parametrize("index_first", [False, True])
+@pytest.mark.parametrize(
+    "num_actual_reqs,num_actual_tokens,stored_rows",
+    [(3, 5, [1, 2, 3, 4]), (2, 5, [1, 2]), (3, 3, [1, 2]), (0, 5, []), (3, 0, [])],
+)
+def test_c2_builder_prepares_shared_store_mask(
+    runtime, full_graph_mode, index_first, num_actual_reqs, num_actual_tokens, stored_rows
+):
+    specs = collect_specs(runtime)
+    names = ["model.layers.2.self_attn.long_kv_cache", "model.layers.2.self_attn.indexer.k_cache"]
+    if index_first:
+        names.reverse()
+    builders = [DeepseekV41MetadataBuilder(specs[name], [name], runtime, torch.device("cpu")) for name in names]
+    common = SimpleNamespace(
+        slot_mapping=torch.tensor([10, 11, 15, 129, 131]),
+        block_table_tensor=torch.tensor([[1], [2], [4]]),
+        query_start_loc=torch.tensor([0, 2, 3, 5]),
+        query_start_loc_cpu=torch.tensor([0, 2, 3, 5]),
+        seq_lens=torch.tensor([4, 6, 10]),
+        seq_lens_cpu=torch.tensor([4, 6, 10]),
+        positions=torch.tensor([2, 3, 5, 7, 9]),
+        num_reqs=3,
+        num_actual_tokens=num_actual_tokens,
+        num_input_tokens=5,
+        max_query_len=2,
+        max_seq_len=10,
+        is_prefilling=torch.tensor([True, False, True]),
+    )
+    original_slots = common.slot_mapping.clone()
+    shared = {}
+    metadata = [
+        builder.build(
+            0, common, num_actual_reqs=num_actual_reqs, full_graph_mode=full_graph_mode, common_v41_metadata=shared
+        )
+        for builder in builders
+    ]
+    expected = torch.full((5, 2), -1, dtype=torch.int32)
+    coordinates = torch.tensor([[-1, -1], [0, 5], [0, 7], [2, 0], [2, 1]], dtype=torch.int32)
+    expected[stored_rows] = coordinates[stored_rows]
+    pointer = metadata[0].slot_mapping.data_ptr()
+    for result in metadata:
+        assert result.slot_mapping.data_ptr() == pointer
+        torch.testing.assert_close(result.slot_mapping, expected)
+    torch.testing.assert_close(common.slot_mapping, original_slots)
+
+    # New metadata must update the captured address and retain position parity
+    # even when a padded slot happens to contain a valid physical coordinate.
+    common.positions = torch.tensor([3, 4, 6, 8, 10])
+    common.slot_mapping = torch.tensor([11, 11, 15, 129, 131])
+    common.num_actual_tokens = 5
+    replay = builders[0].build(0, common, full_graph_mode=full_graph_mode)
+    assert replay.slot_mapping.data_ptr() == pointer
+    assert replay.slot_mapping.tolist() == [[0, 5], [-1, -1], [-1, -1], [-1, -1], [-1, -1]]
+    idle = builders[0].build(0, common, skip_ring_state_update=True)
+    assert idle.slot_mapping.data_ptr() == pointer
+    assert idle.slot_mapping.tolist() == [[-1, -1]] * 5
+
+
 def test_scatter_cache_redirects_invalid_rows_to_null_row():
     cache = torch.full((1, 8, 1, 2), -3.0)
     values = torch.tensor([[9.0, 9.0], [7.0, 8.0]])
@@ -821,18 +880,18 @@ def test_compressor_chunk_boundary_matches_vector_reference(config, chunks):
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 3, 5])
 @pytest.mark.parametrize("start", [0, 1])
-def test_ring_source_masks_both_fused_store_coordinates(monkeypatch, num_tokens, start):
+def test_ring_source_reuses_prepared_store_coordinates(monkeypatch, num_tokens, start):
     from vllm_ascend.attention import dsa_v41
 
     positions = torch.arange(start, start + num_tokens)
     completed = positions.remainder(2) == 1
     slots = torch.tensor([[7, 63], [19, 0], [19, 1], [3, 0], [3, 1]], dtype=torch.int32)[:num_tokens]
+    slots[~completed] = -1
     original_slots = slots.clone()
     rope = torch.zeros(num_tokens, 1, 2)
     state = SimpleNamespace(
         c2_ring_metadata=torch.zeros(5, 1, dtype=torch.int32),
         c2_metadata_group_id="ring",
-        c2_complete_mask=completed,
         c2_source_cos=rope,
         c2_source_sin=rope,
     )
@@ -845,14 +904,15 @@ def test_ring_source_masks_both_fused_store_coordinates(monkeypatch, num_tokens,
         return kv.to(torch.bfloat16)
 
     expected = slots.clone()
-    expected[~completed] = -1
 
     def update_keys(latent, coordinates, cos, sin):
         events.append("index")
+        assert coordinates.data_ptr() == slots.data_ptr()
         torch.testing.assert_close(coordinates, expected)
 
     def store(cache, coordinates, values):
         events.append("kv")
+        assert coordinates.data_ptr() == slots.data_ptr()
         torch.testing.assert_close(coordinates, expected)
 
     monkeypatch.setattr(dsa_v41, "wait_for_device_metadata", lambda *args: events.append("wait"))

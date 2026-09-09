@@ -451,7 +451,6 @@ class DeepseekV41EagerAttentionImpl:
         ratio = self.role.compress_ratio
         if ratio == 1:
             latent = compressor(hidden_states)
-            completed = torch.ones_like(positions, dtype=torch.bool)
             # C1 source positions are the current token positions. Reuse the
             # query RoPE selected by the SWA metadata builder instead of
             # indexing the global table a second time.
@@ -469,7 +468,6 @@ class DeepseekV41EagerAttentionImpl:
             kv = compressor.wkv(hidden_states.float())
             score = compressor.wgate(hidden_states.float())
             latent = compressor.pool_projected(kv, score, state_metadata)
-            completed = state_metadata.c2_complete_mask[: positions.shape[0]]
             source_cos = state_metadata.c2_source_cos
             source_sin = state_metadata.c2_source_sin
             if source_cos is None or source_sin is None:
@@ -480,8 +478,6 @@ class DeepseekV41EagerAttentionImpl:
             source_sin = source_sin[: positions.shape[0]]
             index_slots = indexer_metadata.cache.slot_mapping[: positions.shape[0]]
             long_slots = compressor_metadata.cache.slot_mapping[: positions.shape[0]]
-            index_slots = torch.where(completed[:, None], index_slots, -1)
-            long_slots = torch.where(completed[:, None], long_slots, -1)
 
         if attn.indexer is None:
             raise RuntimeError("V4.1 KV source is missing its indexer")
@@ -822,6 +818,16 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             if prepared_slots is None:
                 active_slots = raw_slots[:num_input_tokens]
                 valid = active_slots >= 0
+                if compressed and ratio == 2:
+                    # Prepare the C2 store mask once per cache group, before
+                    # forward. Match the ring compressor's completion policy.
+                    if kwargs.get("skip_ring_state_update", False):
+                        valid.zero_()
+                    else:
+                        valid_end = common.query_start_loc[num_actual_reqs].clamp_max(num_actual_tokens)
+                        valid &= torch.arange(num_input_tokens, device=active_slots.device) < valid_end
+                        if getattr(common, "positions", None) is not None:
+                            valid &= common.positions[:num_input_tokens].remainder(2) == 1
                 physical = active_slots.clamp_min(0)
                 self._slot_mapping_2d[:num_input_tokens, 0].copy_(
                     torch.where(
