@@ -225,3 +225,128 @@ def test_v41_hc_post_dispatches_fused_operator_with_batch_dimension():
         ),
     ):
         torch.testing.assert_close(actual_arg, expected_arg)
+
+
+def test_v41_dspark_propagates_delayed_mix_and_collapses_final_stream():
+    from vllm_ascend.models.deepseek_v41.dspark import DeepseekV41DSparkModel
+
+    model = DeepseekV41DSparkModel.__new__(DeepseekV41DSparkModel)
+    torch.nn.Module.__init__(model)
+    model.hc_mult = 2
+    model.embed_tokens = torch.nn.Embedding(4, 3)
+    seen = []
+
+    class Layer(torch.nn.Module):
+        def forward(self, positions, hidden, pre_mix, input_ids=None):
+            seen.append(pre_mix.clone())
+            return hidden + 1, pre_mix.flip(-1)
+
+    model.layers = torch.nn.ModuleDict({"40": Layer(), "41": Layer(), "42": Layer()})
+    ids = torch.tensor([0, 1])
+    from contextlib import nullcontext
+
+    model._moe_comm_methods = {}
+    with patch("vllm_ascend.models.deepseek_v41.dspark.use_moe_comm_methods", return_value=nullcontext()):
+        result = model(ids, torch.tensor([2, 3]))
+    torch.testing.assert_close(result, model.embed_tokens(ids) + 3)
+    assert [x[0].tolist() for x in seen] == [[1, 0], [0, 1], [1, 0]]
+
+
+def test_v41_target_emits_selected_aux_and_updates_persistent_mtp_buffer():
+    from vllm_ascend.models.deepseek_v41.model import DeepseekV41Model
+
+    model = DeepseekV41Model.__new__(DeepseekV41Model)
+    torch.nn.Module.__init__(model)
+    model.hc_mult = 2
+    model.embed_tokens = torch.nn.Embedding(4, 3)
+    model.norm = torch.nn.Identity()
+    model.shared_attention_state = MagicMock()
+    model._mtp_hidden_buffer = torch.full((5, 6), -10.0)
+    ptr = model._mtp_hidden_buffer.data_ptr()
+    model._set_aux_hidden_state_layers((1, 3))
+
+    class Layer(torch.nn.Module):
+        hc_collapse = staticmethod(DeepseekV41DecoderLayer.hc_collapse)
+
+        def __init__(self, idx):
+            super().__init__()
+            self.layer_idx = idx
+
+        def forward(self, positions, hidden, pre_mix, scaling, input_ids=None):
+            return hidden + 1, pre_mix
+
+    model.layers = torch.nn.ModuleList([Layer(i) for i in range(3)])
+    ids = torch.tensor([0, 1])
+    with patch("vllm_ascend.models.deepseek_v41.model.get_pp_group",
+               return_value=MagicMock(is_first_rank=True, is_last_rank=True)):
+        output, aux = model.forward(ids, torch.tensor([0, 1]), None)
+    embedded = model.embed_tokens(ids)
+    torch.testing.assert_close(output, embedded + 3)
+    assert len(aux) == 2
+    torch.testing.assert_close(aux[0], embedded + 1)
+    torch.testing.assert_close(aux[1], embedded + 3)
+    assert model._mtp_hidden_buffer.data_ptr() == ptr
+    torch.testing.assert_close(model._mtp_hidden_buffer[:2], (embedded + 3).unsqueeze(1).repeat(1, 2, 1).flatten(1))
+    assert (model._mtp_hidden_buffer[2:] == -10).all()
+
+
+def test_v41_dspark_decoder_uses_draft_experts_instead_of_target_config():
+    from contextlib import ExitStack
+    from types import SimpleNamespace
+
+    import vllm_ascend.models.deepseek_v4.dspark as shared
+    from vllm_ascend.models.deepseek_v41.dspark import DeepseekV41DSparkModel
+
+    draft = SimpleNamespace(
+        hc_mult=4, hidden_size=8, dspark_block_size=5,
+        dspark_target_layer_ids=[37, 38, 39], num_hidden_layers=40,
+        vocab_size=16, rms_norm_eps=1e-6, hc_eps=1e-6,
+        n_routed_experts=128, num_experts_per_tok=3,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(n_routed_experts=384)),
+        speculative_config=SimpleNamespace(draft_model_config=SimpleNamespace(hf_config=draft)),
+        quant_config=None,
+    )
+    factory = MagicMock(side_effect=lambda *args, **kwargs: torch.nn.Module())
+    with ExitStack() as stack:
+        for name in ("VocabParallelEmbedding", "ColumnParallelLinear", "RMSNorm", "DSparkMarkovHead", "DSparkConfidenceHead"):
+            stack.enter_context(patch.object(shared, name, side_effect=lambda *args, **kwargs: torch.nn.Identity()))
+        stack.enter_context(patch.object(DeepseekV41DSparkModel, "decoder_layer_cls", factory))
+        model = DeepseekV41DSparkModel(vllm_config=config)
+    assert len(model.layers) == factory.call_count == 3
+    for call in factory.call_args_list:
+        assert call.kwargs["config"] is draft
+        assert call.kwargs["config"].n_routed_experts == 128
+        assert call.kwargs["is_draft_layer"]
+    assert config.model_config.hf_config.n_routed_experts == 384
+
+
+def test_dspark_moe_comm_state_restores_target_after_draft_and_exception():
+    from types import SimpleNamespace
+
+    import pytest
+    from vllm_ascend.ascend_forward_context import MoECommType
+    from vllm_ascend.ops.fused_moe import moe_comm_method as comm
+
+    target = SimpleNamespace(num_experts=384, top_k=6, buffer=object())
+    draft = SimpleNamespace(num_experts=128, top_k=3, buffer=object())
+    kind = MoECommType.ALLTOALL
+    with patch.dict(comm._MoECommMethods, {kind: target}, clear=True):
+        with comm.isolate_moe_comm_methods() as draft_methods:
+            comm._MoECommMethods[kind] = draft
+        assert comm.get_moe_comm_method(kind) is target
+        assert draft_methods[kind] is draft
+        ctx = SimpleNamespace(moe_comm_type=kind, moe_comm_method=target)
+        with patch.object(comm, "_EXTRA_CTX", ctx):
+            with pytest.raises(RuntimeError, match="draft failed"):
+                with comm.use_moe_comm_methods(draft_methods):
+                    assert ctx.moe_comm_method is draft
+                    assert ctx.moe_comm_method.buffer is not target.buffer
+                    raise RuntimeError("draft failed")
+            assert ctx.moe_comm_method is target
+        with pytest.raises(RuntimeError, match="load failed"):
+            with comm.isolate_moe_comm_methods():
+                comm._MoECommMethods[kind] = draft
+                raise RuntimeError("load failed")
+        assert comm.get_moe_comm_method(kind) is target

@@ -883,7 +883,9 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         coordinates["max_cache_seq_len"] //= plane_ratio
         cos = sin = None
         if cache_kind == "swa" and positions is not None:
-            rope = batch_shared.get("rope")
+            rope = kwargs.get("rope_views")
+            if rope is None:
+                rope = batch_shared.get("rope")
             if rope is None:
                 rope = get_cos_and_sin_dsa(positions, use_cache=coordinates["num_prefills"] == 0)
                 batch_shared["rope"] = rope
