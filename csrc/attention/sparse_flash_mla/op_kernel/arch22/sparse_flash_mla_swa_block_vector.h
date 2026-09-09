@@ -288,6 +288,13 @@ __aicore__ inline void SWAVectorBlock<SMLAT>::CopyInSingleOriSparseRow(int64_t &
         copyInParams.dstStride = 0;
         DataCopyPadExtParams<KV_T> padInParams{false, 0, 0, 0};
         DataCopyPad(kvMergUb_[ubRowOffset], oriKvGm_[keyOffset], copyInParams, padInParams);
+    } else {
+        // The corresponding score is masked later, but the merge buffer is also
+        // consumed by the cube matmul before that mask is applied.  Initialize
+        // invalid sparse slots so the matmul never observes uninitialized data.
+        int64_t ubRowOffset =
+            mergeMte3Idx % 2 * INPUT1_BUFFER_OFFSET / sizeof(KV_T) + (mte2Size - mte3Size) * constInfo.headDim;
+        Duplicate(kvMergUb_[ubRowOffset], static_cast<KV_T>(0), constInfo.headDim);
     }
     mte2Size += constInfo.sparseBlockSize;
 }
@@ -303,9 +310,12 @@ __aicore__ inline void SWAVectorBlock<SMLAT>::CopyInOriSparseKv(int64_t &mte2Siz
         CopyInSingleOriSparseRow(mte2Size, mte3Size, mergeMte3Idx, logicalIdx0, runInfo);
         return;
     }
-    if (unlikely(keyOffset1 < 0 && keyOffset2 < 0)) {
-        // invalid 行仅占 merge 行位，不搬 KV；V1 按索引刷 -inf，值无关
-        mte2Size += 2 * constInfo.sparseBlockSize;
+    // Preserve pair positions whenever either sparse index is invalid.  The
+    // fast strided copy cannot represent a hole (and would place the valid row
+    // in the invalid row's slot), while the per-row path zero-fills holes.
+    if (unlikely(keyOffset1 < 0 || keyOffset2 < 0)) {
+        CopyInSingleOriSparseRow(mte2Size, mte3Size, mergeMte3Idx, logicalIdx0, runInfo);
+        CopyInSingleOriSparseRow(mte2Size, mte3Size, mergeMte3Idx, logicalIdx1, runInfo);
         return;
     }
 
