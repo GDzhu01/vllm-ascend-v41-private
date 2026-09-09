@@ -413,7 +413,8 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
     def __init__(self, vllm_config, prefix, **kwargs):
         super().__init__(vllm_config, prefix, **kwargs)
         config = vllm_config.model_config.hf_config
-        if self.layer_idx in config.engram_layer_ids:
+        engram_enabled = get_ascend_config().enable_engram
+        if engram_enabled and self.layer_idx in config.engram_layer_ids:
             self.engram = torch.nn.Module()
             self.engram.wkv = torch.nn.Linear(
                 (config.engram_max_ngram_size - 1) * config.engram_n_heads * config.engram_head_dim,
@@ -539,9 +540,12 @@ class DeepseekV41Model(DeepseekV4Model):
         # Target storage is a loader/runtime choice.  Checkpoint metadata is
         # used only by load_checkpoint to validate the source representation.
         # Read the storage choice after AscendConfig validation.
-        storage_format = get_ascend_config().engram_storage
+        ascend_config = get_ascend_config()
+        storage_format = ascend_config.engram_storage
         query_group = EngramQueryGroup.from_vllm(vllm_config.parallel_config)
         for layer_id, rows in zip(config.engram_layer_ids, config.engram_num_embeddings):
+            if not ascend_config.enable_engram:
+                break
                 self.layers[layer_id].engram.embed = NodeShardedEngram(
                     rows, config.engram_head_dim, query_group, storage_format=storage_format,
                 )
@@ -552,7 +556,7 @@ class DeepseekV41Model(DeepseekV4Model):
             vllm_config.compilation_config.max_cudagraph_capture_size or 0,
         )
         self.register_buffer("engram_rotation", torch.eye(32), persistent=False)
-        if vllm_config.load_config.load_format != "dummy":
+        if ascend_config.enable_engram and vllm_config.load_config.load_format != "dummy":
             with torch.device("cpu"):
                 tokenizer = AutoTokenizer.from_pretrained(self.engram_root)
                 self.engram_history = PagedNgramHistory(config, tokenizer)
@@ -566,6 +570,8 @@ class DeepseekV41Model(DeepseekV4Model):
     def prepare_engram(self, input_ids, positions):
         """Eager boundary: every DP participates, including metadata-free dummies."""
         config = self.config
+        if not get_ascend_config().enable_engram:
+            return {}, torch.empty(0, dtype=torch.bool, device=positions.device)
         columns = (config.engram_max_ngram_size - 1) * config.engram_n_heads
         hashes = torch.empty((0, len(config.engram_layer_ids), columns), dtype=torch.int64, device="cpu")
         mask = torch.empty(0, dtype=torch.bool, device="cpu")
