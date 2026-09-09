@@ -705,7 +705,6 @@ class NPUModelRunner(GPUModelRunner):
             return layer_ids
         if self.speculative_config.use_dspark():
             hf_config = self.speculative_config.draft_model_config.hf_config
-            hf_config = getattr(hf_config, "text_config", hf_config)
             # deepseek v4 dspark
             dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
             if dspark_layer_ids:
@@ -3002,6 +3001,11 @@ class NPUModelRunner(GPUModelRunner):
             "inputs_embeds": inputs_embeds,
             **model_kwargs,
         }
+        # Variable Engram routing must run on every DP before ACLGraph capture
+        # or replay; only its persistent BF16 inputs enter the model graph.
+        prepare_engram = getattr(self.model, "prepare_engram_inputs", None)
+        if prepare_engram is not None:
+            model_inputs.update(prepare_engram(input_ids, positions, num_tokens_padded))
         run_model = partial(self.model, **model_inputs)
 
         if self.enable_enpu:

@@ -4,16 +4,21 @@
 
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
+from safetensors import safe_open
+from transformers import AutoTokenizer
 from vllm.distributed import get_pp_group
+from vllm.forward_context import get_forward_context
 
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheBackend,
     DeepseekV41CacheLayer,
     DeepseekV41EagerAttentionImpl,
 )
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41FullSpec,
     DeepseekV41SWASpec,
@@ -28,6 +33,9 @@ from vllm_ascend.models.deepseek_v4.model import (
 )
 
 from .compressor import DeepseekV41Compressor, _read, text_config_of
+from .engram_gate import engram_gate
+from .engram_hash import PagedNgramHistory
+from .engram_hbm import EngramQueryGroup, NodeShardedEngram
 from .indexer import DeepseekV41Indexer
 
 
@@ -337,6 +345,27 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
 
     attention_cls = DeepseekV41Attention
 
+    def __init__(self, vllm_config, prefix, **kwargs):
+        super().__init__(vllm_config, prefix, **kwargs)
+        config = vllm_config.model_config.hf_config
+        engram_enabled = get_ascend_config().enable_engram
+        if engram_enabled and self.layer_idx in config.engram_layer_ids:
+            self.engram = torch.nn.Module()
+            self.engram.wkv = torch.nn.Linear(
+                (config.engram_max_ngram_size - 1) * config.engram_n_heads * config.engram_head_dim,
+                (config.hc_mult + 1) * config.hidden_size,
+                bias=False,
+                dtype=torch.bfloat16,
+            )
+            self.engram.q_weight = torch.nn.Parameter(
+                torch.empty(config.hc_mult, config.hidden_size, dtype=torch.bfloat16)
+            )
+            self.engram.k_weight = torch.nn.Parameter(
+                torch.empty(config.hc_mult, config.hidden_size, dtype=torch.bfloat16)
+            )
+        else:
+            self.engram = None
+
     @staticmethod
     def hc_collapse(x, pre_mix):
         return (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
@@ -402,6 +431,12 @@ class DeepseekV41Model(DeepseekV4Model):
     decoder_layer_cls = DeepseekV41DecoderLayer
 
     def __init__(self, *, vllm_config, prefix=""):
+        if (
+            get_ascend_config().enable_engram
+            and vllm_config.load_config.load_format != "dummy"
+            and vllm_config.load_config.safetensors_load_strategy != "lazy"
+        ):
+            raise ValueError("Engram HBM shards require --safetensors-load-strategy lazy")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         # V4.1 collapses with the last block's ffn_pre; it has no hc_head
         # projection in the checkpoint.
@@ -422,37 +457,165 @@ class DeepseekV41Model(DeepseekV4Model):
         for layer in self.layers:
             if isinstance(layer, DeepseekV41DecoderLayer):
                 layer.self_attn.shared_state = self.shared_attention_state
+        self.engram_root = vllm_config.model_config.model
+        config = self.config
+        # Target storage is a loader/runtime choice.  Checkpoint metadata is
+        # used only by load_checkpoint to validate the source representation.
+        # Read the storage choice after AscendConfig validation.
+        ascend_config = get_ascend_config()
+        storage_format = ascend_config.engram_storage
+        if ascend_config.enable_engram:
+            query_group = EngramQueryGroup.from_vllm(vllm_config.parallel_config)
+            for layer_id, rows in zip(config.engram_layer_ids, config.engram_num_embeddings):
+                self.layers[layer_id].engram.embed = NodeShardedEngram(
+                    rows, config.engram_head_dim, query_group, storage_format=storage_format,
+                )
+        self.engram_history = None
+        self._engram_input_buffers = None
+        self._engram_max_tokens = max(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+        )
+        self.register_buffer("engram_rotation", torch.eye(32), persistent=False)
+        if ascend_config.enable_engram and vllm_config.load_config.load_format != "dummy":
+            with torch.device("cpu"):
+                tokenizer = AutoTokenizer.from_pretrained(self.engram_root)
+                self.engram_history = PagedNgramHistory(config, tokenizer)
+                with safe_open(Path(self.engram_root) / "optional/quarot.safetensors", framework="pt") as file:
+                    rotation = file.get_tensor("global_rotation")
+                block = rotation[:32, :32].contiguous()
+                if not torch.equal(rotation, torch.block_diag(*[block] * (config.hidden_size // 32))):
+                    raise ValueError("Engram gate requires repeated block32 global rotation")
+            self.engram_rotation.copy_(block)
 
-    def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds=None):
+    def prepare_engram(self, input_ids, positions):
+        """Eager boundary: every DP participates, including metadata-free dummies."""
+        config = self.config
+        if not get_ascend_config().enable_engram:
+            return {}, torch.empty(0, dtype=torch.bool, device=positions.device)
+        columns = (config.engram_max_ngram_size - 1) * config.engram_n_heads
+        hashes = torch.empty((0, len(config.engram_layer_ids), columns), dtype=torch.int64, device="cpu")
+        mask = torch.empty(0, dtype=torch.bool, device="cpu")
+        metadata = get_forward_context().attn_metadata
+        if metadata is not None and self.engram_history is not None:
+            first = self.layers[0].self_attn.dsa_attn.swa_cache_layer
+            meta = metadata[first.prefix]
+            boundaries = (
+                meta.query_start_loc_cpu
+                if getattr(meta, "query_start_loc_cpu", None) is not None
+                else meta.query_start_loc.detach().cpu()
+            ).long()
+            n = int(boundaries[-1])
+            requests = torch.repeat_interleave(torch.arange(len(boundaries) - 1, device="cpu"), boundaries.diff())
+            hashes, mask = self.engram_history.update(
+                input_ids[:n].cpu().long(),
+                positions[:n].cpu().long(),
+                requests,
+                (
+                    meta.block_table_cpu
+                    if getattr(meta, "block_table_cpu", None) is not None
+                    else meta.block_table.detach().cpu()
+                ),
+                meta.storage_block_size,
+            )
+        lookups = {}
+        tables = [self.layers[layer_id].engram.embed for layer_id in config.engram_layer_ids]
+        ids_list = [hashes[:, slot] for slot in range(len(tables))]
+        if hasattr(tables[0], "route_many"):
+            routed = tables[0].route_many(tables, ids_list)
+        else:
+            routed = [table(ids) for table, ids in zip(tables, ids_list)]
+        for layer_id, values in zip(config.engram_layer_ids, routed):
+            lookups[layer_id] = values.flatten(1)
+        return lookups, mask.to(positions.device)
+
+    def prepare_engram_inputs(self, input_ids, positions, padded_tokens=None):
+        """Refresh persistent inputs before main-model capture or replay."""
+        lookups, mask = self.prepare_engram(input_ids, positions)
+        num_tokens = positions.shape[0]
+        # The compiled V4.1 backbone uses the scheduler's static token
+        # capacity for decode graphs (typically max_num_batched_tokens), even
+        # when the current request has one token.  Keep lookup tensors at that
+        # capacity so every captured graph sees the same Engram shape.
+        output_tokens = max(self._engram_max_tokens, padded_tokens or 0)
+        if output_tokens < num_tokens:
+            raise ValueError("Engram padded token count is smaller than the input")
+        if self._engram_input_buffers is None:
+            capacity = self._engram_max_tokens
+            self._engram_input_buffers = (
+                {layer: values.new_zeros((capacity, values.shape[1])) for layer, values in lookups.items()},
+                mask.new_zeros(capacity),
+            )
+        buffers, mask_buffer = self._engram_input_buffers
+        padded_mask = mask_buffer[:output_tokens]
+        padded_mask.zero_()
+        padded_mask[:mask.numel()].copy_(mask)
+        padded_lookups = {}
+        for layer, values in lookups.items():
+            padded = buffers[layer][:output_tokens]
+            padded.zero_()
+            padded[:values.shape[0]].copy_(values)
+            padded_lookups[layer] = padded
+        return {"engram_lookups": padded_lookups, "engram_mask": padded_mask}
+
+    def forward(
+        self, input_ids, positions, intermediate_tensors, inputs_embeds=None,
+        engram_lookups=None, engram_mask=None,
+    ):
         if not get_pp_group().is_first_rank or not get_pp_group().is_last_rank:
             raise NotImplementedError("V4.1 eager milestone currently requires PP=1")
         hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
+        if engram_lookups is None:
+            lookups, token_mask = self.prepare_engram(input_ids, positions)
+        else:
+            lookups, token_mask = engram_lookups, engram_mask
         self.shared_attention_state.reset()
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
         pre_mix[:, 0] = 1.0
         last_layer = None
-        aux_hidden_states = []
         for layer in self.layers:
             last_layer = layer
-            # DSpark consumes the residual stream entering its configured
-            # target layers. The runner expresses checkpoint IDs as one-based.
-            if layer.layer_idx + 1 in self.aux_hidden_state_layers:
-                aux_hidden_states.append(hidden_states.mean(dim=1))
+            if layer.engram is not None and token_mask.numel():
+                n = hidden_states.shape[0]
+                # Graph captures keep lookup buffers at static capacity; the
+                # model's actual token dimension remains scheduler-dynamic.
+                lookup = lookups[layer.layer_idx][:n]
+                active_mask = token_mask[:n]
+                kv = layer.engram.wkv(lookup)
+                key, value = kv.split([self.hc_mult * self.config.hidden_size, self.config.hidden_size], -1)
+                hidden_states[:n] = engram_gate(
+                    hidden_states[:n],
+                    key.view(n, self.hc_mult, self.config.hidden_size),
+                    value,
+                    layer.engram.q_weight.float() * layer.engram.k_weight.float(),
+                    self.engram_rotation,
+                    active_mask,
+                    self.config.rms_norm_eps,
+                )
             hidden_states, pre_mix = layer(positions, hidden_states, pre_mix, None, input_ids=input_ids)
         assert last_layer is not None
         hidden_states = last_layer.hc_collapse(hidden_states, pre_mix)
-        hidden_states = self.norm(hidden_states)
-        if aux_hidden_states:
-            return hidden_states, aux_hidden_states
-        return hidden_states
+        return self.norm(hidden_states)
 
 
 class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
     model_cls = DeepseekV41Model
-    # Engram is intentionally disabled until its tables can be HBM-sharded.
-    _DEFERRED_WEIGHT_MARKERS = (".engram.",)
+    requires_raw_input_tokens = True
+    _DEFERRED_WEIGHT_MARKERS = ()
     _DEFERRED_WEIGHT_PREFIXES = ("aligner.", "vision.", "image_", "mtp.")
+
+    def prepare_engram_inputs(self, input_ids, positions, padded_tokens=None):
+        return self.model.prepare_engram_inputs(input_ids, positions, padded_tokens)
+
+    def forward(
+        self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None,
+        engram_lookups=None, engram_mask=None,
+    ):
+        return self.model(
+            input_ids, positions, intermediate_tensors, inputs_embeds,
+            engram_lookups=engram_lookups, engram_mask=engram_mask,
+        )
 
     @classmethod
     def _is_milestone_weight(cls, name):
@@ -461,9 +624,35 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if not get_ascend_config().enable_engram:
+            return super().load_weights(
+                (name, tensor) for name, tensor in weights if ".engram." not in name
+            )
+        engram_loaded = set()
+
         def milestone_weights() -> Iterator[tuple[str, torch.Tensor]]:
             for name, tensor in weights:
-                if self._is_milestone_weight(name):
+                if ".engram." in name:
+                    # Bypass V4's generic embed -> embed_tokens remapping and TP loader.
+                    local_name = name.removeprefix("model.")
+                    # FP8/MXFP8 Engram scales are consumed by the CPU loader.
+                    if local_name.endswith(".engram.embed.scale"):
+                        continue
+                    parameter_name = "model." + local_name
+                    if local_name.endswith(".engram.embed.weight"):
+                        layer_id = int(local_name.split(".")[1])
+                        self.model.layers[layer_id].engram.embed.load_checkpoint(self.model.engram_root, local_name)
+                    else:
+                        param = self.get_parameter(parameter_name)
+                        if tensor.dtype != torch.bfloat16 or tensor.shape != param.shape:
+                            raise ValueError(f"Unexpected BF16 Engram parameter: {name}")
+                        param.data.copy_(tensor)
+                    engram_loaded.add(parameter_name)
+                elif self._is_milestone_weight(name):
                     yield name, tensor
 
-        return super().load_weights(milestone_weights())
+        loaded = super().load_weights(milestone_weights())
+        expected = {name for name, _ in self.named_parameters() if ".engram." in name}
+        if engram_loaded != expected:
+            raise ValueError(f"Missing Engram weights: {expected - engram_loaded}")
+        return loaded | engram_loaded
