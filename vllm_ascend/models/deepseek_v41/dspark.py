@@ -3,6 +3,7 @@
 """Aurora / DeepSeek-V4.1 dSPark draft model for Ascend."""
 
 import torch
+from vllm.compilation.decorators import support_torch_compile
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -110,6 +111,7 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
         return last_layer.hc_collapse(hidden_states, pre_mix)
 
 
+@support_torch_compile
 class DSparkDeepseekV41ForCausalLM(DSparkDeepseekV4ForCausalLM):
     def __init__(self, *, vllm_config, prefix="") -> None:
         torch.nn.Module.__init__(self)
