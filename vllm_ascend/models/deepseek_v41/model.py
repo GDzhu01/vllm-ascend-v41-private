@@ -13,12 +13,12 @@ from transformers import AutoTokenizer
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheBackend,
     DeepseekV41CacheLayer,
     DeepseekV41EagerAttentionImpl,
 )
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41CompressorStateSpec,
     DeepseekV41FullSpec,
@@ -34,7 +34,7 @@ from vllm_ascend.models.deepseek_v4.model import (
     DeepseekV4Model,
 )
 
-from .compressor import DeepseekV41Compressor, _read, text_config_of
+from .compressor import DeepseekV41Compressor, DeepseekV41RMSNorm, _read, text_config_of
 from .engram_gate import engram_gate
 from .engram_hash import PagedNgramHistory
 from .engram_hbm import EngramQueryGroup, NodeShardedEngram
@@ -413,6 +413,12 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
     def __init__(self, vllm_config, prefix, **kwargs):
         super().__init__(vllm_config, prefix, **kwargs)
         config = vllm_config.model_config.hf_config
+        self.hc_norm = DeepseekV41RMSNorm(
+            config.hc_mult * config.hidden_size,
+            config.rms_norm_eps,
+            has_weight=False,
+            dtype=torch.float32,
+        )
         engram_enabled = get_ascend_config().enable_engram
         if engram_enabled and self.layer_idx in config.engram_layer_ids:
             self.engram = torch.nn.Module()
@@ -428,14 +434,16 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
             self.engram.k_weight = torch.nn.Parameter(
                 torch.empty(config.hc_mult, config.hidden_size, dtype=torch.bfloat16)
             )
+            self.engram.norm = DeepseekV41RMSNorm(
+                config.hidden_size, config.rms_norm_eps, has_weight=False, dtype=torch.float32
+            )
         else:
             self.engram = None
 
     def hc_mixes(self, x, hc_fn, hc_scale, hc_base):
         x_float = x.float()
         flat = x_float.flatten(-2)
-        mixes = torch.nn.functional.linear(flat, hc_fn)
-        mixes *= torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = torch.nn.functional.linear(self.hc_norm(flat), hc_fn)
         pre, post, comb = mixes.split(
             [self.hc_mult, self.hc_mult, self.hc_mult * self.hc_mult], -1
         )
@@ -671,7 +679,7 @@ class DeepseekV41Model(DeepseekV4Model):
                     layer.engram.q_weight.float() * layer.engram.k_weight.float(),
                     self.engram_rotation,
                     active_mask,
-                    self.config.rms_norm_eps,
+                    layer.engram.norm,
                 )
             hidden_states, pre_mix = layer(
                 positions, hidden_states, pre_mix, None, input_ids=input_ids

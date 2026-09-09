@@ -26,6 +26,7 @@ def load_module(name):
 
 
 hbm = load_module("engram_hbm")
+gate = load_module("engram_gate").engram_gate
 
 
 def _worker(rank, rendezvous):
@@ -221,8 +222,11 @@ def test_gate_preserves_masked_rows():
     hidden = torch.randn(3, 4, 32).bfloat16()
     key = torch.randn(3, 4, 32).bfloat16()
     value = torch.randn(3, 32).bfloat16()
+    def norm(x):
+        return torch.nn.functional.rms_norm(x, (32,), eps=1e-5)
+
     out = gate(hidden, key, value, torch.randn(4, 32), torch.eye(32),
-               torch.tensor([True, False, True]), 1e-5)
+               torch.tensor([True, False, True]), norm)
     assert torch.equal(out[1], hidden[1])
     assert torch.isfinite(out.float()).all()
 

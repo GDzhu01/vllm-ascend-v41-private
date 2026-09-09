@@ -10,7 +10,7 @@ def engram_gate(
     channel_weight: torch.Tensor,
     rotation_block: torch.Tensor,
     token_mask: torch.Tensor,
-    eps: float,
+    norm: torch.nn.Module,
 ) -> torch.Tensor:
     """Apply original-basis gating to a rotated residual and rotated value.
 
@@ -20,10 +20,9 @@ def engram_gate(
     """
     dim = hidden.shape[-1]
     original = (hidden.float().unflatten(-1, (-1, rotation_block.shape[0])) @ rotation_block.float().T).flatten(-2)
-    key = key.float()
-    rstd = torch.rsqrt(original.square().mean(-1) + eps)
-    rstd *= torch.rsqrt(key.square().mean(-1) + eps)
-    dot = (original * channel_weight.float() * key).sum(-1) * rstd * dim**-0.5
+    original = norm(original)
+    key = norm(key.float())
+    dot = (original * channel_weight.float() * key).sum(-1) * dim**-0.5
     magnitude = dot.abs().clamp_min(1e-6).sqrt()
     gate = torch.sigmoid(torch.where(torch.signbit(dot), -magnitude, magnitude))
     gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)

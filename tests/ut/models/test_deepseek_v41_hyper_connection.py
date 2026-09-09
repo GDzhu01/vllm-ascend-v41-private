@@ -4,16 +4,18 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41RMSNorm
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41DecoderLayer
 
 
-def _layer() -> DeepseekV41DecoderLayer:
+def _layer(hidden_size=8) -> DeepseekV41DecoderLayer:
     layer = DeepseekV41DecoderLayer.__new__(DeepseekV41DecoderLayer)
     torch.nn.Module.__init__(layer)
     layer.hc_mult = 4
     layer.hc_sinkhorn_iters = 3
     layer.norm_eps = 1e-6
     layer.hc_eps = 1e-6
+    layer.hc_norm = DeepseekV41RMSNorm(4 * hidden_size, layer.norm_eps, has_weight=False, dtype=torch.float32)
     return layer
 
 
@@ -92,7 +94,7 @@ def test_v41_forward_threads_pre_mix_through_fused_hc_pre():
 
 def test_v41_hc_reference_supports_hidden_size_5120():
     torch.manual_seed(7)
-    layer = _layer()
+    layer = _layer(5120)
     x = torch.randn(2, 4, 5120, dtype=torch.bfloat16)
     hc_fn = torch.randn(24, 4 * 5120, dtype=torch.float32) / 5120
     hc_scale = torch.randn(3, dtype=torch.float32)
