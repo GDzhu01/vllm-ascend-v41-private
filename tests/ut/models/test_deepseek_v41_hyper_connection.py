@@ -17,7 +17,7 @@ def _layer(hidden_size=8) -> DeepseekV41DecoderLayer:
     layer.hc_sinkhorn_iters = 3
     layer.norm_eps = 1e-6
     layer.hc_eps = 1e-6
-    layer.register_buffer("hc_norm_gamma", torch.ones(4 * hidden_size), persistent=False)
+    layer.hc_norm_gamma = torch.ones(4 * hidden_size)
     return layer
 
 

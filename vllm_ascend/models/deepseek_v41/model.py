@@ -414,11 +414,7 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
     def __init__(self, vllm_config, prefix, **kwargs):
         super().__init__(vllm_config, prefix, **kwargs)
         config = vllm_config.model_config.hf_config
-        self.register_buffer(
-            "hc_norm_gamma",
-            torch.ones(config.hc_mult * config.hidden_size, dtype=torch.float32),
-            persistent=False,
-        )
+        self.hc_norm_gamma = torch.ones(config.hc_mult * config.hidden_size, dtype=torch.float32)
         engram_enabled = get_ascend_config().enable_engram
         if engram_enabled and self.layer_idx in config.engram_layer_ids:
             self.engram = torch.nn.Module()
@@ -434,9 +430,7 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
             self.engram.k_weight = torch.nn.Parameter(
                 torch.empty(config.hc_mult, config.hidden_size, dtype=torch.bfloat16)
             )
-            self.engram.register_buffer(
-                "norm_gamma", torch.ones(config.hidden_size, dtype=torch.float32), persistent=False
-            )
+            self.engram.norm_gamma = torch.ones(config.hidden_size, dtype=torch.float32)
         else:
             self.engram = None
 

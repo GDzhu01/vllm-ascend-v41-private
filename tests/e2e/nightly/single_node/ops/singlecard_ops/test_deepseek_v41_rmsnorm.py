@@ -79,7 +79,7 @@ def test_rmsnorm_graph_replay_uses_new_input(width, has_weight, dtype):
 
 @torch.inference_mode()
 @pytest.mark.parametrize("engram_enabled", [False, True])
-def test_weightless_norm_buffers_are_initialized_and_move_with_layer(monkeypatch, engram_enabled):
+def test_weightless_norm_gamma_uses_initialization_device(monkeypatch, engram_enabled):
     def init_parent(self, *args, **kwargs):
         torch.nn.Module.__init__(self)
         self.layer_idx = 0
@@ -95,19 +95,20 @@ def test_weightless_norm_buffers_are_initialized_and_move_with_layer(monkeypatch
         engram_n_heads=1,
         engram_head_dim=32,
     )
-    layer = DeepseekV41DecoderLayer(SimpleNamespace(model_config=SimpleNamespace(hf_config=config)), "layers.0")
-    layer.npu()
-    expected_buffers = {"hc_norm_gamma": config.hc_mult * config.hidden_size}
+    # Model loaders construct layers in the target device context.
+    with torch.device("npu"):
+        layer = DeepseekV41DecoderLayer(SimpleNamespace(model_config=SimpleNamespace(hf_config=config)), "layers.0")
+    expected_gammas = {"hc_norm_gamma": (layer.hc_norm_gamma, config.hc_mult * config.hidden_size)}
     if engram_enabled:
-        expected_buffers["engram.norm_gamma"] = config.hidden_size
+        expected_gammas["engram.norm_gamma"] = (layer.engram.norm_gamma, config.hidden_size)
     else:
         assert layer.engram is None
-    for name, width in expected_buffers.items():
-        gamma = layer.get_buffer(name)
+    for name, (gamma, width) in expected_gammas.items():
         assert gamma.device.type == "npu" and gamma.dtype == torch.float32
         torch.testing.assert_close(gamma.cpu(), torch.ones(width), rtol=0, atol=0)
         assert name not in layer.state_dict()
         assert name not in dict(layer.named_parameters())
+        assert name not in dict(layer.named_buffers())
 
 
 @torch.inference_mode()
@@ -118,7 +119,7 @@ def test_weightless_hc_mixes_matches_reference():
     torch.nn.Module.__init__(layer)
     layer.hc_mult, layer.hc_sinkhorn_iters = hc_mult, 3
     layer.norm_eps, layer.hc_eps = 1e-6, 1e-6
-    layer.register_buffer("hc_norm_gamma", torch.ones(hc_mult * width), persistent=False)
+    layer.hc_norm_gamma = torch.ones(hc_mult * width, dtype=torch.float32, device="npu")
     x = torch.randn(32, hc_mult, width, dtype=torch.bfloat16)
     hc_fn = torch.randn(2 * hc_mult + hc_mult**2, width * hc_mult) / width
     scale, base = torch.randn(3), torch.randn(2 * hc_mult + hc_mult**2)
@@ -134,7 +135,7 @@ def test_weightless_hc_mixes_matches_reference():
     for _ in range(layer.hc_sinkhorn_iters - 1):
         comb /= comb.sum(-1, keepdim=True) + layer.hc_eps
         comb /= comb.sum(-2, keepdim=True) + layer.hc_eps
-    actual = layer.npu().hc_mixes(x.npu(), hc_fn.npu(), scale.npu(), base.npu())
+    actual = layer.hc_mixes(x.npu(), hc_fn.npu(), scale.npu(), base.npu())
     for result, expected in zip(actual, (pre, post, comb)):
         torch.testing.assert_close(result.cpu(), expected, rtol=1e-5, atol=1e-6)
 
