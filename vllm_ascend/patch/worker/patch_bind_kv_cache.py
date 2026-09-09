@@ -3,8 +3,6 @@ import vllm.v1.worker.utils as utils
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.worker.utils import defaultdict, extract_layer_index
 
-from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheBackend
-
 
 # Without this patch, it will raise an exception when initialize kv_cache.
 # TODO To remove the patch, we need check why the original bind_kv_cache raises an NotImplementedError.
@@ -46,11 +44,7 @@ def bind_kv_cache(
 
     # Bind kv_caches to forward context
     for layer_name, kv_cache in kv_caches.items():
-        layer = forward_context[layer_name]
-        if getattr(layer, "get_attn_backend", lambda: None)() is DeepseekV41CacheBackend:
-            layer.kv_cache = [kv_cache]
-        else:
-            layer.kv_cache = kv_cache
+        forward_context[layer_name].kv_cache = kv_cache
 
 
 utils.bind_kv_cache = bind_kv_cache

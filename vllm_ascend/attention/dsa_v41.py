@@ -135,7 +135,6 @@ class DeepseekV41Metadata(AttentionMetadata):
     c2_source_sin: torch.Tensor | None = None
     c2_metadata_group_id: int | None = None
     global_metadata: "DeepseekV41Metadata | None" = None
-    hidden_restore_idx: torch.Tensor | None = None
     cp_token_range: tuple[int, int, int, int] | None = None
 
 
@@ -1110,8 +1109,7 @@ class DeepseekV41CacheBackend(AttentionBackend):
 
     @classmethod
     def supports_pcp(cls) -> bool:
-        # Execution is owned by the model's V4.1 adapter, not get_impl_cls().
-        return True
+        return False
 
     @staticmethod
     def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str="auto"):

@@ -1269,7 +1269,6 @@ def test_v41_cp_metadata_preserves_global_compression_and_local_causality(
     assert metadata.num_actual_tokens == len(positions)
 
 
-
 @pytest.mark.parametrize("rank", [0, 1])
 def test_v41_cp_uses_device_seq_lens_when_cpu_mirror_is_upper_bound(runtime, monkeypatch, rank):
     from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
@@ -1354,71 +1353,6 @@ def test_v41_cp_rope_preserves_global_rows_across_builds(runtime, monkeypatch, r
     assert len(calls) == 2  # One global gather per build, including empty local ranks.
 
 
-def test_v41_pcp_uses_canonical_metadata_and_rank_local_slot_view(runtime, monkeypatch):
-    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41PCPMetadataBuilder
-
-    runtime.parallel_config.prefill_context_parallel_size = 2
-    monkeypatch.setattr(
-        "vllm_ascend.attention.context_parallel.dsa_v41_cp.get_pcp_group",
-        lambda: SimpleNamespace(rank_in_group=1),
-    )
-    spec = collect_specs(runtime)["model.layers.2.self_attn.long_kv_cache"]
-    builder = DeepseekV41PCPMetadataBuilder(spec, [], runtime, torch.device("cpu"))
-    global_common = _cp_common()
-    local_common = global_common.replace(
-        query_start_loc=torch.tensor([0, 1, 2]),
-        query_start_loc_cpu=torch.tensor([0, 1, 2]),
-        seq_lens=torch.tensor([3, 5]),
-        seq_lens_cpu=torch.tensor([3, 5]),
-        positions=torch.tensor([2, 4]),
-        num_actual_tokens=2,
-        num_input_tokens=2,
-        slot_mapping=torch.tensor([0, 1, 2, 68]),
-    )
-    # The canonical view is owned by the common PCP adapter; this test isolates
-    # V4.1's original-to-compressed coordinate conversion in both views.
-    monkeypatch.setattr(builder, "_build_global_common_attn_metadata", lambda *args: global_common)
-    context = SimpleNamespace(
-        global_batch=SimpleNamespace(is_dummy=False), hidden_restore_idx=torch.tensor([0, 1, 2, 3])
-    )
-    metadata = builder.build(0, local_common, pcp_context=context, pcp_cache_group_idx=0)
-    assert metadata.slot_mapping.tolist() == [[-1, -1], [-1, -1]]
-    assert metadata.global_metadata.slot_mapping.tolist() == [[-1, -1], [0, 0], [-1, -1], [-1, -1]]
-    assert metadata.positions.tolist() == [2, 4]
-    assert metadata.hidden_restore_idx.tolist() == [0, 1, 2, 3]
-
-
-@pytest.mark.parametrize("local_tokens", [0, 2])
-def test_v41_pcp_restores_global_order_before_source_update(monkeypatch, local_tokens):
-    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41PCPImpl
-
-    impl = DeepseekV41PCPImpl("layer", SimpleNamespace(is_kv_source=False), None, None, None)
-    hidden = torch.tensor([[10.0], [40.0]])
-    canonical = torch.tensor([[10.0], [20.0], [30.0], [40.0]])
-    gathered = torch.tensor([[10.0], [40.0], [20.0], [30.0]])
-    calls = []
-    group = SimpleNamespace(all_gather=lambda tensor, dim: calls.append("gather") or gathered)
-    monkeypatch.setattr("vllm_ascend.attention.context_parallel.dsa_common.get_pcp_group", lambda: group)
-    global_metadata = object()
-    monkeypatch.setattr(impl, "_global_layer_metadata", lambda _: global_metadata)
-    monkeypatch.setattr(
-        impl,
-        "_update_caches",
-        lambda attn, tensor, metadata: calls.append((tensor.clone(), metadata)),
-    )
-    metadata = SimpleNamespace(
-        swa=SimpleNamespace(
-            hidden_restore_idx=torch.tensor([0, 2, 3, 1]),
-            num_actual_tokens=local_tokens,
-        )
-    )
-    local = impl._prepare_inputs_and_caches(None, hidden, metadata, {})
-    assert calls[0] == "gather"
-    torch.testing.assert_close(calls[1][0], canonical)
-    assert calls[1][1] is global_metadata
-    assert local.shape[0] == local_tokens
-
-
 def test_v41_cp_empty_query_rank_still_exchanges_output(monkeypatch):
     from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
 
@@ -1461,144 +1395,6 @@ def test_v41_cp_consumers_reuse_local_topk_and_candidates():
     assert shared.candidates is candidates
 
 
-def test_v41_v2_packed_cache_keeps_four_backings_and_scale_views(runtime, monkeypatch):
-    from vllm_ascend.worker.v2.attn_utils import _allocate_kv_cache, _reshape_kv_cache_v2
-
-    specs = collect_specs(runtime)
-    groups = make_cache_groups(group_cache_specs(specs))
-    stride = pool_bytes_per_block(groups)
-    num_blocks, tensors = allocate_cache_config(runtime, groups, 3 * stride)
-    cache_config = SimpleNamespace(kv_cache_groups=groups, kv_cache_tensors=tensors, num_blocks=num_blocks)
-    monkeypatch.setattr("vllm_ascend.worker.v2.attn_utils.get_current_vllm_config", lambda: runtime)
-    raw = _allocate_kv_cache(cache_config, {}, torch.device("cpu"))
-    assert len({tensor.data_ptr() for tensor in raw.values()}) == 4
-    attn_groups = [
-        SimpleNamespace(
-            kv_cache_group_id=i,
-            kv_cache_spec=spec,
-            layer_names=[name],
-        )
-        for i, group in enumerate(groups)
-        for name, spec in group.kv_cache_spec.kv_cache_specs.items()
-    ]
-    views = _reshape_kv_cache_v2(attn_groups, raw, "auto", [64] * len(groups), {}, cache_config)
-    index_name = "model.layers.2.self_attn.indexer.k_cache"
-    key, scale = views[index_name]
-    assert key.dtype == torch.int8
-    assert scale.dtype == torch.float16
-    index_stride = next(t.block_stride for t in tensors if index_name in t.shared_by)
-    assert key.stride(0) == index_stride
-    assert scale.stride(0) * scale.element_size() == index_stride
-    assert key.untyped_storage().data_ptr() == scale.untyped_storage().data_ptr()
-
-
-def test_v41_pcp_requires_v2_and_keeps_eager_boundary(runtime, monkeypatch):
-    from vllm_ascend.core.deepseek_v41 import validate_cache_runtime
-
-    runtime.parallel_config.prefill_context_parallel_size = 2
-    monkeypatch.setattr("vllm_ascend.utils.enable_dsa_cp", lambda: False)
-    with pytest.raises(NotImplementedError, match="runner V2"):
-        validate_cache_runtime(runtime)
-    runtime.use_v2_model_runner = True
-    validate_cache_runtime(runtime)
-    runtime.model_config.enforce_eager = False
-    with pytest.raises(NotImplementedError, match="enforce_eager"):
-        validate_cache_runtime(runtime)
-
-
-def test_v41_pcp_ratio2_pairs_tokens_across_rank_segments(monkeypatch):
-    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41PCPImpl
-    from vllm_ascend.attention.dsa_v41 import (
-        DeepseekV41CompressorMetadata,
-        DeepseekV41IndexerMetadata,
-        DeepseekV41LayerMetadata,
-    )
-
-    hidden = torch.tensor([[0.0, 2.0], [6.0, 8.0]])
-    gathered = torch.tensor([[0.0, 2.0], [6.0, 8.0], [2.0, 4.0], [4.0, 6.0]])
-    group = SimpleNamespace(all_gather=lambda tensor, dim: gathered)
-    monkeypatch.setattr("vllm_ascend.attention.context_parallel.dsa_common.get_pcp_group", lambda: group)
-    monkeypatch.setattr(torch.ops._C_ascend, "inplace_partial_rotary_mul", lambda *args, **kwargs: None, raising=False)
-    monkeypatch.setattr(
-        "vllm_ascend.attention.dsa_v41.get_cos_and_sin_dsa",
-        lambda positions: (
-            {"layer.attn": torch.ones((len(positions), 1))},
-            {"layer.attn": torch.zeros((len(positions), 1))},
-        ),
-    )
-    impl = DeepseekV41PCPImpl("layer", SimpleNamespace(is_kv_source=True, compress_ratio=2), None, None, None)
-    state = SimpleNamespace(
-        slot_mapping=torch.arange(4),
-        c2_complete_mask=torch.tensor([False, True, False, True]),
-        c2_ring_metadata=torch.zeros((5, 1), dtype=torch.int32),
-        c2_metadata_group_id=0,
-        c2_source_cos=torch.ones((4, 1)),
-        c2_source_sin=torch.zeros((4, 1)),
-        c2_source_positions=None,
-    )
-    # Incomplete rows are redirected to the reserved null slot after the
-    # graph-safe scatter change. Live compressed rows must not use slot zero.
-    compressed = SimpleNamespace(slot_mapping=torch.tensor([[-1, -1], [0, 2], [-1, -1], [0, 3]]))
-    swa = SimpleNamespace(
-        positions=torch.arange(4),
-        slot_mapping=torch.tensor([[0, 0], [0, 1], [0, 2], [0, 3]]),
-        cos={"layer.attn": torch.ones((4, 1))},
-        sin={"layer.attn": torch.zeros((4, 1))},
-    )
-    metadata = DeepseekV41LayerMetadata(
-        compressed,
-        swa,
-        DeepseekV41CompressorMetadata(compressed, state),
-        DeepseekV41IndexerMetadata(compressed),
-    )
-    def scatter(cache, coordinates, values):
-        valid = (coordinates >= 0).all(dim=1)
-        cache[coordinates[valid, 0], coordinates[valid, 1], 0] = values[valid].reshape(-1, cache.shape[-1])
-
-    monkeypatch.setattr("vllm_ascend.attention.dsa_v41.scatter_cache_v2", scatter)
-    index_writes = []
-
-    def pool(kv, score, metadata):
-        # Adjacent global rows span the rank-local segments in this fixture.
-        torch.testing.assert_close(kv, gathered[torch.tensor([0, 2, 3, 1])])
-        latent = kv.clone()
-        latent[1::2] = (kv[0::2] + kv[1::2]) / 2
-        return latent
-
-    monkeypatch.setattr("vllm_ascend.attention.dsa_v41.wait_for_device_metadata", lambda *args: None)
-    attn = SimpleNamespace(
-        head_dim=2,
-        nope_head_dim=2,
-        rotary_emb=SimpleNamespace(layername="layer.attn"),
-        wkv=lambda tensor: tensor,
-        kv_norm=lambda tensor: tensor,
-        compressor=SimpleNamespace(
-            wkv=lambda tensor: tensor,
-            wgate=torch.zeros_like,
-            pool_projected=pool,
-            norm=lambda tensor: tensor,
-            state_cache=SimpleNamespace(kv_cache=[torch.zeros((1, 16, 1, 4))]),
-        ),
-        indexer=SimpleNamespace(update_keys=lambda latent, *args: index_writes.append(latent.clone())),
-        long_kv_cache=SimpleNamespace(kv_cache=[torch.zeros((1, 4, 1, 2))]),
-        dsa_attn=SimpleNamespace(swa_cache_layer=SimpleNamespace(kv_cache=[torch.zeros((1, 4, 1, 2))])),
-    )
-    monkeypatch.setattr(impl, "_global_layer_metadata", lambda _: metadata)
-    local_metadata = SimpleNamespace(
-        swa=SimpleNamespace(
-            hidden_restore_idx=torch.tensor([0, 2, 3, 1]),
-            num_actual_tokens=2,
-        )
-    )
-    local = impl._prepare_inputs_and_caches(attn, hidden, local_metadata, {})
-    expected = torch.tensor([[1.0, 3.0], [5.0, 7.0]])
-    torch.testing.assert_close(attn.long_kv_cache.kv_cache[0][0, 2:4, 0], expected)
-    assert len(index_writes) == 1
-    # The graph-safe path emits all rows; slot metadata masks incomplete pairs.
-    torch.testing.assert_close(index_writes[0][[1, 3]], expected)
-    torch.testing.assert_close(local, hidden)
-
-
 @pytest.mark.parametrize("pcp,cp", [(False, False), (True, False), (False, True), (True, True)])
 def test_v41_backend_routes_metadata_and_execution_together(monkeypatch, pcp, cp):
     from vllm_ascend.attention.context_parallel import dsa_v41_cp
@@ -1606,29 +1402,15 @@ def test_v41_backend_routes_metadata_and_execution_together(monkeypatch, pcp, cp
 
     monkeypatch.setattr(dsa_v41_cp, "enable_pcp", lambda: pcp)
     monkeypatch.setattr(dsa_v41_cp, "enable_dsa_cp", lambda: cp)
-    if pcp and cp:
-        with pytest.raises(ValueError, match="cannot be enabled"):
+    if pcp:
+        with pytest.raises(NotImplementedError, match="PCP is not supported"):
             DeepseekV41CacheBackend.get_builder_cls()
         return
     builder, impl = dsa_v41_cp.get_v41_cp_classes()
     assert DeepseekV41CacheBackend.get_builder_cls() is builder
-    assert DeepseekV41CacheBackend.supports_pcp()
-    if pcp:
-        assert issubclass(impl, dsa_v41_cp.DeepseekV41PCPImpl)
-    elif cp:
+    assert not DeepseekV41CacheBackend.supports_pcp()
+    if cp:
         assert issubclass(impl, dsa_v41_cp.DeepseekV41CPImpl)
-
-
-def test_v41_v2_binding_preserves_cache_plane_tuple(runtime):
-    from vllm_ascend.patch.worker.patch_bind_kv_cache import bind_kv_cache
-
-    name = "model.layers.2.self_attn.indexer.k_cache"
-    layer = DeepseekV41CacheLayer(runtime, name, collect_specs(runtime)[name])
-    cache = (torch.zeros((2, 32, 1, 4), dtype=torch.int8), torch.ones((2, 32, 1, 1), dtype=torch.float16))
-    runner_caches = []
-    bind_kv_cache({name: cache}, {name: layer}, runner_caches)
-    assert layer.kv_cache[0] is cache
-    assert runner_caches[0] is cache
 
 
 def test_dspark_caches_have_separate_contiguous_backing(runtime):
@@ -1693,3 +1475,13 @@ def test_v41_cp_resolves_own_planes_with_native_draft_metadata_present():
         "mtp.0.self_attn.swa_cache": SimpleNamespace(seq_lens=torch.tensor([4])),
     }
     assert impl._global_layer_metadata(metadata).swa is global_swa
+
+
+@pytest.mark.parametrize("v2,pcp", [(False, 2), (True, 1)])
+def test_v41_runtime_rejects_pcp_and_mrv2(runtime, v2, pcp):
+    from vllm_ascend.core.deepseek_v41 import validate_cache_runtime
+
+    runtime.use_v2_model_runner = v2
+    runtime.parallel_config.prefill_context_parallel_size = pcp
+    with pytest.raises(NotImplementedError, match="runner V1" if v2 else "PCP=1"):
+        validate_cache_runtime(runtime)

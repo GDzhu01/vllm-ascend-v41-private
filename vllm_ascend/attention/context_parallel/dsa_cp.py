@@ -14,11 +14,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.attention import dsa_v1
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.context_parallel.dsa_common import (
-    PCPMetadataMixin,
-    gather_and_restore_hidden_states,
-    restore_tp_heads,
-)
+from vllm_ascend.attention.context_parallel.dsa_common import restore_tp_heads
 from vllm_ascend.attention.dsa_attn_kv_plan import (
     get_dsa_attn_kv_plan,
     is_a5_bf16_kv_enabled,
@@ -2202,7 +2198,7 @@ class AscendDSAPCPMetadata(dsa_v1.AscendDSAMetadata):
         )
 
 
-class AscendDSAPCPMetadataBuilder(PCPMetadataMixin, dsa_v1.AscendDSAMetadataBuilder):
+class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
     """Build rank-local attention and canonical global cache metadata."""
 
     def __init__(
@@ -2348,6 +2344,52 @@ class AscendDSAPCPMetadataBuilder(PCPMetadataMixin, dsa_v1.AscendDSAMetadataBuil
             query_start_loc_cpu=query_start_loc_cpu,
         )
 
+    @staticmethod
+    def _build_global_common_attn_metadata(
+        pcp_context: "AscendPCPAttentionContext",
+        cache_group_idx: int,
+        local_common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> AscendCommonAttentionMetadata:
+        global_batch = pcp_context.global_batch
+        num_reqs = global_batch.num_reqs_after_padding
+        return AscendCommonAttentionMetadata(
+            query_start_loc=global_batch.query_start_loc,
+            query_start_loc_cpu=torch.from_numpy(global_batch.query_start_loc_np),
+            seq_lens=global_batch.seq_lens[:num_reqs],
+            seq_lens_cpu=torch.from_numpy(global_batch.seq_lens_np)[:num_reqs],
+            seq_lens_cpu_upper_bound=global_batch.seq_lens_cpu_upper_bound[:num_reqs],
+            num_computed_tokens_cpu=torch.from_numpy(global_batch.num_computed_tokens_np),
+            num_reqs=num_reqs,
+            num_actual_tokens=global_batch.num_tokens,
+            max_query_len=int(global_batch.num_scheduled_tokens.max()),
+            max_seq_len=local_common_attn_metadata.max_seq_len,
+            block_table_tensor=pcp_context.global_block_tables[cache_group_idx],
+            slot_mapping=pcp_context.global_slot_mappings[cache_group_idx],
+            causal=local_common_attn_metadata.causal,
+            dcp_local_seq_lens=global_batch.dcp_local_seq_lens,
+            positions=global_batch.positions,
+            attn_state=global_batch.attn_state,
+            num_input_tokens=global_batch.num_tokens_after_padding,
+            is_prefilling=torch.from_numpy(global_batch.is_prefilling_np),
+        )
+
+    def _build_local_common_attn_metadata(
+        self,
+        pcp_context: "AscendPCPAttentionContext",
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> AscendCommonAttentionMetadata:
+        num_local_padded_tokens = common_attn_metadata.num_input_tokens
+        gathered_slot_mapping = common_attn_metadata.slot_mapping
+        if pcp_context.global_batch.is_dummy:
+            gathered_slot_mapping.fill_(-1)
+        local_slot_mapping = gathered_slot_mapping.view(
+            self._pcp_world_size,
+            num_local_padded_tokens,
+        )[self._pcp_rank]
+        return common_attn_metadata.replace(
+            slot_mapping=local_slot_mapping,
+        )
+
     def _build_local_dsa_metadata(
         self,
         common_prefix_len: int,
@@ -2461,7 +2503,15 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
         metadata: AscendDSAPCPMetadata,
     ) -> torch.Tensor:
         """All-gather one padded rank slice and restore scheduler token order."""
-        return gather_and_restore_hidden_states(hidden_states, metadata.hidden_restore_idx, get_pcp_group())
+        gathered_hidden_states = get_pcp_group().all_gather(
+            hidden_states.contiguous(),
+            dim=0,
+        )
+        return torch.index_select(
+            gathered_hidden_states,
+            0,
+            metadata.hidden_restore_idx,
+        )
 
     def _update_global_swa_cache(
         self,

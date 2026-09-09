@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""V4.1 replicated-cache PCP and TP-token DSA CP adapters."""
+"""V4.1 replicated-cache TP-token DSA CP adapter."""
 
 from dataclasses import replace
 
 import torch
 
-from vllm.distributed import get_pcp_group, get_tp_group
+from vllm.distributed import get_tp_group
 
-from vllm_ascend.attention.context_parallel.dsa_common import (
-    PCPMetadataMixin,
-    gather_and_restore_hidden_states,
-    restore_tp_heads,
-)
+from vllm_ascend.attention.context_parallel.dsa_common import restore_tp_heads
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_v41 import DeepseekV41EagerAttentionImpl, DeepseekV41MetadataBuilder, _config_value
 from vllm_ascend.attention.utils import enable_pcp
@@ -20,13 +16,10 @@ from vllm_ascend.utils import enable_dsa_cp
 
 
 def get_v41_cp_classes():
-    use_cp, use_pcp = enable_dsa_cp(), enable_pcp()
-    if use_cp and use_pcp:
-        raise ValueError("Legacy DSACP and PCP cannot be enabled at the same time.")
-    if use_cp:
+    if enable_pcp():
+        raise NotImplementedError("V4.1 PCP is not supported")
+    if enable_dsa_cp():
         return DeepseekV41CPMetadataBuilder, DeepseekV41CPImpl
-    if use_pcp:
-        return DeepseekV41PCPMetadataBuilder, DeepseekV41PCPImpl
     return DeepseekV41MetadataBuilder, DeepseekV41EagerAttentionImpl
 
 
@@ -56,34 +49,6 @@ class _ReplicatedCacheMetadataBuilder(DeepseekV41MetadataBuilder):
             global_kwargs["common_v41_metadata"] = shared.setdefault("cp_global", {})
         return self._global_builder.build(
             common_prefix_len, common, fast_build, **global_kwargs
-        )
-
-
-class DeepseekV41PCPMetadataBuilder(PCPMetadataMixin, _ReplicatedCacheMetadataBuilder):
-    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
-        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
-        self._pcp_rank = get_pcp_group().rank_in_group
-
-    def build(
-        self,
-        common_prefix_len,
-        common_attn_metadata,
-        fast_build=False,
-        pcp_context=None,
-        pcp_cache_group_idx=None,
-        **kwargs,
-    ):
-        if pcp_context is None or pcp_cache_group_idx is None:
-            raise ValueError("V4.1 PCP requires the runner's canonical batch context")
-        global_common = self._build_global_common_attn_metadata(pcp_context, pcp_cache_group_idx, common_attn_metadata)
-        global_metadata = self._build_global_metadata(common_prefix_len, global_common, fast_build, kwargs)
-        local_common = self._build_local_common_attn_metadata(pcp_context, common_attn_metadata)
-        local_metadata = super().build(common_prefix_len, local_common, fast_build, **kwargs)
-        return replace(
-            local_metadata,
-            global_metadata=global_metadata,
-            hidden_restore_idx=pcp_context.hidden_restore_idx[: global_common.num_actual_tokens],
         )
 
 
@@ -145,9 +110,7 @@ class DeepseekV41CPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
         return replace(local, global_metadata=global_metadata, cp_token_range=(start, end, per_rank, padded))
 
 
-class DeepseekV41PCPImpl(DeepseekV41EagerAttentionImpl):
-    supports_pcp = True
-
+class DeepseekV41CPImpl(DeepseekV41EagerAttentionImpl):
     def _global_layer_metadata(self, metadata_by_prefix):
         global_by_prefix = {}
         # The runner also includes DSpark's native DSA metadata in this map.
@@ -166,14 +129,6 @@ class DeepseekV41PCPImpl(DeepseekV41EagerAttentionImpl):
             global_by_prefix[prefix] = metadata.global_metadata
         return self._get_layer_metadata(global_by_prefix)
 
-    def _prepare_inputs_and_caches(self, attn, hidden_states, metadata, metadata_by_prefix):
-        global_metadata = self._global_layer_metadata(metadata_by_prefix)
-        global_hidden = gather_and_restore_hidden_states(hidden_states, metadata.swa.hidden_restore_idx)
-        self._update_caches(attn, global_hidden, global_metadata)
-        return hidden_states[: metadata.swa.num_actual_tokens]
-
-
-class DeepseekV41CPImpl(DeepseekV41PCPImpl):
     def _prepare_inputs_and_caches(self, attn, hidden_states, metadata, metadata_by_prefix):
         global_metadata = self._global_layer_metadata(metadata_by_prefix)
         self._update_caches(attn, hidden_states[: global_metadata.swa.num_actual_tokens], global_metadata)

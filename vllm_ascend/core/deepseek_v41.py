@@ -311,8 +311,8 @@ def reshape_cache(raw: torch.Tensor, spec, *, num_blocks, offset, block_stride):
 
 
 def validate_cache_runtime(vllm_config):
-    if vllm_config.use_v2_model_runner and not vllm_config.model_config.enforce_eager:
-        raise NotImplementedError("V4.1 model runner V2 currently requires enforce_eager")
+    if vllm_config.use_v2_model_runner:
+        raise NotImplementedError("V4.1 cache initialization currently requires model runner V1")
     cudagraph_mode = getattr(
         vllm_config.compilation_config,
         "cudagraph_mode",
@@ -342,17 +342,10 @@ def validate_cache_runtime(vllm_config):
         for name in (
             "pipeline_parallel_size",
             "decode_context_parallel_size",
+            "prefill_context_parallel_size",
         )
     ):
-        raise NotImplementedError("V4.1 runtime requires PP=DCP=1")
-    pcp_size = getattr(parallel, "prefill_context_parallel_size", 1)
-    if pcp_size > 1:
-        if not vllm_config.use_v2_model_runner:
-            raise NotImplementedError("V4.1 PCP requires model runner V2")
-        from vllm_ascend.utils import enable_dsa_cp
-
-        if enable_dsa_cp():
-            raise ValueError("Legacy DSACP and PCP cannot be enabled at the same time.")
+        raise NotImplementedError("V4.1 runtime requires PP=DCP=PCP=1")
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         raise ValueError("V4.1 requires the hybrid KV cache manager")
     if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16"):

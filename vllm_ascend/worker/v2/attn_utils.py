@@ -45,13 +45,11 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
-from vllm_ascend.attention.dsa_v41 import DeepseekV41MetadataBuilder
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     get_sfa_qsfa_packed_head_dim,
     is_glm5_next_kpool_cache,
 )
-from vllm_ascend.core.deepseek_v41 import allocate_packed_cache, is_v41_spec, reshape_cache
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
@@ -295,10 +293,11 @@ def build_attn_metadata(
                     num_actual_reqs=num_actual_reqs,
                     common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
                 )
-            if pcp_context is not None and isinstance(
-                attn_metadata_builder, (AscendDSAMetadataBuilder, DeepseekV41MetadataBuilder)
-            ):
-                attn_metadata_extra_kwargs.update(pcp_context=pcp_context, pcp_cache_group_idx=i)
+                if pcp_context is not None:
+                    attn_metadata_extra_kwargs.update(
+                        pcp_context=pcp_context,
+                        pcp_cache_group_idx=i,
+                    )
 
             if for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
@@ -591,9 +590,6 @@ def _allocate_kv_cache(
     # prefill disaggregation need the addr of cache tensor be aligned with 2M
     alignment = 2 * 1024 * 1024
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
-    if any(is_v41_spec(spec) for spec in layer_kv_cache_spec.values()):
-        return allocate_packed_cache(kv_cache_config, layer_kv_cache_spec, device)
-
     has_mamba = any(isinstance(spec, MambaSpec) for spec in layer_kv_cache_spec.values())
     has_attention = any(isinstance(spec, AttentionSpec) for spec in layer_kv_cache_spec.values())
     use_hybrid_layout = has_mamba and has_attention
@@ -757,11 +753,6 @@ def _reshape_kv_cache_v2(
     is_dsv4_model = _is_dsv4_model(vllm_config)
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
     kv_caches: dict[str, Any] = {}
-    layer_packing = {
-        name: (allocation.offset, allocation.block_stride)
-        for allocation in kv_cache_config.kv_cache_tensors
-        for name in allocation.shared_by
-    }
 
     for group in attn_groups:
         if group.kv_cache_group_id >= len(kernel_block_sizes):
@@ -779,16 +770,6 @@ def _reshape_kv_cache_v2(
                 continue
 
             kv_cache_spec = layer_kv_cache_spec[layer_name]
-            if is_v41_spec(kv_cache_spec):
-                offset, stride = layer_packing[layer_name]
-                kv_caches[layer_name] = reshape_cache(
-                    kv_cache_raw_tensors[layer_name],
-                    kv_cache_spec,
-                    num_blocks=kv_cache_config.num_blocks,
-                    offset=offset,
-                    block_stride=stride,
-                )
-                continue
 
             if isinstance(group_spec, AscendSFAIndexerCacheSpec):
                 assert kv_cache_config is not None
