@@ -117,15 +117,14 @@ Triton entry point pools current-chunk rows plus prior ring residuals before
 updating the last 32 rows of the ring. State remains FP32, including values
 that BF16 would round away. The pooled output is BF16 and passes through the
 shared model RMSNorm. C1, C2 and indexer K normalization use
-`torch_npu.npu_rms_norm` on NPU with the checkpoint weight and epsilon. The CPU
-reference remains available for standalone checks; fused BF16 normalization
-can differ from its intermediate rounding. The standalone Triton compressor
-API retains its path.
+`torch_npu.npu_rms_norm` directly with the checkpoint weight and epsilon.
+Fused BF16 normalization can differ from the original intermediate rounding.
+The standalone Triton compressor API retains its path.
 
-The mHC reference projection and both Engram gate inputs use the same fused
-RMSNorm in FP32 without learned weights, following DSV4's weightless RMSNorm
-pattern. Unit gamma buffers are allocated with the model and excluded from
-the checkpoint. The production mHC pre path already uses `npu_hc_pre_v2`.
+The mHC reference projection and Engram gate call `torch_npu.npu_rms_norm`
+directly with FP32 unit gamma and use its inverse-RMS output, preserving the
+original projection and dot-product order. The production mHC pre path already
+uses `npu_hc_pre_v2`.
 
 Completed pairs occupy their completion-token output rows, matching existing
 long-KV/index slot mappings and source RoPE metadata. Per-source output buffers

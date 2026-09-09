@@ -28,6 +28,8 @@ from vllm_ascend.core.deepseek_v41 import (
 from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
 from vllm_ascend.models.deepseek_v41.model import build_layer_plan, build_v41_cache_specs
 
+pytestmark = pytest.mark.usefixtures("mock_npu_rms_norm")
+
 
 @pytest.fixture
 def config():

@@ -48,21 +48,13 @@ class DeepseekV41CompressorStateCache(DeepseekV41CacheLayer):
 
 
 class DeepseekV41RMSNorm(nn.Module):
-    def __init__(self, width, eps, *, has_weight=True, dtype=torch.bfloat16):
+    def __init__(self, width, eps):
         super().__init__()
-        if has_weight:
-            self.weight = nn.Parameter(torch.ones(width, dtype=dtype))
-        else:
-            # Like DSV4's RMSNorm(has_weight=False), supply a fixed unit gamma.
-            self.register_buffer("weight", torch.ones(width, dtype=dtype), persistent=False)
+        self.weight = nn.Parameter(torch.ones(width, dtype=torch.bfloat16))
         self.eps = eps
 
     def forward(self, x):
-        if x.device.type == "npu":
-            return torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
-        # Keep the CPU reference for standalone compressor/cache checks.
-        normalized = x.float() * torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + self.eps)
-        return normalized.to(x.dtype) * self.weight
+        return torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
 
 
 class DeepseekV41Compressor(nn.Module):

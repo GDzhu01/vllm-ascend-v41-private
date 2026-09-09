@@ -66,7 +66,9 @@ def test_projected_ring_matches_fp32_reference(length, start):
     torch.testing.assert_close(out.cpu(), expected, rtol=0.016, atol=1e-5)
     torch.testing.assert_close(state.cpu(), expected_state, rtol=0, atol=0)
     norm = DeepseekV41RMSNorm(512, 1e-6)
-    expected_norm = norm(expected)
+    expected_norm = (expected.float() * torch.rsqrt(expected.float().square().mean(-1, keepdim=True) + norm.eps)).to(
+        expected.dtype
+    ) * norm.weight
     torch.testing.assert_close(norm.npu()(out).cpu(), expected_norm, rtol=0.016, atol=1e-5)
 
 

@@ -4,7 +4,7 @@
 
 import pytest
 import torch
-import torch_npu  # noqa: F401
+import torch_npu
 
 from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41RMSNorm
 from vllm_ascend.models.deepseek_v41.engram_gate import engram_gate
@@ -23,6 +23,15 @@ def _reference(x, weight, eps):
     return normalized.to(x.dtype) * weight
 
 
+def _npu_norm(width, has_weight, dtype, eps):
+    if has_weight:
+        norm = DeepseekV41RMSNorm(width, eps).npu()
+        norm.weight.copy_(torch.randn_like(norm.weight))
+        return norm, norm.weight.cpu()
+    gamma = torch.ones(width, dtype=dtype, device="npu")
+    return lambda x: torch_npu.npu_rms_norm(x, gamma, epsilon=eps)[0], gamma.cpu()
+
+
 @pytest.mark.parametrize("width,has_weight,dtype", NORM_CASES)
 @pytest.mark.parametrize("tokens", [0, 1, 32, 4096])
 @pytest.mark.parametrize("eps", [1e-6, 1e-3])
@@ -31,14 +40,10 @@ def _reference(x, weight, eps):
 def test_rmsnorm_matches_reference(width, has_weight, dtype, tokens, eps, scale):
     torch.manual_seed(41)
     x = (torch.randn(tokens, width) * scale).to(dtype)
-    norm = DeepseekV41RMSNorm(width, eps, has_weight=has_weight, dtype=dtype)
-    if has_weight:
-        norm.weight.copy_(torch.randn(width))
-    else:
-        assert not dict(norm.named_parameters()) and not norm.state_dict()
-    expected = _reference(x, norm.weight, eps)
+    norm, weight = _npu_norm(width, has_weight, dtype, eps)
+    expected = _reference(x, weight, eps)
     x_npu = x.npu()
-    actual = norm.npu()(x_npu)
+    actual = norm(x_npu)
     assert actual.shape == x.shape and actual.dtype == x.dtype
     torch.testing.assert_close(x_npu.cpu(), x, rtol=0, atol=0)
     # The reference rounds the normalized value to BF16 before applying gamma.
@@ -50,11 +55,7 @@ def test_rmsnorm_matches_reference(width, has_weight, dtype, tokens, eps, scale)
 @torch.inference_mode()
 def test_rmsnorm_graph_replay_uses_new_input(width, has_weight, dtype):
     torch.manual_seed(42)
-    norm = DeepseekV41RMSNorm(width, 1e-6, has_weight=has_weight, dtype=dtype)
-    if has_weight:
-        norm.weight.copy_(torch.randn(width))
-    weight = norm.weight.clone()
-    norm = norm.npu()
+    norm, weight = _npu_norm(width, has_weight, dtype, 1e-6)
     x = torch.randn(32, width, dtype=dtype, device="npu")
     norm(x)
     torch.npu.synchronize()
@@ -68,7 +69,7 @@ def test_rmsnorm_graph_replay_uses_new_input(width, has_weight, dtype):
         graph.replay()
         torch.npu.synchronize()
         assert (x.data_ptr(), actual.data_ptr()) == pointers
-        expected = _reference(updated, weight, norm.eps)
+        expected = _reference(updated, weight, 1e-6)
         tolerance = dict(rtol=0.016, atol=1e-5) if dtype == torch.bfloat16 else dict(rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(actual.cpu(), expected, **tolerance)
 
@@ -81,7 +82,6 @@ def test_weightless_hc_mixes_matches_reference():
     torch.nn.Module.__init__(layer)
     layer.hc_mult, layer.hc_sinkhorn_iters = hc_mult, 3
     layer.norm_eps, layer.hc_eps = 1e-6, 1e-6
-    layer.hc_norm = DeepseekV41RMSNorm(width * hc_mult, layer.norm_eps, has_weight=False, dtype=torch.float32)
     x = torch.randn(32, hc_mult, width, dtype=torch.bfloat16)
     hc_fn = torch.randn(2 * hc_mult + hc_mult**2, width * hc_mult) / width
     scale, base = torch.randn(3), torch.randn(2 * hc_mult + hc_mult**2)
@@ -125,12 +125,11 @@ def test_weightless_engram_gate_matches_reference_and_replays(scale):
         gate = gate.masked_fill(~mask.unsqueeze(-1), 0)
         return (h.float() + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(h.dtype)
 
-    norm = DeepseekV41RMSNorm(width, eps, has_weight=False, dtype=torch.float32).npu()
     h_npu, k_npu = hidden.npu(), key.npu()
     v_npu, w_npu, rotation_npu, mask_npu = value.npu(), channel_weight.npu(), rotation.npu(), mask.npu()
 
     def run():
-        return engram_gate(h_npu, k_npu, v_npu, w_npu, rotation_npu, mask_npu, norm)
+        return engram_gate(h_npu, k_npu, v_npu, w_npu, rotation_npu, mask_npu, eps)
 
     torch.testing.assert_close(run().cpu(), reference(hidden, key), rtol=0.016, atol=1e-3)
     torch.npu.synchronize()
