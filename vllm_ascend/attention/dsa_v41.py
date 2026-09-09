@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek V4.1 DSA metadata and correctness-first eager execution.
+"""DeepSeek V4.1 DSA metadata and fused attention execution.
 
 The model file owns the network topology and projection modules.  This module
 owns the attention execution boundary: it gathers every cache plane's metadata
-before running the unfused compressor, indexer and sparse-attention reference
-path.  A future fused AscendC implementation can therefore replace the small
-operators here without moving cache or scheduler knowledge back into the model.
+before running the compressor, indexer and sparse-attention operators without
+moving cache or scheduler knowledge back into the model.
 """
 
 from dataclasses import dataclass
@@ -257,26 +256,6 @@ def _request_counts(common: Any, num_reqs: int):
     return num_decodes, num_decode_tokens, num_prefills, num_prefill_tokens
 
 
-def scatter_cache(cache: torch.Tensor, slots: torch.Tensor, values: torch.Tensor) -> None:
-    """Write rows without Tensor-driven Python control flow.
-
-    Invalid rows are redirected to the reserved null row.  V4.1 reserves page
-    zero precisely so padded and incomplete graph rows cannot touch live KV.
-    """
-    cache = cache.squeeze(-2)
-    slots = slots[: values.shape[0]].long()
-    valid = slots >= 0
-    physical = slots.clamp_min(0)
-    pages = torch.div(physical, cache.shape[1], rounding_mode="floor")
-    rows = physical.remainder(cache.shape[1])
-    write_values = torch.where(
-        valid.view((-1,) + (1,) * (values.ndim - 1)),
-        values,
-        torch.zeros_like(values),
-    )
-    cache[pages, rows] = write_values.to(cache.dtype)
-
-
 def scatter_cache_v2(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -299,59 +278,6 @@ def scatter_cache_v2(
     torch.ops._C_ascend.npu_scatter_nd_update_v2(cache, indices, updates)
 
 
-def gather_cache_rows(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
-    """Read physical rows without flattening a block-strided packed view."""
-    cache = cache.squeeze(-2)
-    slots = slots.long()
-    pages = torch.div(slots, cache.shape[1], rounding_mode="floor")
-    rows = slots.remainder(cache.shape[1])
-    return cache[pages, rows]
-
-
-def paged_prefix(cache, block_table, length, block_size):
-    """Materialize one request's logical prefix from a paged cache."""
-    if length <= 0:
-        return cache.new_empty((0, cache.shape[-1]))
-    blocks = (length + block_size - 1) // block_size
-    page_ids = block_table[:blocks].long()
-    return cache.squeeze(-2).index_select(0, page_ids).flatten(0, 1)[:length]
-
-
-def select_candidate_blocks(logits, compress_lens, topk_blocks, block_size):
-    """Return the level-one candidate-position mask used by V4.1.
-
-    A block is scored by its best position.  The newest, partially populated
-    block is pinned so recent compressed tokens cannot be dropped merely
-    because their block has fewer populated positions.
-    """
-    width = logits.shape[-1]
-    if width == 0:
-        return torch.zeros_like(logits, dtype=torch.bool)
-    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
-    scores = scores.unflatten(-1, (-1, block_size)).amax(-1)
-    num_blocks = scores.shape[-1]
-    if not torch.is_tensor(compress_lens):
-        compress_lens = torch.tensor(compress_lens, device=logits.device)
-    last = (compress_lens - 1) // block_size
-    scores = scores.masked_fill(
-        torch.arange(num_blocks, device=logits.device) == last,
-        torch.inf,
-    )
-    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top.indices, top.values > -torch.inf)
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
-
-
-def select_index_topk(logits, compress_lens, index_topk):
-    """Level-two position TopK, sorted back into chronological order."""
-    width = logits.shape[-1]
-    if width == 0:
-        return torch.empty((*logits.shape[:-1], 0), dtype=torch.int32, device=logits.device)
-    topk = min(index_topk, width)
-    indices = logits.topk(topk, dim=-1, sorted=False).indices.sort(-1).values
-    return torch.where(indices < compress_lens, indices, -1).int()
-
-
 def pad_sparse_indices(indices: torch.Tensor, topk: int) -> torch.Tensor:
     """Convert V4.1's compact [T, K] selection into SMLA [T, 1, topk]."""
     if indices.ndim != 2:
@@ -363,73 +289,8 @@ def pad_sparse_indices(indices: torch.Tensor, topk: int) -> torch.Tensor:
     return indices.unsqueeze(1).contiguous().int()
 
 
-def small_op_attention(
-    q,
-    positions,
-    swa_cache,
-    swa_metadata,
-    *,
-    source_cache=None,
-    source_metadata=None,
-    compress_ratio=0,
-    window_size=128,
-    index_topk=512,
-    compressed_indices=None,
-    sinks=None,
-    softmax_scale=1.0,
-):
-    """Unfused eager sparse attention over SWA plus a shared compressed KV.
-
-    ``compressed_indices`` contains the real Indexer result in compressed-KV
-    coordinates.  When absent, the bounded newest-row selection remains as a
-    diagnostic fallback for local-only tests.
-    """
-    query_starts = swa_metadata.query_start_loc.tolist()
-    seq_lens = swa_metadata.seq_lens.tolist()
-    outputs = []
-    for req_idx, (q_start, q_end) in enumerate(zip(query_starts[:-1], query_starts[1:])):
-        seq_len = int(seq_lens[req_idx])
-        local = paged_prefix(
-            swa_cache,
-            swa_metadata.block_table[req_idx],
-            seq_len,
-            swa_metadata.storage_block_size,
-        )
-        compressed = None
-        if source_cache is not None:
-            compressed_len = int(source_metadata.cache_seq_lens[req_idx])
-            compressed = paged_prefix(
-                source_cache,
-                source_metadata.block_table[req_idx],
-                compressed_len,
-                source_metadata.storage_block_size,
-            )
-        for token_idx in range(q_start, q_end):
-            position = int(positions[token_idx])
-            local_start = max(0, position - window_size + 1)
-            keys = local[local_start : position + 1]
-            if compressed is not None:
-                visible = (position + 1) // compress_ratio
-                if compressed_indices is None:
-                    selected = compressed[max(0, visible - index_topk) : visible]
-                else:
-                    indices = compressed_indices[token_idx].long()
-                    indices = indices[(indices >= 0) & (indices < visible)]
-                    selected = compressed.index_select(0, indices)
-                keys = torch.cat((keys, selected))
-            logits = torch.einsum("hd,kd->hk", q[token_idx].float(), keys.float())
-            logits *= softmax_scale
-            if sinks is not None:
-                logits = torch.cat((logits, sinks.float().unsqueeze(-1)), -1)
-                probs = logits.softmax(-1)[..., :-1]
-            else:
-                probs = logits.softmax(-1)
-            outputs.append(torch.einsum("hk,kd->hd", probs, keys.float()))
-    return torch.stack(outputs).to(q.dtype)
-
-
 class DeepseekV41EagerAttentionImpl:
-    """V4-shaped execution boundary backed by correctness-first small ops.
+    """V4-shaped execution boundary backed by fused Ascend operators.
 
     Projection, compressor and indexer modules remain registered by the model,
     while this object resolves the complete per-layer metadata bundle and owns
@@ -509,7 +370,7 @@ class DeepseekV41EagerAttentionImpl:
         indexer_metadata = metadata.indexer
         ratio = self.role.compress_ratio
         if ratio == 1:
-            latent = compressor(hidden_states, 0)
+            latent = compressor(hidden_states)
             completed = torch.ones_like(positions, dtype=torch.bool)
             # C1 source positions are the current token positions. Reuse the
             # query RoPE selected by the SWA metadata builder instead of
@@ -596,33 +457,16 @@ class DeepseekV41EagerAttentionImpl:
             shared.candidates[: candidates.shape[0]].copy_(candidates)
         return shared.topk_indices[: selected.shape[0]]
 
-    def _attention(self, attn, q, positions, metadata, compressed_indices):
+    def _attention(self, attn, q, metadata, compressed_indices):
         source_cache = None
         if self.role.has_long_context:
             source_cache = get_forward_context().no_compile_layers[self.long_kv_source_prefix].kv_cache[0]
-        # A2/A3 SparseFlashMla uses ratio 0 for SWA-only and supports the
-        # ratio-1/ratio-2 compressed sparse paths used by this topology.
-        if self.role.compress_ratio in (0, 1, 2):
-            return self._native_attention(
-                attn,
-                q,
-                metadata,
-                source_cache=source_cache,
-                compressed_indices=compressed_indices,
-            )
-        return small_op_attention(
+        return self._native_attention(
+            attn,
             q,
-            positions,
-            attn.dsa_attn.swa_cache_layer.kv_cache[0],
-            metadata.swa,
+            metadata,
             source_cache=source_cache,
-            source_metadata=metadata.attention,
-            compress_ratio=self.role.compress_ratio,
-            window_size=attn.window_size,
-            index_topk=self.topology.index_topk,
             compressed_indices=compressed_indices,
-            sinks=attn.attn_sink,
-            softmax_scale=attn.softmax_scale,
         )
 
     def _native_attention(
@@ -728,7 +572,7 @@ class DeepseekV41EagerAttentionImpl:
                 metadata,
             )
         compressed_indices = self._select_sparse_indices(attn, hidden_states, qr, positions, cos, sin, metadata)
-        output = self._attention(attn, q, positions, metadata, compressed_indices)
+        output = self._attention(attn, q, metadata, compressed_indices)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             output.unsqueeze(1),
             cos,

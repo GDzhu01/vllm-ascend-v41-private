@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from tests.deepseek_v41_reference import build_v41_cache_specs
 from vllm_ascend.core.deepseek_v41 import (
     allocate_cache_config,
     cache_slots_from_groups,
@@ -15,7 +16,6 @@ from vllm_ascend.core.deepseek_v41 import (
     pool_bytes_per_block,
     reshape_cache,
 )
-from vllm_ascend.models.deepseek_v41.model import build_v41_cache_specs
 
 
 def make_cache_config(num_blocks, *, block_size=128, head_size=512, index_size=128):

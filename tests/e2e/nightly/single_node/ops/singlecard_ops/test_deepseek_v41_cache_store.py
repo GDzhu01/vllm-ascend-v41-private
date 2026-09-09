@@ -7,7 +7,8 @@ import torch
 import torch_npu  # noqa: F401
 
 from tests.deepseek_v41_cache_utils import allocate_cache_views, make_cache_config
-from vllm_ascend.attention.dsa_v41 import scatter_cache, scatter_cache_v2
+from tests.deepseek_v41_reference import scatter_cache
+from vllm_ascend.attention.dsa_v41 import scatter_cache_v2
 from vllm_ascend.utils import enable_custom_op
 
 enable_custom_op()

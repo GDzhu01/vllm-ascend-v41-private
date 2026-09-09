@@ -11,17 +11,21 @@ from vllm.v1.core import kv_cache_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from tests.deepseek_v41_cache_utils import allocate_cache_views
+from tests.deepseek_v41_reference import (
+    build_v41_cache_specs,
+    compressor_ratio2_reference,
+    gather_cache_rows,
+    scatter_cache,
+    select_candidate_blocks,
+    select_index_topk,
+)
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
     DeepseekV41EagerAttentionImpl,
     DeepseekV41MetadataBuilder,
     compressed_slot_mapping,
-    gather_cache_rows,
     pad_sparse_indices,
-    scatter_cache,
     scatter_cache_v2,
-    select_candidate_blocks,
-    select_index_topk,
 )
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41FullSpec,
@@ -37,7 +41,7 @@ from vllm_ascend.core.deepseek_v41 import (
     reshape_cache,
 )
 from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
-from vllm_ascend.models.deepseek_v41.model import build_layer_plan, build_v41_cache_specs
+from vllm_ascend.models.deepseek_v41.model import build_layer_plan
 
 
 @pytest.fixture
@@ -457,7 +461,6 @@ def test_supported_ratios_route_to_native_sparse_flash_mla(monkeypatch, compress
     actual = impl._attention(
         SimpleNamespace(),
         object(),
-        object(),
         SimpleNamespace(swa=object(), attention=object()),
         object() if compress_ratio else None,
     )
@@ -712,7 +715,11 @@ def test_compressor_chunk_boundary_matches_vector_reference(config, chunks):
     actual = []
     start = 0
     for size in chunks:
-        actual.append(compressor(x[start : start + size], start, state, block_table))
+        actual.append(
+            compressor_ratio2_reference(
+                compressor, x[start : start + size], start, state, block_table
+            )
+        )
         start += size
     torch.testing.assert_close(torch.cat(actual), expected)
     torch.testing.assert_close(state[4, 6, :8], compressor.wkv(x[-1:].float())[0])
@@ -839,7 +846,13 @@ def test_compressor_rejects_missing_previous_state_page(config):
     compressor = DeepseekV41Compressor(config, 2)
     state = torch.full((3, 32, 16), float("nan"), dtype=torch.float32)
     with pytest.raises(ValueError, match="absent/null"):
-        compressor(torch.zeros(1, 16, dtype=torch.bfloat16), 1, state, [0])
+        compressor_ratio2_reference(
+            compressor,
+            torch.zeros(1, 16, dtype=torch.bfloat16),
+            1,
+            state,
+            [0],
+        )
 
 
 @torch.inference_mode()
@@ -847,9 +860,9 @@ def test_state_page_reuse_does_not_require_request_reset(config):
     compressor = DeepseekV41Compressor(config, 2)
     state = torch.full((3, 32, 16), float("nan"), dtype=torch.float32)
     x = torch.randn(2, 16, dtype=torch.bfloat16)
-    expected = compressor(x, 0, state, [1]).clone()
+    expected = compressor_ratio2_reference(compressor, x, 0, state, [1]).clone()
     state[1].fill_(12345)
-    actual = compressor(x, 0, state, [1])
+    actual = compressor_ratio2_reference(compressor, x, 0, state, [1])
     torch.testing.assert_close(actual, expected)
 
 
@@ -876,10 +889,10 @@ def test_interleaved_request_state_isolation(config):
     state = torch.full((3, 32, 16), float("nan"), dtype=torch.float32)
     first = torch.randn(2, 16, dtype=torch.bfloat16)
     second = torch.randn(2, 16, dtype=torch.bfloat16)
-    compressor(first[:1], 0, state, [1])
+    compressor_ratio2_reference(compressor, first[:1], 0, state, [1])
     saved = state[1, 0].clone()
-    compressor(second, 0, state, [2])
+    compressor_ratio2_reference(compressor, second, 0, state, [2])
     torch.testing.assert_close(state[1, 0], saved)
-    actual = compressor(first[1:], 1, state, [1])
-    expected = compressor(first, 0, state, [1])
+    actual = compressor_ratio2_reference(compressor, first[1:], 1, state, [1])
+    expected = compressor_ratio2_reference(compressor, first, 0, state, [1])
     torch.testing.assert_close(actual, expected)
