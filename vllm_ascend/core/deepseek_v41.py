@@ -81,6 +81,103 @@ def _uniform(members, label):
     return uniform
 
 
+@dataclass(frozen=True)
+class CachePlacement:
+    name: str
+    offset: int
+    page_size_bytes: int
+
+
+@dataclass(frozen=True)
+class CacheSlot:
+    page_size_bytes: int
+    placements: tuple[CachePlacement, ...]
+
+
+def _layer_number(name):
+    try:
+        return int(name.rsplit(".layers.", 1)[1].split(".", 1)[0])
+    except (IndexError, ValueError) as exc:
+        raise ValueError(f"Invalid V4.1 cache resource name: {name}") from exc
+
+
+def _cache_plane_sizes(spec):
+    rows = spec.storage_block_size * spec.num_kv_heads
+    key_bytes = rows * spec.head_size * spec.dtype.itemsize
+    if isinstance(spec, DeepseekV41IndexerSpec):
+        return key_bytes, rows * spec.scale_dim * spec.scale_dtype.itemsize
+    return (key_bytes,)
+
+
+def plan_cache_slots(specs):
+    """Place source KV/index tuples, state and SWA in four shared layer slots.
+
+    Sizes come from payloads, never previously padded specs. Different groups
+    overlay a slot at distinct live block IDs; a source's KV and index share
+    the same ID at disjoint offsets within its page.
+    """
+    target_specs = {name: spec for name, spec in specs.items() if is_v41_spec(spec)}
+    draft_specs = {name: spec for name, spec in specs.items() if not is_v41_spec(spec)}
+    if not target_specs:
+        raise ValueError("V4.1 cache planning requires target cache resources")
+    invalid_draft_names = [
+        name
+        for name, spec in draft_specs.items()
+        if not isinstance(spec, AscendSlidingWindowMLASpec)
+    ]
+    if invalid_draft_names:
+        raise ValueError(
+            "V4.1 mixed cache supports only dSPark SWA draft resources; "
+            f"unsupported resources: {', '.join(sorted(invalid_draft_names))}"
+        )
+    full = sorted((n for n, s in target_specs.items() if isinstance(s, DeepseekV41FullSpec)), key=_layer_number)
+    state = sorted((n for n, s in target_specs.items() if isinstance(s, DeepseekV41CompressorStateSpec)), key=_layer_number)
+    swa = sorted((n for n, s in target_specs.items() if isinstance(s, DeepseekV41SWASpec)), key=_layer_number)
+    if list(map(_layer_number, full)) != [2, 8, 14, 20]:
+        raise ValueError("V4.1 requires KV source layers 2, 8, 14, 20")
+    if list(map(_layer_number, state)) != [2, 8, 14]:
+        raise ValueError("V4.1 requires state source layers 2, 8, 14")
+    if list(map(_layer_number, swa)) != list(range(40)):
+        raise ValueError("V4.1 requires exactly 40 ordered SWA resources")
+
+    slots = []
+    for slot_idx, kv_name in enumerate(full):
+        prefix, suffix = kv_name.rsplit(".", 1)
+        index_name = prefix + ".indexer.k_cache"
+        index_spec = target_specs.get(index_name)
+        kv_spec = target_specs[kv_name]
+        ratio = 2 if slot_idx < len(state) else 1
+        if (
+            suffix != "long_kv_cache"
+            or not isinstance(index_spec, DeepseekV41IndexerSpec)
+            or kv_spec.compress_ratio != ratio
+            or index_spec.compress_ratio != ratio
+            or kv_spec.block_size != index_spec.block_size
+        ):
+            raise ValueError(f"V4.1 source {prefix} has incompatible KV/index specs")
+        aliases = ([state[slot_idx]] if slot_idx < len(state) else []) + swa[slot_idx :: len(full)]
+        kv_bytes = sum(_cache_plane_sizes(kv_spec))
+        index_bytes = sum(_cache_plane_sizes(index_spec))
+        capacity = max(kv_bytes + index_bytes, *(sum(_cache_plane_sizes(target_specs[n])) for n in aliases))
+        placements = [
+            CachePlacement(kv_name, 0, kv_bytes),
+            CachePlacement(index_name, kv_bytes, capacity - kv_bytes),
+            *(CachePlacement(name, 0, capacity) for name in aliases),
+        ]
+        slots.append(CacheSlot(capacity, tuple(placements)))
+    # Draft layers consume the same global scheduler block id concurrently, so
+    # they must not alias one another or the target's layer-outermost slots.
+    for name, spec in sorted(draft_specs.items()):
+        page_size = spec.page_size_bytes
+        slots.append(
+            CacheSlot(page_size, (CachePlacement(name, 0, page_size),))
+        )
+    names = [p.name for slot in slots for p in slot.placements]
+    if len(names) != len(set(names)) or set(names) != set(specs):
+        raise ValueError("V4.1 slot placement must cover each resource exactly once")
+    return tuple(slots)
+
+
 def group_cache_specs(specs):
     """Build the fixed V4.1 ownership graph used by the hybrid manager."""
     if not any(is_v41_spec(s) for s in specs.values()):
@@ -255,7 +352,8 @@ def validate_cache_runtime(vllm_config):
     if vllm_config.cache_config.enable_prefix_caching:
         raise NotImplementedError("V4.1 prefix state restoration is not implemented")
     speculative = vllm_config.speculative_config
-    if speculative is not None and not speculative.use_dspark():
+    use_dspark = getattr(speculative, "use_dspark", None)
+    if speculative is not None and (not callable(use_dspark) or not use_dspark()):
         raise NotImplementedError("V4.1 currently supports only dSPark speculative decoding")
     if vllm_config.kv_transfer_config is not None:
         raise NotImplementedError("V4.1 KV transfer is not implemented")

@@ -78,8 +78,9 @@ def _normalize_deepseek_v4_dspark_draft(draft_model_config) -> None:
         model_type=hf_config.model_type,
         is_mm_prefix_lm=False,
     )
+    architectures = draft_model_config.model_arch_config.architectures
     model_info, architecture = draft_model_config.registry.inspect_model_cls(
-        draft_model_config.architectures,
+        architectures,
         draft_model_config,
     )
     draft_model_config._model_info = model_info
