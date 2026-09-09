@@ -12,6 +12,7 @@ from vllm_ascend.attention.dsa_v41 import (
     scatter_cache_v2,
 )
 from vllm_ascend.core.deepseek_v41 import DeepseekV41IndexerSpec
+from vllm_ascend.ops.triton.prepare_indexer_indices import prepare_indexer_indices
 from vllm_ascend.ops.triton.quantize_indexer_query import quantize_indexer_query
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
@@ -239,12 +240,5 @@ class DeepseekV41Indexer(nn.Module):
             candidate_block_size=candidate_block_size,
             **common,
         )
-        selected = selected.squeeze(1)
-        visible = ((positions + 1) // self.compress_ratio).unsqueeze(-1)
-        valid = (selected >= 0) & (selected < visible)
-        # Native TopK is score-ordered. Attention consumes chronological positions
-        # with invalid slots at the end, as in the previous small-op path.
-        sentinel = torch.iinfo(torch.int32).max
-        selected = torch.where(valid, selected, sentinel).sort(dim=-1).values
-        selected = torch.where(selected == sentinel, -1, selected)
+        selected = prepare_indexer_indices(selected.squeeze(1), positions, self.compress_ratio)
         return selected, candidate_out if is_candidate_source else candidates
