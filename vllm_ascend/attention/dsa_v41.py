@@ -826,7 +826,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                     else:
                         valid_end = common.query_start_loc[num_actual_reqs].clamp_max(num_actual_tokens)
                         valid &= torch.arange(num_input_tokens, device=active_slots.device) < valid_end
-                        if getattr(common, "positions", None) is not None:
+                        if common.positions is not None:
                             valid &= common.positions[:num_input_tokens].remainder(2) == 1
                 physical = active_slots.clamp_min(0)
                 self._slot_mapping_2d[:num_input_tokens, 0].copy_(

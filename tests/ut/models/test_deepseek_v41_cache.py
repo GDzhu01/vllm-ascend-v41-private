@@ -685,6 +685,7 @@ def test_slot_mapping_is_shared_per_compatible_cache_group(config, runtime):
     specs = collect_specs(runtime)
     common = SimpleNamespace(
         slot_mapping=torch.tensor([1, 2, 65, -1]),
+        positions=None,
         block_table_tensor=torch.tensor([[5, 7]]),
         query_start_loc=torch.tensor([0, 4]),
         query_start_loc_cpu=torch.tensor([0, 4]),
@@ -744,6 +745,7 @@ def test_compressed_metadata_exposes_original_and_cache_coordinates(config, runt
     # with an incomplete pair. Only completed pairs become cache rows.
     common = SimpleNamespace(
         slot_mapping=torch.tensor([1, 2, 3, 65, 66]),
+        positions=torch.tensor([1, 2, 3, 1, 2]),
         block_table_tensor=torch.tensor([[5, 7], [9, 0]]),
         query_start_loc=torch.tensor([0, 3, 5]),
         query_start_loc_cpu=torch.tensor([0, 3, 5]),
@@ -788,6 +790,7 @@ def test_merged_metadata_preserves_nonconsecutive_block_ids(runtime, end):
     original_slots = table[0, positions // 128] * 128 + positions % 128
     common = SimpleNamespace(
         slot_mapping=original_slots,
+        positions=positions,
         block_table_tensor=table,
         query_start_loc=torch.tensor([0, 3]),
         query_start_loc_cpu=torch.tensor([0, 3]),
