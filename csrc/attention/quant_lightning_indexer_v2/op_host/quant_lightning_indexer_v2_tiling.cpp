@@ -332,8 +332,11 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
     std::string layout_query(opParamInfo_.layOutQuery);
 
     if (npuArch_ == NpuArch::DAV_2201) {
-        OP_CHECK_IF(layout_query != "TND" || layout_key != "PA_BBND",
-                    OP_LOGE(opName_, "A2/A3 Aurora QLI only compiles TND Q with PA_BBND K."),
+        OP_CHECK_IF((std::string(opParamInfo_.layOutKey) != "PA_BBND"),
+                    OP_LOGE(opName_,
+                            "input attr layout_key only supported PA_BBND,"
+                            "but now layout_key is %s.",
+                            layout_key.c_str()),
                     return ge::GRAPH_FAILED);
     } else if (npuArch_ == NpuArch::DAV_3510) {
         OP_CHECK_IF(
@@ -1006,7 +1009,10 @@ ge::graphStatus QLIV2InfoParser::GetS1Size()
     if (qLayout_ == DataLayout::BSND) {
         s1Size_ = opParamInfo_.query.shape->GetStorageShape().GetDim(1);
     } else if (qLayout_ == DataLayout::TND) {
-        // A12: TND 的 q 为 [T, G, D] 拼接, s1Size = 总行数 T (各 batch 行数经 cu_seqlens_q 切分)
+        // A12: TND 的 q 为 [T, G, D] 拼接, s1Size = 总行数 T。
+        // 注意: TND 主路径的批前缀/行数均由 kernel 从 cu_seqlens_q(GM) 逐批读取, 不消费 s1Size;
+        // tiling 阶段禁止读 tensor 数据 (gert::Tensor data 未就绪, 读取直接段错误);
+        // consumer shape 校验式已用 TND 专分支 (query.shape[0] x N2 x candBlocks), 与 s1Size 解耦
         s1Size_ = opParamInfo_.query.shape->GetStorageShape().GetDim(0);
     }
     return ge::GRAPH_SUCCESS;
@@ -1709,18 +1715,21 @@ ge::graphStatus QuantLightningIndexerV2Tiling::DoTiling(QLIV2TilingInfo *tilingI
     workSpaces[0] = workspaceSize;
 
     // -------------set tilingdata-----------------
-    // Candidate input: BSND [B, S1, N2, blocks], TND [T, N2, blocks].
+    // candidate (two-level topk) 输入校验: mode=2 时 candidate_topk_index 必须为 [B, S1, N2, candBlocks] int32
     if (tilingInfo->candidateMode == CANDIDATE_MODE_CONSUMER) {
         OP_CHECK_IF(tilingInfo->opParamInfo.candidateTopkIndex.desc == nullptr ||
                         tilingInfo->opParamInfo.candidateTopkIndex.desc->GetDataType() != ge::DT_INT32,
                     OP_LOGE("QuantLightningIndexerV2", "candidate_topk_index dtype only supports int32."),
                     return ge::GRAPH_FAILED);
-        // TND s1Size already contains the total rows across every request.
-        int64_t queryRows = tilingInfo->s1Size;
-        if (tilingInfo->inputQLayout == DataLayout::BSND) {
-            queryRows *= tilingInfo->bSize;
+        int64_t expectSize = 0;
+        if (tilingInfo->inputQLayout == DataLayout::TND) {
+            // A12 修正: TND 输出布局为 [T, N2, K], T = query.shape[0], 非 B x s1Size (会双重计数)
+            expectSize = tilingInfo->opParamInfo.query.shape->GetStorageShape().GetDim(0) *
+                         tilingInfo->n2Size * tilingInfo->candidateTopkBlocks;
+        } else {
+            expectSize = static_cast<int64_t>(tilingInfo->bSize) * tilingInfo->s1Size * tilingInfo->n2Size *
+                         tilingInfo->candidateTopkBlocks;
         }
-        int64_t expectSize = queryRows * tilingInfo->n2Size * tilingInfo->candidateTopkBlocks;
         int64_t actualSize = tilingInfo->opParamInfo.candidateTopkIndex.tensor->GetShapeSize();
         OP_CHECK_IF(actualSize != expectSize,
                     OP_LOGE("QuantLightningIndexerV2",

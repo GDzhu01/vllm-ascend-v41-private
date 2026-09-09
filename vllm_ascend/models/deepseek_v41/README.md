@@ -32,12 +32,13 @@ Within the merged group, KV and index share an ID at disjoint byte offsets.
 | Group | Resources | Logical block size | Slots |
 | --- | --- | --- | --- |
 | G0 | C2 KV/index at layers 2, 8, 14; C1 KV/index at layer 20 | 128 | 0-3 |
-| G1 | FP32 compressor state at layers 2, 8, 14, window 2 | 16 | 0-2; slot 3 unused |
+| G1 | FP32 circular compressor state at layers 2, 8, 14 | 32 | 0-2; slot 3 unused |
 | G2-G11 | SWA layers 0-39, four consecutive layers per group, window 128 | 128 | 0-3 |
 
 There are 12 groups and 51 cache specs. The base attention block size is
 128 at production dimensions. C2 stores 64 compressed rows per logical block;
-C1 and SWA store 128 rows. State stores 16 uncompressed rows with width 1024.
+C1 and SWA store 128 rows. State stores 32 uncompressed FP32 rows with width
+1024 in one private ring page per request.
 C2 and C1 share the original-token block table, with compression applied by
 per-layer metadata builders. No paired-block mapping is needed.
 
@@ -52,7 +53,7 @@ C2 KV has 65536 payload bytes. Its index spec is padded from 8320 to 65536
 bytes, placing 57216 unused bytes after the scales. SWA/state occupy offset
 zero and are padded to their assigned slot capacity. Thirty SWA layers have
 no padding; the ten layers in slot 3 have 16640 padding bytes per page. Each
-state spec has 65536 payload bytes and is padded to 131072; G1 leaves slot 3
+state spec uses all 131072 bytes as 32 ring rows; G1 leaves slot 3
 reserved but unused. Padding is applied to cloned specs and is idempotent.
 
 With `N` global IDs (including the reserved null ID), the raw uint8 buffers
@@ -63,8 +64,9 @@ maximum-length sizing and concurrency use their sum: **540928 bytes =
 Typed zero-copy views retain the slot's physical page stride, not the
 component's page size. C2 KV is `[N,64,1,512]` BF16; index K/scales are
 `[N,64,1,128]` INT8 and `[N,64,1,1]` FP16. C1 uses the same widths with 128
-rows. SWA is `[N,128,1,512]` BF16; state is `[N,16,1,1024]` FP32. Components
-need not be contiguous; no whole-context gather is introduced by allocation.
+rows. SWA is `[N,128,1,512]` BF16; state is `[N,32,1,1024]` FP32. Components
+other than state need not be contiguous. State must fill its slot contiguously;
+no whole-context gather is introduced by allocation.
 
 ### Earlier design comparisons
 
@@ -99,6 +101,37 @@ numerically unverified. Full accuracy still requires HBM-sharded Engram at
 layers 1 and 14 and reference FP8/FP4 rounding. These omissions must not be
 interpreted as full model accuracy.
 
+## Circular compressor integration
+
+The v0.27.1 compatibility layer registers a circular spec and manager inside
+vLLM-Ascend. G1 owns one global ID per request, retained until finish or
+preemption. Its block table has one column; ordinary position-to-page slot
+mapping is disabled. C2 uses the original global ID and `position % 32`.
+The ring's 128-KiB contiguous page matches the shared-slot stride without
+block-ID expansion or copying the cache. Full C1/C2 and SWA groups keep their
+existing address calculations. Thirty SWA layers remain unpadded and ten
+retain 16.25 KiB padding per page.
+
+C2 retains the existing FP32 projection weights and computation. The projected
+Triton entry point pools current-chunk rows plus prior ring residuals before
+updating the last 32 rows of the ring. State remains FP32, including values
+that BF16 would round away. The pooled output is BF16 and passes through the
+existing model RMSNorm, preserving its epsilon and rounding order. C1 and the
+standalone Triton compressor API retain their paths.
+
+Completed pairs occupy their completion-token output rows, matching existing
+long-KV/index slot mappings and source RoPE metadata. Per-source output buffers
+are allocated before memory profiling. Device metadata uses persistent builder
+buffers for graph replay; inactive requests have zero lengths and IDs. Dummy
+capture requests receive distinct non-null ring IDs; idle DP synchronization
+runs skip ring state updates. Model runner V1 supports eager prefill and
+`FULL_DECODE_ONLY` dispatch, with runtime correctness still unverified.
+
+G1 admission now reserves one ID regardless of sequence length. Slot capacity
+and proportional rank shrinking are unchanged: total backing bytes remain
+`N * 540928`. Prefix scratch compatibility does not enable Aurora prefix caching,
+speculation, KV transfer, V2, or unsupported parallel modes.
+
 ## Validation
 
 For the earlier block-outermost implementation, on the A3 remote container
@@ -114,3 +147,11 @@ Allocator/worker/metadata tests and slot-backed QLI/SparseFlashMla tests are
 provided, but their torch/NPU execution is deferred. The earlier serving
 results above do not validate this layout. Remote synchronization, builds,
 correctness verification and performance measurements require a later run.
+
+Circular-ring changes have **local static checks only**. Run the dependency-free
+`python3 tests/check_aurora_ring_static.py` to check placement and ring arithmetic.
+The circular manager, metadata, and `test_deepseek_v41_ring_compressor.py` tests
+are authored but have not been executed with torch/NPU. Numerical correctness,
+full-decode graph replay, model serving, and performance remain **not verified**.
+No remote synchronization, builds, or device execution were performed for this
+change. Remote Run Manifest evidence belongs to a later requested phase.

@@ -1279,3 +1279,19 @@
 #       Remove this patch once vllm-ascend's bundled PyTorch >= 2.13.0
 #       (which, like upstream, allows eps >= 0 for inference).
 #
+
+# ** File: platform/patch_deepseek_v41_frontend/ **
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   Target: vLLM tokenizer, renderer, reasoning and tool parser registries.
+#   Why:
+#       Day0 DeepSeek V4.1 encoding differs from the upstream V4 protocol.
+#   How:
+#       Register lazy deepseek_v41 implementations when global patches load;
+#       reuse vLLM rendering and parsing infrastructure with checkpoint encoding.
+#   Test:
+#       tests/ut/patch/platform/deepseek_v41 and CPU HTTP render/derender.
+#   Related PR:
+#       No upstream PR yet; this is temporary day0 protocol support.
+#   Future Plan:
+#       Upstream V4.1 frontend support to vLLM and remove this patch once the
+#       pinned vLLM version implements the same checkpoint protocol.

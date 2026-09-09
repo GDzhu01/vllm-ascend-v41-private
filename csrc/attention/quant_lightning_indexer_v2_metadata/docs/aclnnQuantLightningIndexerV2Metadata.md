@@ -388,29 +388,29 @@ aclnnStatus aclnnQuantLightningIndexerV2Metadata(
 
 ## 约束说明
 
-- aclnnQuantLightningIndexerV2Metadata默认确定性实现。
-- B（Batch）表示输入样本批量大小，q、k为配套的aclnnQuantLightningIndexerV2算子的入参，S1表示layoutQOptional=BSND时，q shape中的S轴的大小，S2表示layoutKOptional=BSND时，k shape中的S轴的大小。
-- 参数cuSeqlensQOptional、cuSeqlensKOptional要求其值为当前Batch与前序Batch有效token数的累加值，第一个元素固定为0，后一个元素的值必须大于等于前一个元素的值。
-- 参数sequsedQOptional、sequsedKOptional要求其值表示每个Batch中的有效token数。
-- 非PA场景layoutQOptional、layoutKOptional须相同。
-- 参数cmpResidualKOptional需满足cmpResidualKOptional[i] < cmpRatio。
-- layoutQOptional=BSND场景
+  - aclnnQuantLightningIndexerV2Metadata默认确定性实现。
+  - B（Batch）表示输入样本批量大小，q、k为配套的aclnnQuantLightningIndexerV2算子的入参，S1表示layoutQOptional=BSND时，q shape中的S轴的大小，S2表示layoutKOptional=BSND时，k shape中的S轴的大小。
+  - 参数cuSeqlensQOptional、cuSeqlensKOptional要求其值为当前Batch与前序Batch有效token数的累加值，第一个元素固定为0，后一个元素的值必须大于等于前一个元素的值。
+  - 参数sequsedQOptional、sequsedKOptional要求其值表示每个Batch中的有效token数。
+  - 非PA场景layoutQOptional、layoutKOptional须相同。
+  - 参数cmpResidualKOptional需满足cmpResidualKOptional[i] < cmpRatio。
+  - layoutQOptional=BSND场景
     - maxSeqlenQ必须传入S1的值。
-- layoutKOptional=BSND场景
+  - layoutKOptional=BSND场景
     - maxSeqlenK必须传入S2的值。
-- layoutQOptional=TND场景
+  - layoutQOptional=TND场景
     - cuSeqlensQOptional必须传入。
-- layoutKOptional=TND场景
+  - layoutKOptional=TND场景
     - cuSeqlensKOptional必须传入。
-- layoutKOptional=PA_BBND场景
+  - layoutKOptional=PA_BBND场景
     - sequsedKOptional必须传入。
-- Batch取值规则
+  - Batch取值规则
     - layoutQOptional为BSND时，优先通过sequsedQOptional的shape推导batch，sequsedQOptional未传入则通过batchSize获取batch数。
     - layoutQOptional为TND时，优先通过sequsedQOptional的shape推导batch，sequsedQOptional未传入则通过cuSeqlensQOptional的shape推导batch。
-- q Seqlen取值规则
+  - q Seqlen取值规则
     - layoutQOptional为BSND时，优先通过sequsedQOptional中的元素获取seqlen，sequsedQOptional未传入则通过maxSeqlenQ获取seqlen。
     - layoutQOptional为TND时，优先通过sequsedQOptional中的元素获取seqlen，sequsedQOptional未传入则通过cuSeqlensQOptional中的元素获取seqlen。
-- k Seqlen取值规则
+  - k Seqlen取值规则
     - layoutKOptional为BSND时，优先通过sequsedKOptional中的元素获取seqlen，sequsedKOptional未传入则通过maxSeqlenK获取seqlen。
     - layoutKOptional为TND时，优先通过sequsedKOptional中的元素获取seqlen，sequsedKOptional未传入则通过cuSeqlensKOptional中的元素获取seqlen。
 

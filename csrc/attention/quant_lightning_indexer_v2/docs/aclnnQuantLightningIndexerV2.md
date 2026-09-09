@@ -459,27 +459,27 @@ aclnnStatus aclnnQuantLightningIndexerV2(
 
 <!-- npu="950" id10 -->
 - <term>Ascend 950PR/Ascend 950DT</term>：
-    - `layout_key` 额外支持 BSND 和 TND；支持 PA_BSND、BSND、TND。
-    - `quant_mode` 支持 1（FLOAT8_e4m3fn量化）、2（INT8量化）、3（MXFP8量化）、4（HIFLOAT8量化）和 5（MXFP4量化）。
-    - `cmp_ratio` 支持 (0, 128] 内任意正整数。
-    - 支持 `return_value`。
-    - query 和 key：`quant_mode` 为 1/3 时支持 FLOAT8_e4m3fn，`quant_mode` 为 2 时支持 INT8，`quant_mode` 为 4 时支持 HIFLOAT8，`quant_mode` 为 5 时支持 FLOAT4_e2m1。
-    - query_dequant_scale 和 key_dequant_scale：`quant_mode` 为 1/4 时支持 FLOAT32，`quant_mode` 为 2 时支持 FLOAT16，`quant_mode` 为 3/5 时支持 FLOAT8_e8m0。
-    - weights：`quant_mode` 为 2 时支持 FLOAT16，`quant_mode` 为 1/3/4/5 时支持 FLOAT32。
-    - query Q_N 支持 [1, 64]。
+  - `layout_key` 额外支持 BSND 和 TND；支持 PA_BSND、BSND、TND。
+  - `quant_mode` 支持 1（FLOAT8_e4m3fn量化）、2（INT8量化）、3（MXFP8量化）、4（HIFLOAT8量化）和 5（MXFP4量化）。
+  - `cmp_ratio` 支持 (0, 128] 内任意正整数。
+  - 支持 `return_value`。
+  - query 和 key：`quant_mode` 为 1/3 时支持 FLOAT8_e4m3fn，`quant_mode` 为 2 时支持 INT8，`quant_mode` 为 4 时支持 HIFLOAT8，`quant_mode` 为 5 时支持 FLOAT4_e2m1。
+  - query_dequant_scale 和 key_dequant_scale：`quant_mode` 为 1/4 时支持 FLOAT32，`quant_mode` 为 2 时支持 FLOAT16，`quant_mode` 为 3/5 时支持 FLOAT8_e8m0。
+  - weights：`quant_mode` 为 2 时支持 FLOAT16，`quant_mode` 为 1/3/4/5 时支持 FLOAT32。
+  - query Q_N 支持 [1, 64]。
 <!-- end id10 -->
 <!-- npu="A3,910b" id11 -->
 - <term>Atlas A3 训练系列产品/Atlas A3 推理系列产品</term>、<term>Atlas A2 训练系列产品/Atlas A2 推理系列产品</term>：
-    - `layout_key` 仅支持 PA_BSND。
-    - `quant_mode` 仅支持 2（Per-Token-Head量化）。
-    - `cmp_ratio` 仅支持 2 的幂次方且范围为 [1, 128]，即 1/2/4/8/16/32/64/128。
-    - 不支持 `outputIdxOffsetOptional`。
-    - 不支持 `return_value`。
-    - query 和 key：支持 INT8，不支持 FLOAT8_e4m3fn、HIFLOAT8 和 FLOAT4_e2m1。
-    - query_dequant_scale 和 key_dequant_scale：支持 FLOAT16，不支持 FLOAT32 和 FLOAT8_e8m0。
-    - weights：支持 FLOAT16，不支持 FLOAT32。
-    - query Q_N 仅支持 64。
-    - topk 仅支持 [1, 2048]。
+  - `layout_key` 仅支持 PA_BSND。
+  - `quant_mode` 仅支持 2（Per-Token-Head量化）。
+  - `cmp_ratio` 仅支持 2 的幂次方且范围为 [1, 128]，即 1/2/4/8/16/32/64/128。
+  - 不支持 `outputIdxOffsetOptional`。
+  - 不支持 `return_value`。
+  - query 和 key：支持 INT8，不支持 FLOAT8_e4m3fn、HIFLOAT8 和 FLOAT4_e2m1。
+  - query_dequant_scale 和 key_dequant_scale：支持 FLOAT16，不支持 FLOAT32 和 FLOAT8_e8m0。
+  - weights：支持 FLOAT16，不支持 FLOAT32。
+  - query Q_N 仅支持 64。
+  - topk 仅支持 [1, 2048]。
 <!-- end id11 -->
 
 - **返回值：**

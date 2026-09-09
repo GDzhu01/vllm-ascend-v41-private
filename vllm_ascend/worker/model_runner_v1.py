@@ -138,6 +138,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
+from vllm_ascend.core.circular_buffer import is_circular_spec
 from vllm_ascend.core.deepseek_v41 import (
     is_v41_spec,
     plan_cache_slots,
@@ -3464,6 +3465,7 @@ class NPUModelRunner(GPUModelRunner):
             elif isinstance(builder, DeepseekV41MetadataBuilder):
                 extra_attn_metadata_args = dict(
                     num_actual_reqs=num_reqs,
+                    skip_ring_state_update=skip_gdn_state_update,
                     common_v41_metadata=common_v41_metadata,
                     full_graph_mode=cudagraph_runtime_mode == CUDAGraphMode.FULL,
                 )
@@ -3506,9 +3508,12 @@ class NPUModelRunner(GPUModelRunner):
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
-        common_v41_metadata: dict[str, Any] = {}
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            # V4.1 cache coordinates are shared only inside one framework KV
+            # cache group. This lets a source's LongKV and Indexer reuse the
+            # same [T, 2] mapping without aliasing any SWA group's mapping.
+            common_v41_metadata: dict[str, Any] = {}
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -3772,6 +3777,19 @@ class NPUModelRunner(GPUModelRunner):
                 # Dummy graph runs do not go through _prepare_inputs(), but GDN/Mamba
                 # metadata reads block_table[:num_reqs_padded] below. Sync padded
                 # rows as well so device-side metadata does not see stale block ids.
+                # Dummy requests bypass scheduler allocation. Give each active
+                # request a distinct non-null state ID before metadata/capture.
+                for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                    if skip_gdn_state_update or not is_circular_spec(group.kv_cache_spec):
+                        continue
+                    if num_reqs >= self.kv_cache_config.num_blocks:
+                        raise ValueError("Insufficient ring pages for dummy graph requests")
+                    table = self.input_batch.block_table[gid]
+                    table.block_table.np[:num_reqs_padded].fill(0)
+                    table.block_table.np[:num_reqs, 0] = np.arange(1, num_reqs + 1)
+                    context = self.compilation_config.static_forward_context
+                    for name in group.layer_names:
+                        context[name].kv_cache[0][1:num_reqs + 1].zero_()
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
                 # Invalidate real-request slots before attention backends derive
@@ -4176,6 +4194,14 @@ class NPUModelRunner(GPUModelRunner):
                 self.sparse_kv_offload_config,
             )
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        if any(is_circular_spec(g.kv_cache_spec) for g in kv_cache_config.kv_cache_groups):
+            # Lazy import avoids the model/cache registration cycle.
+            from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
+
+            for module in self.model.modules():
+                if isinstance(module, DeepseekV41Compressor) and module.ratio == 2:
+                    module.prepare_ring_compressor(self.max_num_tokens, self.device)
+
         # TODO: refactor the logic of attention
         if (
             self.speculative_config
@@ -5123,6 +5149,8 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
             if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
+            elif is_circular_spec(kv_cache_spec):
+                self.kernel_block_sizes.append([kv_cache_spec.block_size])
             elif isinstance(kv_cache_spec, AttentionSpec):
                 # This is an attention backend that supports virtual
                 # block splitting. Get the supported block sizes from

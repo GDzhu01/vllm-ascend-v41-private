@@ -84,7 +84,7 @@ private:
     // candidate (two-level topk)
     __aicore__ inline int32_t CountGE(const LocalTensor<float> &sortedDesc, int32_t n, float x);
     __aicore__ inline void BuildCandidateMask(const QLIV2Common::RunInfo &info, int32_t cuS1Idx,
-                                              int32_t cuBaseS2Idx);
+                                              int32_t cuBaseS2Idx, int32_t innerS1Idx);
     __aicore__ inline void ProcessCandBlockTopk(const QLIV2Common::RunInfo &info, int32_t cuS1Idx, int32_t cuS2Len,
                                                 int32_t cuS2LenVecAlign, int32_t cuRealAcSeq, int32_t innerS1Idx);
     __aicore__ inline void CopyOutCandTopkIndex(const QLIV2Common::RunInfo &info, int32_t cuS1Idx, int32_t innerS1Idx);
@@ -229,7 +229,9 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::InitBuffers(TPipe *pipe)
         globalBlockTopkUb_ = blockSortOutBuf_.Get<float>();
         InitSortOutBuf(globalBlockTopkUb_, CeilDiv(s1BaseSize_, 2) * BASE_TOPK_VALUE_IDX_SIZE);
     } else if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER) {
-        pipe->InitBuffer(candBuf_, BASE_TOPK * 2 * sizeof(float)); // 16KB: 排序候选对 [values | idx]
+        // R6 修复: candBuf 按行分区 (每 AIV 处理 CeilDiv(s1BaseSize,2)=2 行, 行间 tile0 重排序
+        // 会互相覆盖) — 2 行 x 2048 对 x 8B = 32KB; mode=2 UB 预算 144+32+8=184KB <= 192KB
+        pipe->InitBuffer(candBuf_, CeilDiv(s1BaseSize_, 2) * BASE_TOPK * 2 * sizeof(float));
         pipe->InitBuffer(candConstBuf_, BASE_TOPK * sizeof(float)); // 8KB: negHuge
         candNegHuge_ = candConstBuf_.Get<float>();
         Duplicate(candNegHuge_.template ReinterpretCast<int32_t>(), QLIV2ServiceVec::NEG_HUGE_F32, BASE_TOPK);
@@ -446,16 +448,18 @@ __aicore__ inline int32_t QLIV2Vector<QLIV2T>::CountGE(const LocalTensor<float> 
 // 产出 position 级 isOut (fp32 0/1, 1=候选外) 与其 int32 形式
 template <typename QLIV2T>
 __aicore__ inline void QLIV2Vector<QLIV2T>::BuildCandidateMask(const QLIV2Common::RunInfo &info, int32_t cuS1Idx,
-                                                               int32_t cuBaseS2Idx)
+                                                               int32_t cuBaseS2Idx, int32_t innerS1Idx)
 {
     int32_t candBlocks = static_cast<int32_t>(constInfo_.candidateTopkBlocks);
     int32_t blockSize = static_cast<int32_t>(constInfo_.candidateBlockSize);
     int32_t tileBlkNum = s2BaseSize_ / blockSize;
     int32_t tileBlockBase = cuBaseS2Idx / blockSize;
+    // R6 修复: 同核多行 (每 AIV 处理 CeilDiv(s1BaseSize,2)=2 行) 共享 candBuf 时,
+    // 后一行的 tile0 重排序会覆盖前行候选 (s2 内层循环按 gS1 块整体推进) — candBuf 按行分区
     LocalTensor<float> tmp = tmpBuf_.Get<float>();
+    LocalTensor<float> candPairs = candBuf_.Get<float>()[innerS1Idx * candBlocks * 2];
     if (info.isFirstS2InnerLoop) {
         // 加载候选行到 tmp 尾部, 转 fp32 后与有序索引组成 [values | idx] 对并降序排序
-        LocalTensor<float> candPairs = candBuf_.Get<float>();
         LocalTensor<int32_t> candInt = tmp[12288].template ReinterpretCast<int32_t>();
         AscendC::DataCopyExtParams copyInParams;
         copyInParams.blockCount = 1;
@@ -483,9 +487,10 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::BuildCandidateMask(const QLIV2Common
         SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
     }
     // 候选与 tile 块号 [tileBlockBase, tileBlockBase+tileBlkNum) 的最小距离, 0 即命中
-    LocalTensor<float> candPairs = candBuf_.Get<float>();
-    int32_t lo = CountGE(candPairs, candBlocks, static_cast<float>(tileBlockBase));
-    int32_t hi = CountGE(candPairs, candBlocks, static_cast<float>(tileBlockBase + tileBlkNum));
+    // (candBuf 按行分区, R6: 同核行间覆盖已修复)
+    LocalTensor<float> candPairs2 = candBuf_.Get<float>()[innerS1Idx * candBlocks * 2];
+    int32_t lo = CountGE(candPairs2, candBlocks, static_cast<float>(tileBlockBase));
+    int32_t hi = CountGE(candPairs2, candBlocks, static_cast<float>(tileBlockBase + tileBlkNum));
     LocalTensor<float> blkIdxF = tmp[4096];     // [tileBlkNum]
     LocalTensor<float> acc = tmp[4352];         // [tileBlkNum]
     LocalTensor<float> diff = tmp[4608];        // [tileBlkNum]
@@ -497,7 +502,7 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::BuildCandidateMask(const QLIV2Common
     PipeBarrier<PIPE_V>();
     // 降序排序下: 值 >= base+tileBlkNum 占 [0, hi), 落在 tile 内的候选占 [hi, lo), < base (含 -1 pad) 占 [lo, ...)
     for (int32_t j = hi; j < lo; j++) {
-        float v = candPairs.GetValue(2 * j);
+        float v = candPairs2.GetValue(2 * j);
         Adds(diff, blkIdxF, -v, tileBlkNum);
         PipeBarrier<PIPE_V>();
         VecAbs(diff, diff, tileBlkNum);
@@ -537,7 +542,13 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessCandBlockTopk(const QLIV2Comm
     LocalTensor<float> tmp = tmpBuf_.Get<float>();
     // 块内归约: vcgmax 每 32B 块 (8 fp32) 出 1 个 max, 紧凑输出 [blockNum]
     LocalTensor<float> blkScore = tmp[6144];
-    int32_t brmRepeat = (blkLen / 64) > 0 ? (blkLen / 64) : 1;
+    // R10: blkLen=96 是 AlignS2 输出中唯一非 64 倍数的值 (≤128 段对齐到 32 的倍数),
+    // 96/64 整除截断为 1 只归约 [0,64) — 块 8..11 残留上一 tile/行的 stale 分数
+    // (实测 big128k_b2_varlen b1 行 73 tile 56: 块 14344 拿到 tile 55 块 14088 的
+    // 3.5568, 虚高挤掉 2048 名边界块 2760; 小 shape 总块数≤2048 集合不变故未暴露)。
+    // 改 CeilDiv 覆盖全部块; 多归约的 [96,128) stale 只落在 pad 块槽位, 被 -inf
+    // 位型链位精确覆盖, 无害。
+    int32_t brmRepeat = CeilDiv(blkLen, 64);
     BlockReduceMax(blkScore, tmp[0], brmRepeat, 64, 1, 1, 8);
     PipeBarrier<PIPE_V>();
     int32_t lastBlk = (cuRealAcSeq - 1) / blockSize;
@@ -837,7 +848,7 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
             PipeBarrier<PIPE_V>();
             // mode=2 (use_candidate): 候选块外 score 减至极小值 (S4a, 纯算术无 NaN)
             if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER) {
-                BuildCandidateMask(info, cuS1Idx, cuBaseS2Idx);
+                BuildCandidateMask(info, cuS1Idx, cuBaseS2Idx, innerS1Idx);
                 PipeBarrier<PIPE_V>();
                 LocalTensor<float> pen = tmpBuf_.Get<float>()[4096]; // blkIdxF/acc/d 已释放, 复用
                 Sub(pen, candNegHuge_, mmInUb, cuS2Len);

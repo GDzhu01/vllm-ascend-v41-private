@@ -214,7 +214,7 @@ __aicore__ inline void QLIV2Matmul<QLIV2T>::InitMm1GlobalTensor(const GlobalTens
     keyGm_ = keyGm;
     queryGm_ = queryGm;
     if constexpr (IS_MX) {
-        mxKeyScaleGmBf16_ = keyScaleGmBf16; // gitleaks:allow (C++ tensor handle assignment)
+        mxKeyScaleGmBf16_ = keyScaleGmBf16;
         mxQueryScaleGmBf16_ = queryScaleGmBf16;
     }
 }

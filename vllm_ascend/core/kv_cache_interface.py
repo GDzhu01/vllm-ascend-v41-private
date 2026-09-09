@@ -18,6 +18,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
+from vllm_ascend.core.circular_buffer import AscendCircularBufferManager, AscendCircularBufferSpec
+
 
 def get_storage_block_size(kv_cache_spec: KVCacheSpec) -> int:
     """Return the physical token rows represented by one scheduler block."""
@@ -233,11 +235,16 @@ def register_ascend_kv_cache_specs() -> None:
         DeepseekV41SWASpec,
     )
 
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=AscendCircularBufferSpec,
+        manager_class=AscendCircularBufferManager,
+        uniform_type_base_spec=AscendCircularBufferSpec,
+    )
     for spec, manager in (
         (DeepseekV41FullSpec, FullAttentionManager),
         (DeepseekV41IndexerSpec, FullAttentionManager),
         (DeepseekV41SWASpec, SlidingWindowManager),
-        (DeepseekV41CompressorStateSpec, SlidingWindowManager),
+        (DeepseekV41CompressorStateSpec, AscendCircularBufferManager),
     ):
         KVCacheSpecRegistry.register(kvcache_spec_cls=spec, manager_class=manager, uniform_type_base_spec=spec)
     KVCacheSpecRegistry.register(

@@ -3,12 +3,13 @@
 """V4.1 index projections, quantized QLI and cross-layer candidate selection."""
 
 import torch
+import torch_npu
 from torch import nn
 from vllm.model_executor.layers.linear import ReplicatedLinear
 
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
-    scatter_cache,
+    scatter_cache_v2,
 )
 from vllm_ascend.core.deepseek_v41 import DeepseekV41IndexerSpec
 from vllm_ascend.worker.device_metadata import (
@@ -99,11 +100,16 @@ class DeepseekV41Indexer(nn.Module):
             partial_slice=[self.width - self.rope_width, self.width],
         )
         key = key.squeeze(1)
-        scale = key.float().abs().amax(-1, keepdim=True).clamp_min_(1e-12) / 127.0
-        quantized = (key.float() / scale).round_().clamp_(-127, 127).to(torch.int8)
+        quantized, scale = torch_npu.npu_dynamic_quant(
+            key, dst_type=torch.int8
+        )
         k_cache, scale_cache = self.k_cache.kv_cache[0]
-        scatter_cache(k_cache, slots, quantized)
-        scatter_cache(scale_cache, slots, scale.to(torch.float16))
+        scatter_cache_v2(k_cache, slots, quantized)
+        scatter_cache_v2(
+            scale_cache,
+            slots,
+            scale.unsqueeze(-1).to(torch.float16),
+        )
 
     def select(
         self,

@@ -178,24 +178,24 @@
 - mask_mode所表示的mask模式的详细介绍见[sparse_mode参数说明](../../docs/zh/context/sparse_mode_introduction.md)。
 - 非PA场景layout_q、layout_k须相同。
 - layout_q=BSND场景
-    - max_seqlen_q必须传入S1的值。
+  - max_seqlen_q必须传入S1的值。
 - layout_k=BSND场景
-    - max_seqlen_k必须传入S2的值。
+  - max_seqlen_k必须传入S2的值。
 - layout_q=TND场景
-    - cu_seqlens_q必须传入。
+  - cu_seqlens_q必须传入。
 - layout_k=TND场景
-    - cu_seqlens_k必须传入。
+  - cu_seqlens_k必须传入。
 - layout_k=PA_BBND场景
-    - seqused_k必须传入。
+  - seqused_k必须传入。
 - Batch取值规则
-    - layout_q为BSND时，优先通过seqused_q的shape推导batch，seqused_q未传入则通过batch_size获取batch数。
-    - layout_q为TND时，优先通过seqused_q的shape推导batch，seqused_q未传入则通过cu_seqlens_q的shape推导batch。
+  - layout_q为BSND时，优先通过seqused_q的shape推导batch，seqused_q未传入则通过batch_size获取batch数。
+  - layout_q为TND时，优先通过seqused_q的shape推导batch，seqused_q未传入则通过cu_seqlens_q的shape推导batch。
 - q Seqlen取值规则
-    - layout_q为BSND时，优先通过seqused_q中的元素获取seqlen，seqused_q未传入则通过max_seqlen_q获取seqlen。
-    - layout_q为TND时，优先通过seqused_q中的元素获取seqlen，seqused_q未传入则通过cu_seqlens_q中的元素获取seqlen。
+  - layout_q为BSND时，优先通过seqused_q中的元素获取seqlen，seqused_q未传入则通过max_seqlen_q获取seqlen。
+  - layout_q为TND时，优先通过seqused_q中的元素获取seqlen，seqused_q未传入则通过cu_seqlens_q中的元素获取seqlen。
 - k Seqlen取值规则
-    - layout_k为BSND时，优先通过seqused_k中的元素获取seqlen，seqused_k未传入则通过max_seqlen_k获取seqlen。
-    - layout_k为TND时，优先通过seqused_k中的元素获取seqlen，seqused_k未传入则通过cu_seqlens_k中的元素获取seqlen。
+  - layout_k为BSND时，优先通过seqused_k中的元素获取seqlen，seqused_k未传入则通过max_seqlen_k获取seqlen。
+  - layout_k为TND时，优先通过seqused_k中的元素获取seqlen，seqused_k未传入则通过cu_seqlens_k中的元素获取seqlen。
 
 ## 调用说明
 
