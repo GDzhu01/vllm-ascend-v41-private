@@ -35,7 +35,7 @@ Within the merged group, KV and index share an ID at disjoint byte offsets.
 | G1 | FP32 circular compressor state at layers 2, 8, 14 | 32 | 0-2; slot 3 unused |
 | G2-G11 | SWA layers 0-39, four consecutive layers per group, window 128 | 128 | 0-3 |
 
-There are 12 groups and 51 cache specs. The base attention block size is
+Without DSpark there are 12 groups and 51 cache specs. The base attention block size is
 128 at production dimensions. C2 stores 64 compressed rows per logical block;
 C1 and SWA store 128 rows. State stores 32 uncompressed FP32 rows with width
 1024 in one private ring page per request.
@@ -68,6 +68,48 @@ rows. SWA is `[N,128,1,512]` BF16; state is `[N,32,1,1024]` FP32. Components
 other than state need not be contiguous. State must fill its slot contiguously;
 no whole-context gather is introduced by allocation.
 
+### DSpark in the same four slots
+
+The optional Aurora DSpark model adds one group, G12, containing exactly three
+`DeepseekV41DraftSWASpec` resources: `mtp.0.self_attn.swa_cache`,
+`mtp.1.self_attn.swa_cache`, and `mtp.2.self_attn.swa_cache`. They occupy offset
+zero in slots 0, 1, and 2 respectively; G12 leaves slot 3 unused. The target
+groups and their padding remain unchanged. This is **13 groups, 54 specs and
+four physical buffers**, still **540928 bytes per global ID**.
+
+Each draft view is `[N,128,1,512]` BF16 with 131072-byte block stride and no
+padding. The planner validates draft geometry against target SWA and rejects
+foreign resources, compressed drafts, extra draft layers, and any geometry
+that would enlarge the existing slots. An explicit draft spec keeps G12
+separate from target SWA while reusing its `SlidingWindowManager` semantics.
+
+G12 owns its own block table and live global IDs. All three draft layers use
+that table, accessing different physical slots at the same ID. Target groups
+use other live IDs, so sharing the backing does not share live target KV data.
+Release/preemption returns IDs to the common pool. G12 adds one group's SWA
+page demand, not three groups' demand; available-memory sizing still divides
+by 540928, and rank shrinking changes only N.
+
+DSpark context KV is projected independently for each draft layer using the
+inherited DSV4 SWA backend and the group's own slot mappings. The target exports
+the incoming residual streams from the checkpoint-selected auxiliary layers.
+Composite-config selection reads Aurora's text config. Target and draft MoE
+dispatchers are selected by expert/execution shape to avoid sharing mutable
+dispatch state across incompatible expert counts. With DSpark, `auto` cache
+dtype is resolved to BF16 before constructing the inherited DSV4 draft backend.
+
+The 32-row FP32 target ring requires **1..31 speculative tokens**. A verifier
+writes the anchor plus S speculative input rows. After accepting A drafts, the
+next forward starts at `P+A+1`; if that position is odd it needs row `P+A`.
+At most S newer rows follow it, so S below 32 preserves it through the tail
+write. S=32 can overwrite the anchor after complete rejection and is rejected
+at initialization. Per-batch limits cannot exceed the configured maximum.
+Rejected compressed KV/index rows remain outside the accepted sequence length
+and are overwritten when those positions are recomputed.
+
+Target eager and `FULL_DECODE_ONLY` modes retain their existing dispatch;
+the V1 DSpark proposer runs eagerly. Draft graph capture is not enabled.
+
 ### Earlier design comparisons
 
 The original block-outermost implementation reserved 393216 bytes per ID
@@ -90,8 +132,9 @@ re-registered under consumer layers.
 The runtime contract is model runner V1, eager or `FULL_DECODE_ONLY` mode,
 BF16 cache, hybrid KV management, PP/DCP/PCP equal to one, and
 tensor/data/expert parallel serving. `FULL_DECODE_ONLY` retains Aurora main's
-eager prefill and full-graph decode dispatch. Prefix caching, speculative
-decoding, KV transfer and other graph modes fail closed.
+eager prefill and full-graph decode dispatch. DSpark is the only supported
+speculative method, subject to the retention bound above. Prefix caching,
+KV transfer and other graph modes fail closed.
 
 The fallback attends over local SWA plus the compressed rows selected by the
 Indexer/Candidate path. Engram execution is intentionally disabled: its two
@@ -155,3 +198,11 @@ are authored but have not been executed with torch/NPU. Numerical correctness,
 full-decode graph replay, model serving, and performance remain **not verified**.
 No remote synchronization, builds, or device execution were performed for this
 change. Remote Run Manifest evidence belongs to a later requested phase.
+
+DSpark coverage adds dependency-free grouping/allocation checks and 5797
+acceptance/rejection schedules. Torch tests cover shared storage, group-ID
+isolation, rank shrinking, configuration/auxiliary-state wiring and per-group
+draft metadata. NPU tests cover draft context stores in the actual shared
+backings and ring residuals after rejection. These torch/NPU tests are authored
+but **not executed**; DSpark correctness, target graph replay and performance
+remain **not verified**.

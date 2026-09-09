@@ -425,6 +425,32 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "allocation disagrees"):
             runner._allocate_kv_cache_tensors(config)
 
+    def test_v41_dspark_shares_four_backings_after_rank_shrink(self):
+        runner = self._build_runner()
+        config = make_cache_config(5, draft_layers=3)
+        for allocation in config.kv_cache_tensors:
+            allocation.size = allocation.size // config.num_blocks * 3
+        config.num_blocks = 3
+        raw = runner._allocate_kv_cache_tensors(config)
+        assert len({id(value) for value in raw.values()}) == 4
+        runner._kv_cache_spec_attn_group_iterator = lambda: [
+            SimpleNamespace(kv_cache_spec=spec, backend=runner.attn_backend, layer_names=[name])
+            for group in config.kv_cache_groups
+            for name, spec in group.kv_cache_spec.kv_cache_specs.items()
+        ]
+        caches = runner._reshape_kv_cache_tensors(config, raw)
+        for stage, source in enumerate((2, 8, 14)):
+            draft = f"mtp.{stage}.self_attn.swa_cache"
+            target = f"model.layers.{source}.self_attn.long_kv_cache"
+            assert raw[draft] is raw[target]
+            assert caches[draft].shape == (3, 128, 1, 512)
+            assert caches[draft].stride(0) * 2 == 131072
+            assert caches[draft].data_ptr() == caches[target].data_ptr()
+            caches[target][1].fill_(2)
+            caches[draft][2].fill_(3)
+            assert (caches[target][1] == 2).all()
+            assert (caches[draft][0] == 0).all()
+
     def test_allocate_kv_cache_uses_layer_spec_for_draft_gqa(self):
         runner = self._build_runner()
         runner.sparse_kv_offload_enabled = False

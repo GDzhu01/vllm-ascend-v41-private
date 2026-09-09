@@ -109,6 +109,38 @@ def test_empty_projected_batch_keeps_ring_untouched():
     torch.testing.assert_close(state.cpu(), initial, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("start", [0, 1, 31, 32, 127, 128])
+@pytest.mark.parametrize("accepted", [0, 1, 15, 30, 31])
+def test_ring_residual_after_dspark_rejection_matches_verified_prefix(start, accepted):
+    _, caches = allocate_cache_views(make_cache_config(17, draft_layers=3), "npu")
+    state = caches["model.layers.2.self_attn.compressor.state_cache"].squeeze(-2)
+    state[7].fill_(17)
+    kv = torch.randn(32, 512, dtype=torch.float32, device="npu")
+    scores = torch.randn_like(kv)
+    metadata = torch.tensor([[start], [32], [0], [0], [7]], dtype=torch.int32, device="npu")
+    out = torch.empty_like(kv, dtype=torch.bfloat16)
+    cores = _cube_core_num()
+    compressor_from_projected(kv, scores, state, metadata, out, max_query_len=32, num_cores=cores)
+    next_start = start + accepted + 1
+    next_kv = torch.randn(2, 512, dtype=torch.float32, device="npu")
+    next_scores = torch.randn_like(next_kv)
+    controls = torch.tensor([[next_start], [2], [0], [0], [7]], dtype=torch.int32, device="npu")
+    next_out = torch.empty_like(next_kv, dtype=torch.bfloat16)
+    if next_start % 2:
+        pair_kv = torch.stack((kv[accepted], next_kv[0]))
+        pair_scores = torch.stack((scores[accepted], next_scores[0]))
+        output_index = 0
+    else:
+        pair_kv, pair_scores = next_kv, next_scores
+        output_index = 1
+    expected = (pair_kv * pair_scores.softmax(0)).sum(0).bfloat16()
+    compressor_from_projected(next_kv, next_scores, state, controls, next_out, max_query_len=2, num_cores=cores)
+    torch.testing.assert_close(next_out[output_index].cpu(), expected.cpu(), rtol=0.016, atol=1e-5)
+    assert not next_out[1 - output_index].any()
+    # G12's separate live ID is untouched by target state updates.
+    assert not caches["mtp.0.self_attn.swa_cache"][13].any()
+
+
 @pytest.mark.parametrize("invalid", ["state_dtype", "projection_dtype", "strided_state", "ring_rows", "output_dtype"])
 def test_projected_ring_rejects_incompatible_views(invalid):
     state, _, kv_cpu, scores_cpu, controls = _inputs(1, 0)

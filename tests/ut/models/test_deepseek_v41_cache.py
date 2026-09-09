@@ -10,7 +10,7 @@ from vllm.config import CUDAGraphMode
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
-from tests.deepseek_v41_cache_utils import allocate_cache_views
+from tests.deepseek_v41_cache_utils import allocate_cache_views, make_cache_config
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
     DeepseekV41EagerAttentionImpl,
@@ -24,6 +24,7 @@ from vllm_ascend.attention.dsa_v41 import (
     select_index_topk,
 )
 from vllm_ascend.core.deepseek_v41 import (
+    DeepseekV41DraftSWASpec,
     DeepseekV41FullSpec,
     DeepseekV41IndexerSpec,
     DeepseekV41SWASpec,
@@ -339,6 +340,92 @@ def test_full_decode_only_runtime_is_supported(runtime):
     runtime.model_config.enforce_eager = False
     runtime.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
     validate_cache_runtime(runtime)
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY])
+@pytest.mark.parametrize("count", [1, 15, 31])
+def test_dspark_runtime_preserves_ring_retention_limit(runtime, mode, count):
+    from vllm_ascend.core.deepseek_v41 import validate_cache_runtime
+
+    runtime.speculative_config = SimpleNamespace(use_dspark=lambda: True, num_speculative_tokens=count)
+    runtime.compilation_config.cudagraph_mode = mode
+    validate_cache_runtime(runtime)
+    assert runtime.cache_config.cache_dtype == "bfloat16"
+
+
+@pytest.mark.parametrize("count", [0, 32, 63])
+def test_dspark_rejects_verification_tail_that_cannot_fit_ring(runtime, count):
+    from vllm_ascend.core.deepseek_v41 import validate_cache_runtime
+
+    runtime.speculative_config = SimpleNamespace(use_dspark=lambda: True, num_speculative_tokens=count)
+    with pytest.raises(ValueError, match="1..31"):
+        validate_cache_runtime(runtime)
+
+
+def test_dspark_is_one_additional_group_in_existing_slots(runtime):
+    runtime.model_config.max_model_len = 4096
+    runtime.max_in_flight_tokens = 256
+    target = make_cache_config(17)
+    draft = make_cache_config(17, draft_layers=3)
+    groups = draft.kv_cache_groups
+    assert len(groups) == 13 and sum(len(g.layer_names) for g in groups) == 54
+    assert groups[:12] == target.kv_cache_groups
+    assert groups[12].layer_names == [f"mtp.{i}.self_attn.swa_cache" for i in range(3)]
+    assert all(isinstance(s, DeepseekV41DraftSWASpec) for s in groups[12].kv_cache_spec.kv_cache_specs.values())
+    assert len(draft.kv_cache_tensors) == 4
+    assert [t.size for t in draft.kv_cache_tensors] == [t.size for t in target.kv_cache_tensors]
+    assert pool_bytes_per_block(groups) == 540928
+    added = request_blocks(runtime, groups) - request_blocks(runtime, target.kv_cache_groups)
+    spec = next(iter(groups[12].kv_cache_spec.kv_cache_specs.values()))
+    assert added == (spec.max_memory_usage_bytes(runtime) + spec.page_size_bytes - 1) // spec.page_size_bytes
+    padded = {n: s for g in groups for n, s in g.kv_cache_spec.kv_cache_specs.items()}
+    assert plan_cache_slots(padded) == plan_cache_slots(dict(reversed(list(padded.items()))))
+    backings, views = allocate_cache_views(draft)
+    assert sum(b.numel() for b in backings) == 17 * 540928
+    for stage in range(3):
+        name = f"mtp.{stage}.self_attn.swa_cache"
+        assert name in draft.kv_cache_tensors[stage].shared_by
+        assert views[name].data_ptr() == backings[stage].data_ptr()
+        assert views[name].shape == (17, 128, 1, 512)
+        assert views[name].stride() == (65536, 512, 512, 1)
+
+
+def test_dspark_slots_isolate_groups_and_reuse_released_ids():
+    cfg = make_cache_config(17, draft_layers=3)
+    _, views = allocate_cache_views(cfg)
+    # Each group owns a different live global ID, including the draft group.
+    for gid, group in enumerate(cfg.kv_cache_groups):
+        for name in group.layer_names:
+            planes = views[name] if isinstance(views[name], tuple) else (views[name],)
+            for plane in planes:
+                plane[gid + 1].fill_(gid + 1)
+    for gid, group in enumerate(cfg.kv_cache_groups):
+        for name in group.layer_names:
+            planes = views[name] if isinstance(views[name], tuple) else (views[name],)
+            for plane in planes:
+                assert (plane[gid + 1] == gid + 1).all()
+                assert (plane[0] == 0).all()
+    # After target G0 releases ID 1, G12 may use it without touching live IDs.
+    for stage in range(3):
+        view = views[f"mtp.{stage}.self_attn.swa_cache"]
+        view[1].fill_(7)
+        assert (view[13] == 13).all()
+        assert (view[0] == 0).all()
+
+
+@pytest.mark.parametrize("change", [{"head_size": 1024}, {"block_size": 256}, {"sliding_window": 256}])
+def test_dspark_geometry_cannot_expand_existing_slots(change):
+    cfg = make_cache_config(3, draft_layers=3)
+    specs = {n: s for g in cfg.kv_cache_groups for n, s in g.kv_cache_spec.kv_cache_specs.items()}
+    specs["mtp.0.self_attn.swa_cache"] = replace(specs["mtp.0.self_attn.swa_cache"], **change)
+    with pytest.raises(ValueError, match="geometry"):
+        plan_cache_slots(specs)
+
+
+@pytest.mark.parametrize("count", [1, 2, 4])
+def test_dspark_requires_three_slot_owners(count):
+    with pytest.raises(ValueError, match="three ordered"):
+        make_cache_config(3, draft_layers=count)
 
 
 @pytest.mark.parametrize("full_graph_mode", [False, True])
