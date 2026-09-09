@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -80,31 +79,6 @@ def get_moe_comm_method(
     if moe_config is not None:
         return _MoECommMethodsByConfig.get((moe_comm_type, _moe_config_key(moe_config)))
     return _MoECommMethods.get(moe_comm_type)
-
-
-@contextmanager
-def isolate_moe_comm_methods():
-    """Capture a model's dispatchers while preserving the already-loaded model."""
-    previous = _MoECommMethods.copy()
-    methods = {}
-    _MoECommMethods.clear()
-    try:
-        yield methods
-    finally:
-        methods.update(_MoECommMethods)
-        _MoECommMethods.clear()
-        _MoECommMethods.update(previous)
-
-
-@contextmanager
-def use_moe_comm_methods(methods):
-    """Select model-owned routing metadata and buffers for one forward."""
-    previous = _EXTRA_CTX.moe_comm_method
-    _EXTRA_CTX.moe_comm_method = methods[_EXTRA_CTX.moe_comm_type]
-    try:
-        yield
-    finally:
-        _EXTRA_CTX.moe_comm_method = previous
 
 
 def setup_moe_comm_method(moe_config):

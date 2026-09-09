@@ -28,9 +28,6 @@ from vllm_ascend.models.common.ops.sequence_parallel import (
 )
 
 
-from vllm_ascend.ops.fused_moe.moe_comm_method import isolate_moe_comm_methods, use_moe_comm_methods
-
-
 class DeepseekV41DSparkSWACache(AscendDeepseekV4SWACache):
     def get_kv_cache_spec(self, vllm_config):
         spec = super().get_kv_cache_spec(vllm_config)
@@ -66,11 +63,6 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
     """Three serial draft blocks matching the checkpoint's ``mtp.*`` tree."""
 
     def __init__(self, *, vllm_config, prefix="") -> None:
-        with isolate_moe_comm_methods() as methods:
-            self._init_model(vllm_config=vllm_config, prefix=prefix)
-        self._moe_comm_methods = methods
-
-    def _init_model(self, *, vllm_config, prefix="") -> None:
         # Deliberately do not call the V4 dSPark constructor: V4.1 has delayed
         # mHC state between blocks and no terminal hc_head parameters.
         torch.nn.Module.__init__(self)
@@ -136,10 +128,6 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
         last_layer.markov_head = self.markov_head
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        with use_moe_comm_methods(self._moe_comm_methods):
-            return self._forward(input_ids, positions)
-
-    def _forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids).unsqueeze(-2).repeat(1, self.hc_mult, 1)
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:

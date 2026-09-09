@@ -245,11 +245,7 @@ def test_v41_dspark_propagates_delayed_mix_and_collapses_final_stream():
 
     model.layers = torch.nn.ModuleDict({"40": Layer(), "41": Layer(), "42": Layer()})
     ids = torch.tensor([0, 1])
-    from contextlib import nullcontext
-
-    model._moe_comm_methods = {}
-    with patch("vllm_ascend.models.deepseek_v41.dspark.use_moe_comm_methods", return_value=nullcontext()):
-        result = model(ids, torch.tensor([2, 3]))
+    result = model(ids, torch.tensor([2, 3]))
     torch.testing.assert_close(result, model.embed_tokens(ids) + 3)
     assert [x[0].tolist() for x in seen] == [[1, 0], [0, 1], [1, 0]]
 
@@ -318,33 +314,3 @@ def test_v41_dspark_decoder_uses_draft_experts_instead_of_target_config():
         assert call.kwargs["config"].n_routed_experts == 128
         assert call.kwargs["is_draft_layer"]
     assert config.model_config.hf_config.n_routed_experts == 384
-
-
-def test_dspark_moe_comm_state_restores_target_after_draft_and_exception():
-    from types import SimpleNamespace
-
-    import pytest
-    from vllm_ascend.ascend_forward_context import MoECommType
-    from vllm_ascend.ops.fused_moe import moe_comm_method as comm
-
-    target = SimpleNamespace(num_experts=384, top_k=6, buffer=object())
-    draft = SimpleNamespace(num_experts=128, top_k=3, buffer=object())
-    kind = MoECommType.ALLTOALL
-    with patch.dict(comm._MoECommMethods, {kind: target}, clear=True):
-        with comm.isolate_moe_comm_methods() as draft_methods:
-            comm._MoECommMethods[kind] = draft
-        assert comm.get_moe_comm_method(kind) is target
-        assert draft_methods[kind] is draft
-        ctx = SimpleNamespace(moe_comm_type=kind, moe_comm_method=target)
-        with patch.object(comm, "_EXTRA_CTX", ctx):
-            with pytest.raises(RuntimeError, match="draft failed"):
-                with comm.use_moe_comm_methods(draft_methods):
-                    assert ctx.moe_comm_method is draft
-                    assert ctx.moe_comm_method.buffer is not target.buffer
-                    raise RuntimeError("draft failed")
-            assert ctx.moe_comm_method is target
-        with pytest.raises(RuntimeError, match="load failed"):
-            with comm.isolate_moe_comm_methods():
-                comm._MoECommMethods[kind] = draft
-                raise RuntimeError("load failed")
-        assert comm.get_moe_comm_method(kind) is target
