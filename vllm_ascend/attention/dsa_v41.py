@@ -570,7 +570,13 @@ class DeepseekV41EagerAttentionImpl:
             ].kv_cache[0]
         # A2/A3 SparseFlashMla uses ratio 0 for SWA-only and supports the
         # ratio-1/ratio-2 compressed sparse paths used by this topology.
-        if self.role.compress_ratio in (0, 1, 2):
+        # arch22 has no cmp_topk_length input; -1-padded rows can leave
+        # compacted merge columns uninitialised and produce NaN.
+        has_padded_sparse_row = (
+            compressed_indices is not None
+            and bool((compressed_indices < 0).any().item())
+        )
+        if self.role.compress_ratio in (0, 1, 2) and not has_padded_sparse_row:
             return self._native_attention(
                 attn,
                 q,
