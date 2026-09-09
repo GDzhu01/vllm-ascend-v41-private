@@ -177,6 +177,7 @@ private:
                                            RunInfo extraInfo[SMLA_PRELOAD_TASK_CACHE_SIZE]);
     // ================================Offset Calc=====================================
     __aicore__ inline void GetSparseActualSeqLen();
+    __aicore__ inline int32_t CountValidCmpSparseLen(int32_t maxLen);
     __aicore__ inline void UpdateInnerLoopCond();
     __aicore__ inline void CalcParams(uint32_t loop, uint32_t cmpLoop, uint64_t s2Start, uint32_t s2LoopIdx,
                                       RunInfo &info);
@@ -419,10 +420,42 @@ __aicore__ inline void SparseFlashMlaCsa<SMLAT>::GetSparseActualSeqLen()
         return;
     }
 
-    // 对于cmp部分还有top k, tempLoopInfo.actS2Size只针对cmp
+    // 对于cmp部分还有top k, tempLoopInfo.actS2Size只针对cmp。
+    // 因果可见长度是 q_idx+1，连续 indices（0..q_idx,-1）时有效条数等于该长度；
+    // 出现 sparse gap（如 0..70,88,89,90,-1）时有效条数更少，gather 与计算都按真实有效条数走。
     int32_t thresHold = (tempLoopInfo.cmpMaskRight + tempLoopInfo.s1EndIdx + 1) / constInfo.cmpRatio;
-    tempLoopInfo.actCmpS2Size =
-        Min(tempLoopInfo.actCmpS2Size, Min(constInfo.sparseBlockCount * constInfo.sparseBlockSize, Max(thresHold, 0)));
+    int32_t bound = Min(tempLoopInfo.actCmpS2Size,
+                        Min(constInfo.sparseBlockCount * constInfo.sparseBlockSize, Max(thresHold, 0)));
+    tempLoopInfo.actCmpS2Size = Min(bound, CountValidCmpSparseLen(bound));
+}
+
+template <typename SMLAT>
+__aicore__ inline int32_t SparseFlashMlaCsa<SMLAT>::CountValidCmpSparseLen(int32_t maxLen)
+{
+    if (maxLen <= 0) {
+        return 0;
+    }
+    int64_t base;
+    if constexpr (LAYOUT_T == SMLA_LAYOUT::BSND) {
+        base = (static_cast<int64_t>(tempLoopInfo.bIdx) * constInfo.qSeqSize + tempLoopInfo.s1StartIdx) *
+                   constInfo.kvHeadNum * constInfo.sparseBlockCount +
+               static_cast<int64_t>(tempLoopInfo.n2Idx) * constInfo.sparseBlockCount;
+    } else {
+        base = (static_cast<int64_t>(tempLoopInfo.actualSeqQPrefixSum) + tempLoopInfo.s1StartIdx) *
+                   constInfo.kvHeadNum * constInfo.sparseBlockCount +
+               static_cast<int64_t>(tempLoopInfo.n2Idx) * constInfo.sparseBlockCount;
+    }
+    int32_t lo = 0;
+    int32_t hi = maxLen;
+    while (lo < hi) {
+        int32_t mid = (lo + hi) >> 1;
+        if (topKGm.GetValue(base + mid) < 0) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return lo;
 }
 
 template <typename SMLAT>
