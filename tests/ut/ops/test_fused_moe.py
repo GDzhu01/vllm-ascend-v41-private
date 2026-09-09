@@ -514,6 +514,7 @@ def test_routed_experts_select_experts_validates_router_logits(monkeypatch):
     monkeypatch.setattr(routed_experts_module, "get_forward_context", lambda: SimpleNamespace(input_ids=None))
     monkeypatch.setattr(routed_experts_module, "get_current_vllm_config", lambda: None)
     monkeypatch.setattr(routed_experts_module, "get_moe_num_logical_experts", lambda *args, **kwargs: 3)
+    monkeypatch.setattr(routed_experts_module, "get_ascend_config", lambda: SimpleNamespace(enable_force_eplb=False))
 
     result_weights, result_ids = routed_experts._select_experts(
         hidden_states=hidden_states,
@@ -574,6 +575,7 @@ def test_routing_replay_captures_logical_ids_before_ascend_mapping(monkeypatch):
         "get_moe_num_logical_experts",
         lambda *args, **kwargs: 4,
     )
+    monkeypatch.setattr(routed_experts_module, "get_ascend_config", lambda: SimpleNamespace(enable_force_eplb=False))
     hidden_states = torch.randn(2, 4)
     router_logits = torch.tensor(
         [[0.1, 0.9, 0.2, 0.8], [0.7, 0.2, 0.6, 0.1]],
@@ -606,6 +608,7 @@ def test_routing_replay_disabled_keeps_ascend_routing_unchanged(monkeypatch):
         "get_moe_num_logical_experts",
         lambda *args, **kwargs: 4,
     )
+    monkeypatch.setattr(routed_experts_module, "get_ascend_config", lambda: SimpleNamespace(enable_force_eplb=False))
     hidden_states = torch.randn(2, 4)
     router_logits = torch.tensor(
         [[0.1, 0.9, 0.2, 0.8], [0.7, 0.2, 0.6, 0.1]],
@@ -623,9 +626,10 @@ def test_routing_replay_disabled_keeps_ascend_routing_unchanged(monkeypatch):
     torch.testing.assert_close(physical_ids, log2phy[expected_logical_ids])
 
 
-def test_hash_router_uses_explicit_input_ids(monkeypatch):
+@pytest.mark.parametrize("hidden_dtype", [torch.float16, torch.bfloat16])
+def test_hash_router_preserves_fp32_weights_and_explicit_input_ids(monkeypatch, hidden_dtype):
     input_ids = torch.tensor([11, 22], dtype=torch.int32)
-    hidden_states = torch.randn(2, 4)
+    hidden_states = torch.randn(2, 4, dtype=hidden_dtype)
     router_logits = torch.randn(2, 4)
     topk_weights = torch.randn(2, 2)
     topk_ids = torch.zeros(2, 2, dtype=torch.int32)
@@ -654,14 +658,19 @@ def test_hash_router_uses_explicit_input_ids(monkeypatch):
         tid2eid=torch.ones(32, 4, dtype=torch.int32),
     )
 
-    weights, ids = router._compute_routing(
+    routed_experts = _build_routing_replay_experts(router, None)
+    routed_experts.n_shared_experts = 0
+    monkeypatch.setattr(routed_experts_module, "get_moe_num_logical_experts", lambda *args, **kwargs: 4)
+    monkeypatch.setattr(routed_experts_module, "get_ascend_config", lambda: SimpleNamespace(enable_force_eplb=False))
+    weights, ids = routed_experts._select_experts(
         hidden_states,
         router_logits,
-        torch.int32,
+        enable_force_load_balance=False,
         input_ids=input_ids,
     )
 
     assert weights is topk_weights
+    assert weights.dtype == torch.float32
     assert ids is topk_ids
     torch.testing.assert_close(hash_op.call_args.kwargs["input_ids"], input_ids.to(torch.int64))
     prepare_finalize.all_gather_input_id_with_dp_group.assert_called_once()
@@ -844,13 +853,16 @@ def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_
         "_EXTRA_CTX",
         SimpleNamespace(
             in_profile_run=False,
+            moe_comm_type=MoECommType.MC2,
             moe_comm_method=moe_comm_method,
             eplb_heat_collection_status=False,
         ),
     )
+    monkeypatch.setattr(routed_experts_module, "activate_moe_comm_method", lambda *args: None)
     monkeypatch.setattr(routed_experts_module, "get_forward_context", lambda: SimpleNamespace(all_moe_layers=None))
     monkeypatch.setattr(routed_experts_module, "get_current_vllm_config", lambda: None)
     monkeypatch.setattr(routed_experts_module, "get_moe_num_logical_experts", lambda *args, **kwargs: 3)
+    monkeypatch.setattr(routed_experts_module, "get_ascend_config", lambda: SimpleNamespace(enable_force_eplb=False))
 
     result = routed_experts.forward_impl(
         hidden_states=hidden_states,
