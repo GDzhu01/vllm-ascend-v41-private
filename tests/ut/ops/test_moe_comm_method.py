@@ -82,6 +82,7 @@ class TestMoECommMethod(TestBase):
 
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.AllGatherCommImpl")
     def test_comm_methods_are_cached_by_expert_shape(self, mock_impl):
+        mock_impl.side_effect = lambda _config: MagicMock()
         _MoECommMethods.clear()
         _MoECommMethodsByConfig.clear()
         target = self.moe_config
