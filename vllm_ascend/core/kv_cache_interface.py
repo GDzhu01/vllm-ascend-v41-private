@@ -230,6 +230,7 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
 def register_ascend_kv_cache_specs() -> None:
     from vllm_ascend.core.deepseek_v41 import (
         DeepseekV41CompressorStateSpec,
+        DeepseekV41DraftSWASpec,
         DeepseekV41FullSpec,
         DeepseekV41IndexerSpec,
         DeepseekV41SWASpec,
@@ -244,6 +245,7 @@ def register_ascend_kv_cache_specs() -> None:
         (DeepseekV41FullSpec, FullAttentionManager),
         (DeepseekV41IndexerSpec, FullAttentionManager),
         (DeepseekV41SWASpec, SlidingWindowManager),
+        (DeepseekV41DraftSWASpec, SlidingWindowManager),
         (DeepseekV41CompressorStateSpec, AscendCircularBufferManager),
     ):
         KVCacheSpecRegistry.register(kvcache_spec_cls=spec, manager_class=manager, uniform_type_base_spec=spec)

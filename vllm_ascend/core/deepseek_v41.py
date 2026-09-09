@@ -48,6 +48,23 @@ class DeepseekV41SWASpec(AscendSlidingWindowMLASpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class DeepseekV41DraftSWASpec(AscendSlidingWindowMLASpec):
+    """DSpark SWA owned by G12, aliasing target slots at distinct block IDs."""
+
+    def __post_init__(self):
+        if self.dtype != torch.bfloat16 or self.num_kv_heads != 1 or self.compress_ratio != 1:
+            raise ValueError("Aurora DSpark requires one uncompressed BF16 KV plane")
+
+    def is_uniform_with_collection(self, specs):
+        return all(
+            isinstance(s, DeepseekV41DraftSWASpec)
+            and s.block_size == self.block_size
+            and s.sliding_window == self.sliding_window
+            for s in specs.values()
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
 class DeepseekV41CompressorStateSpec(AscendCircularBufferSpec):
     """One private FP32 KV/score ring page for each active request."""
 
@@ -67,6 +84,7 @@ def is_v41_spec(spec):
             DeepseekV41FullSpec,
             DeepseekV41IndexerSpec,
             DeepseekV41SWASpec,
+            DeepseekV41DraftSWASpec,
             DeepseekV41CompressorStateSpec,
         ),
     )
@@ -109,6 +127,13 @@ def _cache_plane_sizes(spec):
     return (key_bytes,)
 
 
+def _draft_layer_number(name):
+    try:
+        return int(("." + name).rsplit(".mtp.", 1)[1].split(".", 1)[0])
+    except (IndexError, ValueError) as exc:
+        raise ValueError(f"Invalid Aurora DSpark cache resource name: {name}") from exc
+
+
 def plan_cache_slots(specs):
     """Place source KV/index tuples, state and SWA in four shared layer slots.
 
@@ -117,10 +142,15 @@ def plan_cache_slots(specs):
     the same ID at disjoint offsets within its page.
     """
     if not all(is_v41_spec(spec) for spec in specs.values()):
-        raise ValueError("V4.1 mixed draft/foreign cache resources are not supported yet")
+        raise ValueError(
+            "V4.1 requires explicit target or Aurora DSpark cache specs; foreign resources are unsupported"
+        )
     full = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41FullSpec)), key=_layer_number)
     state = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41CompressorStateSpec)), key=_layer_number)
     swa = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41SWASpec)), key=_layer_number)
+    draft = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41DraftSWASpec)), key=_draft_layer_number)
+    if draft and list(map(_draft_layer_number, draft)) != [0, 1, 2]:
+        raise ValueError("Aurora DSpark requires exactly three ordered draft layers: mtp.0, mtp.1, mtp.2")
     if list(map(_layer_number, full)) != [2, 8, 14, 20]:
         raise ValueError("V4.1 requires KV source layers 2, 8, 14, 20")
     if list(map(_layer_number, state)) != [2, 8, 14]:
@@ -147,6 +177,18 @@ def plan_cache_slots(specs):
         kv_bytes = sum(_cache_plane_sizes(kv_spec))
         index_bytes = sum(_cache_plane_sizes(index_spec))
         capacity = max(kv_bytes + index_bytes, *(sum(_cache_plane_sizes(specs[n])) for n in aliases))
+        if slot_idx < len(draft):
+            draft_name = draft[slot_idx]
+            draft_spec = specs[draft_name]
+            swa_spec = specs[swa[slot_idx]]
+            if (
+                draft_spec.block_size != swa_spec.block_size
+                or draft_spec.head_size != swa_spec.head_size
+                or draft_spec.sliding_window != swa_spec.sliding_window
+                or sum(_cache_plane_sizes(draft_spec)) > capacity
+            ):
+                raise ValueError("Aurora DSpark geometry must match target SWA and fit its existing slot")
+            aliases.append(draft_name)
         placements = [
             CachePlacement(kv_name, 0, kv_bytes),
             CachePlacement(index_name, kv_bytes, capacity - kv_bytes),
@@ -175,6 +217,9 @@ def group_cache_specs(specs):
         _uniform({n: padded[n] for n in swa[start : start + len(slots)]}, f"swa{start}")
         for start in range(0, len(swa), len(slots))
     )
+    draft = sorted((n for n, s in padded.items() if isinstance(s, DeepseekV41DraftSWASpec)), key=_draft_layer_number)
+    if draft:
+        groups.append(_uniform({n: padded[n] for n in draft}, "dspark"))
     return groups
 
 
@@ -280,8 +325,21 @@ def validate_cache_runtime(vllm_config):
         raise NotImplementedError("V4.1 currently supports only eager or FULL_DECODE_ONLY graph mode")
     if vllm_config.cache_config.enable_prefix_caching:
         raise NotImplementedError("V4.1 prefix state restoration is not implemented")
-    if vllm_config.speculative_config is not None or vllm_config.kv_transfer_config is not None:
-        raise NotImplementedError("V4.1 speculative decoding and KV transfer are not implemented")
+    speculative = vllm_config.speculative_config
+    if speculative is not None:
+        use_dspark = getattr(speculative, "use_dspark", None)
+        if not callable(use_dspark) or not use_dspark():
+            raise NotImplementedError("Aurora supports only DSpark speculative decoding")
+        # Verification writes the anchor and up to S speculative rows. After
+        # rejection, the earliest needed residual is the verified anchor.
+        # It must survive the final 32-row write: S must be strictly below 32.
+        if not 0 < speculative.num_speculative_tokens < STATE_RING_ROWS:
+            raise ValueError("Aurora DSpark requires 1..31 speculative tokens to preserve FP32 ring residuals")
+        per_batch = getattr(speculative, "num_speculative_tokens_per_batch_size", None) or ()
+        if any(not 0 <= count <= speculative.num_speculative_tokens for _, _, count in per_batch):
+            raise ValueError("Aurora DSpark per-batch speculation must stay within the configured ring-safe maximum")
+    if vllm_config.kv_transfer_config is not None:
+        raise NotImplementedError("V4.1 KV transfer is not implemented")
     parallel = vllm_config.parallel_config
     if any(
         getattr(parallel, name, 1) != 1
@@ -296,3 +354,7 @@ def validate_cache_runtime(vllm_config):
         raise ValueError("V4.1 requires the hybrid KV cache manager")
     if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16"):
         raise NotImplementedError("V4.1 initial cache layout requires BF16")
+    if speculative is not None:
+        # Aurora's planes are always BF16. Pin the inherited DSV4 draft
+        # backend to the same layout, including on hardware where auto is FP8.
+        vllm_config.cache_config.cache_dtype = "bfloat16"

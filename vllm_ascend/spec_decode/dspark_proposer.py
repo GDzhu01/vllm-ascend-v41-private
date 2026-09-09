@@ -36,7 +36,9 @@ class AscendDSparkProposer(AscendDflashProposer):
     ):
         super().__init__(vllm_config, device, runner=runner)
         assert vllm_config.speculative_config is not None
-        self.sample_from_anchor = getattr(self.draft_model_config.hf_config, "sample_from_anchor", True)
+        hf_config = self.draft_model_config.hf_config
+        hf_config = getattr(hf_config, "text_config", hf_config)
+        self.sample_from_anchor = getattr(hf_config, "sample_from_anchor", True)
         if self.sample_from_anchor:
             self.num_query_per_req = self.num_speculative_tokens
         else:

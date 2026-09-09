@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 import torch_npu  # noqa: F401
 
+from tests.deepseek_v41_reference import hc_post_reference
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41DecoderLayer
 
 HC_MULT = 4
@@ -63,9 +64,7 @@ def test_v41_hc_pre_handoff_5120_on_npu():
             rtol=5e-3,
         )
 
-    expected_post = _layer().hc_post_reference(
-        expected[0], x, expected[1], expected[2]
-    )
+    expected_post = hc_post_reference(expected[0], x, expected[1], expected[2])
     actual_post = _layer().hc_post(actual[0], x.npu(), actual[1], actual[2])
     torch.testing.assert_close(
         actual_post.cpu().float(), expected_post.float(), atol=2e-2, rtol=2e-2

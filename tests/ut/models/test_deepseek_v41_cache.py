@@ -6,24 +6,30 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch_npu
 from vllm.config import CUDAGraphMode
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
-from tests.deepseek_v41_cache_utils import allocate_cache_views
+from tests.deepseek_v41_cache_utils import allocate_cache_views, make_cache_config
+from tests.deepseek_v41_reference import (
+    build_v41_cache_specs,
+    compressor_ratio2_reference,
+    gather_cache_rows,
+    scatter_cache,
+    select_candidate_blocks,
+    select_index_topk,
+)
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
     DeepseekV41EagerAttentionImpl,
     DeepseekV41MetadataBuilder,
     compressed_slot_mapping,
-    gather_cache_rows,
     pad_sparse_indices,
-    scatter_cache,
     scatter_cache_v2,
-    select_candidate_blocks,
-    select_index_topk,
 )
 from vllm_ascend.core.deepseek_v41 import (
+    DeepseekV41DraftSWASpec,
     DeepseekV41FullSpec,
     DeepseekV41IndexerSpec,
     DeepseekV41SWASpec,
@@ -37,7 +43,17 @@ from vllm_ascend.core.deepseek_v41 import (
     reshape_cache,
 )
 from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
-from vllm_ascend.models.deepseek_v41.model import build_layer_plan, build_v41_cache_specs
+from vllm_ascend.models.deepseek_v41.model import build_layer_plan
+
+
+@pytest.fixture(autouse=True)
+def mock_npu_rms_norm(monkeypatch):
+    # Keep cache/state tests on CPU; operator accuracy is covered on NPU.
+    def rms_norm(x, gamma, epsilon=1e-6):
+        rstd = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + epsilon)
+        return (x.float() * rstd).to(x.dtype) * gamma, rstd
+
+    monkeypatch.setattr(torch_npu, "npu_rms_norm", rms_norm)
 
 
 @pytest.fixture
@@ -341,6 +357,92 @@ def test_full_decode_only_runtime_is_supported(runtime):
     validate_cache_runtime(runtime)
 
 
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY])
+@pytest.mark.parametrize("count", [1, 15, 31])
+def test_dspark_runtime_preserves_ring_retention_limit(runtime, mode, count):
+    from vllm_ascend.core.deepseek_v41 import validate_cache_runtime
+
+    runtime.speculative_config = SimpleNamespace(use_dspark=lambda: True, num_speculative_tokens=count)
+    runtime.compilation_config.cudagraph_mode = mode
+    validate_cache_runtime(runtime)
+    assert runtime.cache_config.cache_dtype == "bfloat16"
+
+
+@pytest.mark.parametrize("count", [0, 32, 63])
+def test_dspark_rejects_verification_tail_that_cannot_fit_ring(runtime, count):
+    from vllm_ascend.core.deepseek_v41 import validate_cache_runtime
+
+    runtime.speculative_config = SimpleNamespace(use_dspark=lambda: True, num_speculative_tokens=count)
+    with pytest.raises(ValueError, match="1..31"):
+        validate_cache_runtime(runtime)
+
+
+def test_dspark_is_one_additional_group_in_existing_slots(runtime):
+    runtime.model_config.max_model_len = 4096
+    runtime.max_in_flight_tokens = 256
+    target = make_cache_config(17)
+    draft = make_cache_config(17, draft_layers=3)
+    groups = draft.kv_cache_groups
+    assert len(groups) == 13 and sum(len(g.layer_names) for g in groups) == 54
+    assert groups[:12] == target.kv_cache_groups
+    assert groups[12].layer_names == [f"mtp.{i}.self_attn.swa_cache" for i in range(3)]
+    assert all(isinstance(s, DeepseekV41DraftSWASpec) for s in groups[12].kv_cache_spec.kv_cache_specs.values())
+    assert len(draft.kv_cache_tensors) == 4
+    assert [t.size for t in draft.kv_cache_tensors] == [t.size for t in target.kv_cache_tensors]
+    assert pool_bytes_per_block(groups) == 540928
+    added = request_blocks(runtime, groups) - request_blocks(runtime, target.kv_cache_groups)
+    spec = next(iter(groups[12].kv_cache_spec.kv_cache_specs.values()))
+    assert added == (spec.max_memory_usage_bytes(runtime) + spec.page_size_bytes - 1) // spec.page_size_bytes
+    padded = {n: s for g in groups for n, s in g.kv_cache_spec.kv_cache_specs.items()}
+    assert plan_cache_slots(padded) == plan_cache_slots(dict(reversed(list(padded.items()))))
+    backings, views = allocate_cache_views(draft)
+    assert sum(b.numel() for b in backings) == 17 * 540928
+    for stage in range(3):
+        name = f"mtp.{stage}.self_attn.swa_cache"
+        assert name in draft.kv_cache_tensors[stage].shared_by
+        assert views[name].data_ptr() == backings[stage].data_ptr()
+        assert views[name].shape == (17, 128, 1, 512)
+        assert views[name].stride() == (65536, 512, 512, 1)
+
+
+def test_dspark_slots_isolate_groups_and_reuse_released_ids():
+    cfg = make_cache_config(17, draft_layers=3)
+    _, views = allocate_cache_views(cfg)
+    # Each group owns a different live global ID, including the draft group.
+    for gid, group in enumerate(cfg.kv_cache_groups):
+        for name in group.layer_names:
+            planes = views[name] if isinstance(views[name], tuple) else (views[name],)
+            for plane in planes:
+                plane[gid + 1].fill_(gid + 1)
+    for gid, group in enumerate(cfg.kv_cache_groups):
+        for name in group.layer_names:
+            planes = views[name] if isinstance(views[name], tuple) else (views[name],)
+            for plane in planes:
+                assert (plane[gid + 1] == gid + 1).all()
+                assert (plane[0] == 0).all()
+    # After target G0 releases ID 1, G12 may use it without touching live IDs.
+    for stage in range(3):
+        view = views[f"mtp.{stage}.self_attn.swa_cache"]
+        view[1].fill_(7)
+        assert (view[13] == 13).all()
+        assert (view[0] == 0).all()
+
+
+@pytest.mark.parametrize("change", [{"head_size": 1024}, {"block_size": 256}, {"sliding_window": 256}])
+def test_dspark_geometry_cannot_expand_existing_slots(change):
+    cfg = make_cache_config(3, draft_layers=3)
+    specs = {n: s for g in cfg.kv_cache_groups for n, s in g.kv_cache_spec.kv_cache_specs.items()}
+    specs["mtp.0.self_attn.swa_cache"] = replace(specs["mtp.0.self_attn.swa_cache"], **change)
+    with pytest.raises(ValueError, match="geometry"):
+        plan_cache_slots(specs)
+
+
+@pytest.mark.parametrize("count", [1, 2, 4])
+def test_dspark_requires_three_slot_owners(count):
+    with pytest.raises(ValueError, match="three ordered"):
+        make_cache_config(3, draft_layers=count)
+
+
 @pytest.mark.parametrize("full_graph_mode", [False, True])
 def test_c2_builder_keeps_fixed_rows_for_mixed_parity_and_padding(config, runtime, full_graph_mode):
     spec = collect_specs(runtime)["model.layers.2.self_attn.compressor.state_cache"]
@@ -456,7 +558,6 @@ def test_supported_ratios_route_to_native_sparse_flash_mla(monkeypatch, compress
 
     actual = impl._attention(
         SimpleNamespace(),
-        object(),
         object(),
         SimpleNamespace(swa=object(), attention=object()),
         object() if compress_ratio else None,
@@ -712,7 +813,7 @@ def test_compressor_chunk_boundary_matches_vector_reference(config, chunks):
     actual = []
     start = 0
     for size in chunks:
-        actual.append(compressor(x[start : start + size], start, state, block_table))
+        actual.append(compressor_ratio2_reference(compressor, x[start : start + size], start, state, block_table))
         start += size
     torch.testing.assert_close(torch.cat(actual), expected)
     torch.testing.assert_close(state[4, 6, :8], compressor.wkv(x[-1:].float())[0])
@@ -839,7 +940,13 @@ def test_compressor_rejects_missing_previous_state_page(config):
     compressor = DeepseekV41Compressor(config, 2)
     state = torch.full((3, 32, 16), float("nan"), dtype=torch.float32)
     with pytest.raises(ValueError, match="absent/null"):
-        compressor(torch.zeros(1, 16, dtype=torch.bfloat16), 1, state, [0])
+        compressor_ratio2_reference(
+            compressor,
+            torch.zeros(1, 16, dtype=torch.bfloat16),
+            1,
+            state,
+            [0],
+        )
 
 
 @torch.inference_mode()
@@ -847,9 +954,9 @@ def test_state_page_reuse_does_not_require_request_reset(config):
     compressor = DeepseekV41Compressor(config, 2)
     state = torch.full((3, 32, 16), float("nan"), dtype=torch.float32)
     x = torch.randn(2, 16, dtype=torch.bfloat16)
-    expected = compressor(x, 0, state, [1]).clone()
+    expected = compressor_ratio2_reference(compressor, x, 0, state, [1]).clone()
     state[1].fill_(12345)
-    actual = compressor(x, 0, state, [1])
+    actual = compressor_ratio2_reference(compressor, x, 0, state, [1])
     torch.testing.assert_close(actual, expected)
 
 
@@ -876,10 +983,10 @@ def test_interleaved_request_state_isolation(config):
     state = torch.full((3, 32, 16), float("nan"), dtype=torch.float32)
     first = torch.randn(2, 16, dtype=torch.bfloat16)
     second = torch.randn(2, 16, dtype=torch.bfloat16)
-    compressor(first[:1], 0, state, [1])
+    compressor_ratio2_reference(compressor, first[:1], 0, state, [1])
     saved = state[1, 0].clone()
-    compressor(second, 0, state, [2])
+    compressor_ratio2_reference(compressor, second, 0, state, [2])
     torch.testing.assert_close(state[1, 0], saved)
-    actual = compressor(first[1:], 1, state, [1])
-    expected = compressor(first, 0, state, [1])
+    actual = compressor_ratio2_reference(compressor, first[1:], 1, state, [1])
+    expected = compressor_ratio2_reference(compressor, first, 0, state, [1])
     torch.testing.assert_close(actual, expected)

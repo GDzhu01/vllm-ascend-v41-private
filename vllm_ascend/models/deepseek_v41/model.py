@@ -15,10 +15,7 @@ from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41EagerAttentionImpl,
 )
 from vllm_ascend.core.deepseek_v41 import (
-    STATE_RING_ROWS,
-    DeepseekV41CompressorStateSpec,
     DeepseekV41FullSpec,
-    DeepseekV41IndexerSpec,
     DeepseekV41SWASpec,
     validate_cache_runtime,
 )
@@ -190,53 +187,6 @@ def build_layer_plan(config: Any) -> DeepseekV41Topology:
     )
 
 
-def build_v41_cache_specs(config: Any, vllm_config: Any, prefix: str = "model"):
-    """Describe the source-shared V4.1 cache graph without building the model."""
-    config = text_config_of(config)
-    block_size = vllm_config.cache_config.block_size
-    if block_size <= 0 or block_size % 2:
-        raise ValueError("V4.1 logical block_size must be a positive multiple of two")
-    width = _read(config, "head_dim")
-    index_width = _read(config, "index_head_dim")
-    window = _read(config, "sliding_window")
-    specs = {}
-    for role in build_layer_plan(config).layers:
-        attn_prefix = f"{prefix}.layers.{role.layer_idx}.self_attn"
-        specs[f"{attn_prefix}.swa_cache"] = DeepseekV41SWASpec(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=width,
-            dtype=torch.bfloat16,
-            sliding_window=window,
-        )
-        if not role.is_kv_source:
-            continue
-        specs[f"{attn_prefix}.long_kv_cache"] = DeepseekV41FullSpec(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=width,
-            dtype=torch.bfloat16,
-            compress_ratio=role.compress_ratio,
-        )
-        specs[f"{attn_prefix}.indexer.k_cache"] = DeepseekV41IndexerSpec(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=index_width,
-            dtype=torch.int8,
-            compress_ratio=role.compress_ratio,
-            scale_dim=1,
-            scale_dtype=torch.float16,
-        )
-        if role.compress_ratio == 2:
-            specs[f"{attn_prefix}.compressor.state_cache"] = DeepseekV41CompressorStateSpec(
-                block_size=STATE_RING_ROWS,
-                num_kv_heads=1,
-                head_size=2 * width,
-                dtype=torch.float32,
-            )
-    return specs
-
-
 class AscendDeepseekV41SWACache(AscendDeepseekV4SWACache):
     """V4 execution-compatible SWA plane participating in V4.1 grouping."""
 
@@ -258,13 +208,7 @@ class AscendDeepseekV41SWACache(AscendDeepseekV4SWACache):
 
 
 class DeepseekV41Attention(DeepseekV4Attention):
-    """V4 small-op attention plus V4.1 source-owned cache resources.
-
-    The first eager milestone deliberately executes the proven V4 SWA small-op
-    path.  Long KV/index planes are nevertheless allocated only at source
-    layers, so consumers can subsequently reuse them without changing the
-    framework-side hybrid grouping contract.
-    """
+    """V4 projections plus V4.1 source-owned cache and fused DSA execution."""
 
     swa_cache_cls = AscendDeepseekV41SWACache
 
@@ -393,23 +337,6 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
 
     attention_cls = DeepseekV41Attention
 
-    def hc_mixes(self, x, hc_fn, hc_scale, hc_base):
-        x_float = x.float()
-        flat = x_float.flatten(-2)
-        mixes = torch.nn.functional.linear(flat, hc_fn)
-        mixes *= torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
-        pre, post, comb = mixes.split([self.hc_mult, self.hc_mult, self.hc_mult * self.hc_mult], -1)
-        pre = torch.sigmoid(pre * hc_scale[0] + hc_base[: self.hc_mult]) + self.hc_eps
-        post = 2 * torch.sigmoid(post * hc_scale[1] + hc_base[self.hc_mult : 2 * self.hc_mult])
-        comb = comb.unflatten(-1, (self.hc_mult, self.hc_mult))
-        comb = comb * hc_scale[2] + hc_base[2 * self.hc_mult :].view(self.hc_mult, self.hc_mult)
-        comb = comb.softmax(-1) + self.hc_eps
-        comb = comb / (comb.sum(-2, keepdim=True) + self.hc_eps)
-        for _ in range(self.hc_sinkhorn_iters - 1):
-            comb = comb / (comb.sum(-1, keepdim=True) + self.hc_eps)
-            comb = comb / (comb.sum(-2, keepdim=True) + self.hc_eps)
-        return pre, post, comb
-
     @staticmethod
     def hc_collapse(x, pre_mix):
         return (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
@@ -426,12 +353,6 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
             norm_eps=self.norm_eps,
             hc_eps=self.hc_eps,
         )
-
-    @staticmethod
-    def hc_post_reference(x, residual, post, comb):
-        y = post.unsqueeze(-1) * x.unsqueeze(-2)
-        y += (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(-3)
-        return y.to(x.dtype)
 
     def hc_post(self, x, residual, post, comb):
         return torch.ops._C_ascend.npu_hc_post(
@@ -511,12 +432,20 @@ class DeepseekV41Model(DeepseekV4Model):
         pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
         pre_mix[:, 0] = 1.0
         last_layer = None
+        aux_hidden_states = []
         for layer in self.layers:
             last_layer = layer
+            # DSpark consumes the residual stream entering its configured
+            # target layers. The runner expresses checkpoint IDs as one-based.
+            if layer.layer_idx + 1 in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states.mean(dim=1))
             hidden_states, pre_mix = layer(positions, hidden_states, pre_mix, None, input_ids=input_ids)
         assert last_layer is not None
         hidden_states = last_layer.hc_collapse(hidden_states, pre_mix)
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):

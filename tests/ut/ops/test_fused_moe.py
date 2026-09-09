@@ -648,6 +648,58 @@ def test_hash_router_uses_explicit_input_ids(monkeypatch):
         router._compute_routing(hidden_states, router_logits, torch.int32)
 
 
+def test_vision_router_fuses_bias_and_image_sentinel(monkeypatch):
+    input_ids = torch.tensor([11, 129259], dtype=torch.int32)
+    hidden_states = torch.randn(2, 4)
+    router_logits = torch.randn(2, 4, dtype=torch.float32)
+    text_bias = torch.randn(4, dtype=torch.float32)
+    bias_vl = torch.randn(4, dtype=torch.bfloat16)
+    topk_weights = torch.randn(2, 2)
+    topk_ids = torch.zeros(2, 2, dtype=torch.int32)
+    prepare_finalize = SimpleNamespace(all_gather_input_id_with_dp_group=MagicMock(side_effect=lambda value: value))
+    monkeypatch.setattr(
+        fused_topk_router_module,
+        "_EXTRA_CTX",
+        SimpleNamespace(
+            moe_comm_type=MoECommType.ALLGATHER,
+            moe_comm_method=SimpleNamespace(prepare_finalize=prepare_finalize),
+        ),
+    )
+    hash_op = MagicMock(return_value=(topk_weights, topk_ids, None))
+    monkeypatch.setattr(
+        fused_topk_router_module.torch.ops._C_ascend,
+        "moe_gating_top_k_hash",
+        hash_op,
+        raising=False,
+    )
+    router = AscendFusedTopKRouter(
+        top_k=2,
+        global_num_experts=4,
+        num_expert_group=1,
+        topk_group=1,
+        scoring_func="sqrtsoftplus",
+        e_score_correction_bias=text_bias,
+        bias_vl=bias_vl,
+        image_sentinel_lo=129257,
+    )
+
+    weights, ids = router._compute_routing(
+        hidden_states,
+        router_logits,
+        torch.int64,
+        input_ids=input_ids,
+    )
+
+    kwargs = hash_op.call_args.kwargs
+    assert weights is topk_weights
+    assert ids.dtype == torch.int64
+    assert kwargs["bias"] is text_bias
+    assert kwargs["bias_vl"].dtype == router_logits.dtype
+    torch.testing.assert_close(kwargs["input_ids"], input_ids.to(torch.int64))
+    assert kwargs["image_sentinel_lo"] == 129257
+    assert kwargs["image_sentinel_count"] == 5
+
+
 def test_hash_router_chunks_unaligned_input_ids_for_sequence_parallel(monkeypatch):
     input_ids = torch.tensor([11, 22, 33, 44], dtype=torch.int32)
     hidden_states = torch.randn(2, 4)

@@ -30,10 +30,15 @@ class Resource:
     scale_dim: int = 0
     scale_dtype: ItemSize = ItemSize(2)
     page_size_padded: int | None = None
+    sliding_window: int = 128
 
     @property
     def storage_block_size(self):
         return self.block_size // self.compress_ratio
+
+    @property
+    def page_size_bytes(self):
+        return self.page_size_padded or sum(planes(self))
 
 
 class Full(Resource):
@@ -52,15 +57,50 @@ class SWA(Resource):
     pass
 
 
+class Draft(Resource):
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class Uniform:
+    kv_cache_specs: dict
+
+    @classmethod
+    def from_specs(cls, specs):
+        return cls(specs)
+
+
 symbols = {
     "dataclass": dataclasses.dataclass,
     "DeepseekV41FullSpec": Full,
     "DeepseekV41IndexerSpec": Index,
     "DeepseekV41CompressorStateSpec": State,
     "DeepseekV41SWASpec": SWA,
-    "is_v41_spec": lambda s: isinstance(s, (Full, Index, State, SWA)),
+    "DeepseekV41DraftSWASpec": Draft,
+    "is_v41_spec": lambda s: isinstance(s, (Full, Index, State, SWA, Draft)),
+    "replace": dataclasses.replace,
+    "UniformTypeKVCacheSpecs": Uniform,
+    "KVCacheGroupSpec": lambda **kw: SimpleNamespace(**kw),
+    "KVCacheTensor": lambda **kw: SimpleNamespace(**kw),
+    "may_override_num_blocks": lambda cfg, count: cfg.override if cfg.override is not None else count,
+    "STATE_RING_ROWS": 32,
+    "CUDAGraphMode": SimpleNamespace(NONE="none", FULL="full", FULL_DECODE_ONLY="decode"),
 }
-names = {"CachePlacement", "CacheSlot", "_layer_number", "_cache_plane_sizes", "plan_cache_slots"}
+names = {
+    "CachePlacement",
+    "CacheSlot",
+    "_layer_number",
+    "_draft_layer_number",
+    "_cache_plane_sizes",
+    "plan_cache_slots",
+    "_uniform",
+    "group_cache_specs",
+    "make_cache_groups",
+    "cache_slots_from_groups",
+    "pool_bytes_per_block",
+    "allocate_cache_config",
+    "validate_cache_runtime",
+}
 module = ast.parse(SOURCE.read_text())
 selected = ast.Module(
     body=[node for node in module.body if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names],
@@ -168,6 +208,94 @@ print(
         indent=2,
     )
 )
+
+# Execute the actual grouping and allocator for the optional G12 overlay.
+draft_specs = dict(specs)
+for stage in range(3):
+    draft_specs[f"mtp.{stage}.self_attn.swa_cache"] = Draft(128, 512, ItemSize(2))
+draft_slots = plan(draft_specs)
+assert len(draft_slots) == 4 and sum(s.page_size_bytes for s in draft_slots) == 540928
+assert [len(s.placements) for s in draft_slots] == [14, 14, 14, 12]
+target_groups = symbols["make_cache_groups"](symbols["group_cache_specs"](specs))
+draft_groups = symbols["make_cache_groups"](symbols["group_cache_specs"](draft_specs))
+assert len(draft_groups) == 13 and sum(len(g.layer_names) for g in draft_groups) == 54
+assert draft_groups[:12] == target_groups
+assert draft_groups[12].layer_names == [f"mtp.{i}.self_attn.swa_cache" for i in range(3)]
+draft_padded = {n: s for g in draft_groups for n, s in g.kv_cache_spec.kv_cache_specs.items()}
+assert plan(draft_padded) == plan(dict(reversed(list(draft_padded.items())))) == draft_slots
+for override in (None, 5):
+    count, allocations = symbols["allocate_cache_config"](SimpleNamespace(override=override), draft_groups, 17 * 540928)
+    assert count == (17 if override is None else override)
+    assert len(allocations) == 4 and sum(a.size for a in allocations) == count * 540928
+    for stage in range(3):
+        assert f"mtp.{stage}.self_attn.swa_cache" in allocations[stage].shared_by
+    # Mirrors upstream rank-capacity shrinking without changing offsets/stride.
+    for allocation, slot in zip(allocations, draft_slots):
+        assert allocation.size // count * 3 == 3 * slot.page_size_bytes
+for override in (1, 18):
+    try:
+        symbols["allocate_cache_config"](SimpleNamespace(override=override), draft_groups, 17 * 540928)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Unsafe block override accepted")
+draft_intervals = list(intervals)
+for stage in range(3):
+    # G12 owns ID 13, independent of all target group IDs 1..12.
+    begin = bases[stage] + 13 * draft_slots[stage].page_size_bytes
+    end = begin + sum(planes(draft_specs[f"mtp.{stage}.self_attn.swa_cache"]))
+    assert all(end <= lo or hi <= begin for lo, hi, _ in draft_intervals)
+    draft_intervals.append((begin, end, f"mtp.{stage}"))
+assert len(draft_intervals) == 58
+print("PASS: DSpark has 13 groups, 54 specs, four buffers, 540928 bytes/ID and 58 disjoint payload planes.")
+
+# A verifier writes anchor P and S speculative input rows. After A acceptances
+# the next forward starts at P+A+1. Its previous row must survive if that start
+# is odd. Test every acceptance count, including complete rejection.
+rollback_cases = 0
+for start in (0, 1, 15, 16, 17, 31, 32, 33, 127, 128, 129):
+    for proposed in range(1, 32):
+        ring = {p % 32: p for p in range(max(0, start - 32), start)}
+        end = start + proposed + 1
+        for p in range(max(start, end - 32), end):
+            ring[p % 32] = p
+        for accepted in range(proposed + 1):
+            next_start = start + accepted + 1
+            if next_start % 2:
+                assert ring[(next_start - 1) % 32] == next_start - 1
+            rollback_cases += 1
+# S=32 can overwrite the anchor needed after complete rejection.
+unsafe = {p % 32: p for p in range(1, 33)}
+assert unsafe[0] != 0
+print(f"PASS: {rollback_cases} speculative rejection cases; S=32 is correctly outside the safe bound.")
+
+for mode in ("none", "decode"):
+    for proposed in (1, 15, 31, 32):
+        config = SimpleNamespace(
+            use_v2_model_runner=False,
+            model_config=SimpleNamespace(enforce_eager=mode == "none"),
+            compilation_config=SimpleNamespace(cudagraph_mode=mode),
+            cache_config=SimpleNamespace(enable_prefix_caching=False, cache_dtype="auto"),
+            scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+            parallel_config=SimpleNamespace(),
+            kv_transfer_config=None,
+            speculative_config=SimpleNamespace(use_dspark=lambda: True, num_speculative_tokens=proposed),
+        )
+        try:
+            symbols["validate_cache_runtime"](config)
+        except ValueError:
+            assert proposed == 32
+        else:
+            assert proposed < 32 and config.cache_config.cache_dtype == "bfloat16"
+config.speculative_config.num_speculative_tokens = 31
+config.speculative_config.num_speculative_tokens_per_batch_size = [(1, 8, 32)]
+try:
+    symbols["validate_cache_runtime"](config)
+except ValueError:
+    pass
+else:
+    raise AssertionError("Per-batch draft length escaped the ring retention limit")
+print("PASS: actual runtime guards enforce the retention bound and BF16 draft backend in both target modes.")
 
 # Model the read-before-write schedule with token identities, including ring wraps.
 cases = 0
