@@ -708,6 +708,10 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if not get_ascend_config().enable_engram:
+            return super().load_weights(
+                (name, tensor) for name, tensor in weights if ".engram." not in name
+            )
         engram_loaded = set()
 
         def milestone_weights() -> Iterator[tuple[str, torch.Tensor]]:
