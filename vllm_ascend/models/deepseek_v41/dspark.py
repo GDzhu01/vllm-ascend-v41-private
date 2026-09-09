@@ -42,6 +42,8 @@ class DeepseekV41DSparkAttention(DeepseekV4Attention):
         super().__init__(*args, **kwargs)
         if self.compress_ratio != 0:
             raise ValueError("Aurora DSpark supports only uncompressed draft SWA layers")
+        # V4.1 applies Q LoRA RMSNorm only, without a second per-head Q norm.
+        self.dsa_attn.dsa_attn.impl.apply_q_norm = False
 
 
 class DeepseekV41DSparkDecoderLayer(DeepseekV41DecoderLayer):

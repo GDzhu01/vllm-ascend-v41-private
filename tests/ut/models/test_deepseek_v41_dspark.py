@@ -82,3 +82,20 @@ def test_target_exports_residual_entering_selected_layers(monkeypatch):
     torch.testing.assert_close(aux[0], hidden)
     torch.testing.assert_close(aux[1], hidden + 3)
     torch.testing.assert_close(output, hidden + 6)
+
+
+def test_v41_draft_disables_only_its_backend_post_projection_q_norm():
+    from vllm_ascend.models.deepseek_v4.model import DeepseekV4Attention
+
+    ordinary_backend = SimpleNamespace(apply_q_norm=True)
+    draft_backend = SimpleNamespace(apply_q_norm=True)
+
+    def initialize_base(instance, **kwargs):
+        torch.nn.Module.__init__(instance)
+        instance.compress_ratio = 0
+        instance.dsa_attn = SimpleNamespace(dsa_attn=SimpleNamespace(impl=draft_backend))
+
+    with patch.object(DeepseekV4Attention, "__init__", initialize_base):
+        draft = DeepseekV41DSparkAttention()
+    assert draft.dsa_attn.dsa_attn.impl.apply_q_norm is False
+    assert ordinary_backend.apply_q_norm is True
