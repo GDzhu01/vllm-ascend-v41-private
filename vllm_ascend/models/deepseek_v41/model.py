@@ -457,12 +457,13 @@ class DeepseekV41Model(DeepseekV4Model):
         for layer in self.layers:
             if isinstance(layer, DeepseekV41DecoderLayer):
                 layer.self_attn.shared_state = self.shared_attention_state
-        self.engram_root = vllm_config.model_config.model
         config = self.config
         # Target storage is a loader/runtime choice.  Checkpoint metadata is
         # used only by load_checkpoint to validate the source representation.
         # Read the storage choice after AscendConfig validation.
         ascend_config = get_ascend_config()
+        self.engram_root = vllm_config.model_config.model
+        self.engram_weight_root = ascend_config.engram_model_path or self.engram_root
         storage_format = ascend_config.engram_storage
         if ascend_config.enable_engram:
             query_group = EngramQueryGroup.from_vllm(vllm_config.parallel_config)
@@ -472,6 +473,7 @@ class DeepseekV41Model(DeepseekV4Model):
                     config.engram_head_dim,
                     query_group,
                     storage_format=storage_format,
+                    cpu_offload=ascend_config.enable_engram_ple_offload,
                 )
         self.engram_history = None
         self._engram_input_buffers = None
@@ -661,13 +663,15 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
                 if ".engram." in name:
                     # Bypass V4's generic embed -> embed_tokens remapping and TP loader.
                     local_name = name.removeprefix("model.")
-                    # FP8/MXFP8 Engram scales are consumed by the CPU loader.
+                    # Compressed Engram scales are consumed by the shard loader.
                     if local_name.endswith(".engram.embed.scale"):
                         continue
                     parameter_name = "model." + local_name
                     if local_name.endswith(".engram.embed.weight"):
                         layer_id = int(local_name.split(".")[1])
-                        self.model.layers[layer_id].engram.embed.load_checkpoint(self.model.engram_root, local_name)
+                        self.model.layers[layer_id].engram.embed.load_checkpoint(
+                            self.model.engram_weight_root, local_name
+                        )
                     else:
                         param = self.get_parameter(parameter_name)
                         if tensor.dtype != torch.bfloat16 or tensor.shape != param.shape:
