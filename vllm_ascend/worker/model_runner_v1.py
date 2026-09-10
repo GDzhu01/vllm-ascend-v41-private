@@ -3400,6 +3400,7 @@ class NPUModelRunner(GPUModelRunner):
             common_attn_metadata: CommonAttentionMetadata,
             common_ratio_to_sas_metadata: dict,
             common_v41_metadata: dict,
+            common_v41_batch_metadata: dict,
             ubid: int | None = None,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
@@ -3468,6 +3469,7 @@ class NPUModelRunner(GPUModelRunner):
                     num_actual_reqs=num_reqs,
                     skip_ring_state_update=skip_gdn_state_update,
                     common_v41_metadata=common_v41_metadata,
+                    common_v41_batch_metadata=common_v41_batch_metadata,
                     full_graph_mode=cudagraph_runtime_mode == CUDAGraphMode.FULL,
                 )
             if (for_cudagraph_capture
@@ -3509,6 +3511,7 @@ class NPUModelRunner(GPUModelRunner):
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
+        common_v41_batch_metadata: dict[str, Any] = {}
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             # V4.1 cache coordinates are shared only inside one framework KV
@@ -3562,6 +3565,7 @@ class NPUModelRunner(GPUModelRunner):
                     cm,
                     common_ratio_to_sas_metadata,
                     common_v41_metadata,
+                    common_v41_batch_metadata,
                 )
         if req_doc_ranges is not None:
             if isinstance(attn_metadata, list):

@@ -3,6 +3,7 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -20,6 +21,7 @@ from tests.deepseek_v41_reference import (
     select_candidate_blocks,
     select_index_topk,
 )
+from vllm_ascend.attention import dsa_v41
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
     DeepseekV41EagerAttentionImpl,
@@ -44,6 +46,7 @@ from vllm_ascend.core.deepseek_v41 import (
 )
 from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
 from vllm_ascend.models.deepseek_v41.model import build_layer_plan
+from vllm_ascend.worker.device_metadata import DeviceMetadataStage
 
 
 @pytest.fixture(autouse=True)
@@ -658,6 +661,7 @@ def test_state_metadata_disables_ordinary_token_slots(config, runtime):
     slots = torch.tensor([7 * 16 + 15, 3 * 16, -1])
     common = SimpleNamespace(
         slot_mapping=slots,
+        positions=None,
         block_table_tensor=torch.tensor([[7, 3]]),
         query_start_loc=torch.tensor([0, 2]),
         query_start_loc_cpu=torch.tensor([0, 2]),
@@ -677,11 +681,9 @@ def test_state_metadata_disables_ordinary_token_slots(config, runtime):
     assert metadata.storage_block_size == 32
     assert metadata.max_query_len == 2
     assert metadata.max_seq_len == 17
-    assert metadata.start_pos.tolist() == [15]
+    assert metadata.query_start_loc.tolist() == [0, 2]
     assert metadata.cache_seq_lens.tolist() == [17]
-    assert metadata.cache_query_lens.tolist() == [2]
-    assert metadata.cache_query_start_loc.tolist() == [0, 2]
-    assert metadata.num_cache_tokens == 2
+    assert metadata.cache_seq_lens is metadata.seq_lens
     assert metadata.num_prefills == 1
     assert metadata.num_prefill_tokens == 2
 
@@ -765,13 +767,9 @@ def test_compressed_metadata_exposes_original_and_cache_coordinates(config, runt
     )
     metadata = builder.build(0, common)
     assert metadata.seq_lens.tolist() == [4, 3]
-    assert metadata.query_lens.tolist() == [3, 2]
-    assert metadata.start_pos.tolist() == [1, 1]
+    assert metadata.query_start_loc.tolist() == [0, 3, 5]
     assert metadata.cache_seq_lens.tolist() == [2, 1]
-    assert metadata.cache_start_pos.tolist() == [0, 0]
-    assert metadata.cache_query_lens.tolist() == [2, 1]
-    assert metadata.cache_query_start_loc.tolist() == [0, 2, 3]
-    assert metadata.num_cache_tokens == 3
+    assert metadata.cmp_residual.tolist() == [0, 1]
     assert metadata.max_cache_seq_len == 2
     assert metadata.slot_mapping.tolist() == [
         [0, 0],
@@ -784,6 +782,153 @@ def test_compressed_metadata_exposes_original_and_cache_coordinates(config, runt
     assert metadata.num_prefill_tokens == 3
     assert metadata.num_decodes == 1
     assert metadata.num_decode_tokens == 2
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("query_len", [1, 3])
+def test_batch_metadata_reuses_work_and_keeps_group_slots_separate(runtime, monkeypatch, deferred, query_len):
+    groups = make_cache_config(17).kv_cache_groups
+    builders = []
+    for group in groups:
+        layers_by_spec = {}
+        for name, spec in group.kv_cache_spec.kv_cache_specs.items():
+            layers_by_spec.setdefault(spec, []).append(name)
+        builders.append(
+            [
+                DeepseekV41MetadataBuilder(spec, names, runtime, torch.device("cpu"))
+                for spec, names in layers_by_spec.items()
+            ]
+        )
+    assert sum(map(len, builders)) == 25
+    counts = Mock(wraps=dsa_v41._request_counts)
+    compressed_slots = Mock(wraps=dsa_v41.compressed_slot_mapping)
+    rope = Mock(side_effect=lambda positions, **kwargs: (positions.float().clone(), -positions.float()))
+    monkeypatch.setattr(dsa_v41, "_request_counts", counts)
+    monkeypatch.setattr(dsa_v41, "compressed_slot_mapping", compressed_slots)
+    monkeypatch.setattr(dsa_v41, "get_cos_and_sin_dsa", rope)
+
+    def native_metadata(*args, **kwargs):
+        lengths = kwargs.get("seqused_ori_kv", kwargs.get("seqused_k"))
+        return torch.full(
+            (dsa_v41.V41_METADATA_BUFFER_SIZE,), int(lengths.sum()) + kwargs["cmp_ratio"], dtype=torch.int32
+        )
+
+    smla = Mock(side_effect=native_metadata)
+    qli = Mock(side_effect=native_metadata)
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_sparse_flash_mla_metadata", smla, raising=False)
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_quant_lightning_indexer_v2_metadata", qli, raising=False)
+    for group_builders in builders:
+        for builder in group_builders:
+            # Only native operator dispatch is mocked; all coordinates use CPU torch.
+            builder._supports_device_ops = not isinstance(builder.kv_cache_spec, dsa_v41.DeepseekV41CompressorStateSpec)
+            builder._device_metadata_enabled = deferred
+
+    def build_batch(lengths, block_offset=0, idle=False):
+        batch_shared = {}
+        results, tasks = [], []
+        positions = torch.tensor(
+            [*range(lengths[0] - query_len, lengths[0]), *range(lengths[1] - query_len, lengths[1]), 0]
+        )
+        query_start_loc = torch.tensor([0, query_len, 2 * query_len, 2 * query_len + 1], dtype=torch.int32)
+        for gid, group_builders in enumerate(builders):
+            block_ids = torch.tensor([gid + 1 + block_offset, gid + 2 + block_offset, 0], dtype=torch.int32)
+            flat_slots = torch.cat(
+                (
+                    block_ids[0] * 128 + positions[:query_len],
+                    block_ids[1] * 128 + positions[query_len : 2 * query_len],
+                    torch.tensor([-1]),
+                )
+            )
+            common = SimpleNamespace(
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc,
+                seq_lens=torch.tensor([*lengths, 999], dtype=torch.int32),
+                seq_lens_cpu=None,
+                _seq_lens_cpu=torch.tensor([*lengths, 999], dtype=torch.int32),
+                positions=positions,
+                slot_mapping=flat_slots,
+                block_table_tensor=block_ids[:, None],
+                num_reqs=3,
+                num_input_tokens=len(positions),
+                num_actual_tokens=2 * query_len,
+                max_query_len=query_len,
+                max_seq_len=max(lengths),
+                is_prefilling=torch.tensor([query_len > 1, query_len > 1, False]),
+            )
+            group_shared = {}
+            group_results = []
+            for builder in group_builders:
+                metadata = builder.build(
+                    0,
+                    common,
+                    num_actual_reqs=2,
+                    skip_ring_state_update=idle,
+                    full_graph_mode=query_len == 1,
+                    common_v41_metadata=group_shared,
+                    common_v41_batch_metadata=batch_shared,
+                )
+                group_results.append(metadata)
+                tasks.extend(builder.take_device_metadata_tasks())
+            results.append(group_results)
+            # Building later groups must never modify an earlier group's slots.
+            if gid >= 2:
+                expected = torch.stack((flat_slots.clamp_min(0) // 128, flat_slots.clamp_min(0) % 128), dim=1).int()
+                expected[-1] = -1
+                torch.testing.assert_close(group_results[0].slot_mapping, expected)
+        for task in sorted(tasks, key=lambda task: task.stage):
+            task.run()
+        if deferred:
+            assert [task.stage for task in tasks].count(DeviceMetadataStage.ATTENTION) == 3
+            assert [task.stage for task in tasks].count(DeviceMetadataStage.INDEXER) == 2
+            assert [task.stage for task in tasks].count(DeviceMetadataStage.COMPRESSOR) == 1
+        else:
+            assert not tasks
+        return results, tuple((task.stage, task.group_id) for task in tasks)
+
+    previous_pointers = previous_frontiers = None
+    for iteration, (lengths, idle) in enumerate([([7, 8], False), ([10, 11], False), ([10, 11], True)]):
+        results, frontiers = build_batch(lengths, block_offset=iteration, idle=idle)
+        all_metadata = [metadata for group_results in results for metadata in group_results]
+        assert counts.call_count == iteration + 1
+        assert rope.call_count == iteration + 1
+        assert compressed_slots.call_count == iteration + 1
+        assert smla.call_count == 3 * (iteration + 1)
+        assert qli.call_count == 2 * (iteration + 1)
+        for metadata in all_metadata:
+            assert metadata.seq_lens.tolist() == [*lengths, 0]
+            assert metadata.seq_lens is all_metadata[0].seq_lens
+        c2 = [metadata for metadata in results[0] if metadata.compress_ratio == 2]
+        assert c2[0].cache_seq_lens is c2[1].cache_seq_lens
+        assert c2[0].cmp_residual is c2[1].cmp_residual
+        assert c2[0].cache_seq_lens.tolist() == [n // 2 for n in lengths] + [0]
+        assert c2[0].cmp_residual.tolist() == [n % 2 for n in lengths] + [0]
+        assert c2[0].max_cache_seq_len == max(lengths) // 2
+        for metadata in results[0]:
+            if metadata.compress_ratio == 1:
+                assert metadata.cache_seq_lens is metadata.seq_lens
+        swa = [metadata for group_results in results[2:] for metadata in group_results]
+        assert all(metadata.cos is swa[0].cos and metadata.sin is swa[0].sin for metadata in swa)
+        assert all(metadata.smla_metadata is swa[0].smla_metadata for metadata in swa)
+        assert int(swa[0].smla_metadata[0]) == sum(lengths)
+        assert len({group_results[0].slot_mapping.data_ptr() for group_results in results[2:]}) == 10
+        for group_results in results[2:]:
+            assert group_results[0].slot_mapping is group_results[1].slot_mapping
+        if idle:
+            assert (c2[0].slot_mapping == -1).all()
+            assert (results[1][0].c2_ring_metadata[1] == 0).all()
+        pointers = tuple(
+            (
+                metadata.seq_lens.data_ptr(),
+                metadata.cache_seq_lens.data_ptr(),
+                metadata.slot_mapping.data_ptr(),
+                None if metadata.smla_metadata is None else metadata.smla_metadata.data_ptr(),
+            )
+            for metadata in all_metadata
+        )
+        if previous_pointers is not None:
+            assert pointers == previous_pointers
+            assert frontiers == previous_frontiers
+        previous_pointers, previous_frontiers = pointers, frontiers
 
 
 @pytest.mark.parametrize("end", [127, 128, 129, 255, 256, 257])
