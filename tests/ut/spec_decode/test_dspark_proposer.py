@@ -384,6 +384,38 @@ class _DSparkProposerTestBase:
         return num_query_total, token_indices, cad, extra, next_token_ids, target_hidden_states
 
 
+class TestDSparkDummyRunLocalDpTokens(_DSparkProposerTestBase):
+    def test_uses_this_dp_rank_token_count(self):
+        proposer = self._make_proposer(max_num_tokens=64, num_reqs=2, block_size=5)
+        proposer.dp_rank = 1
+        tokens_across_dp = torch.tensor([20, 10, 25, 15], dtype=torch.int32)
+        proposer.runner = SimpleNamespace(
+            _sync_metadata_across_dp=lambda num_tokens, **kwargs: (25, tokens_across_dp, None)
+        )
+        proposer.token_indices_to_sample = torch.zeros(10, dtype=torch.int32)
+        proposer._pad_draft_buffers = MagicMock()
+        proposer._runnable = MagicMock()
+        forward_context_kwargs = []
+
+        @contextmanager
+        def forward_context_manager(*args, **kwargs):
+            forward_context_kwargs.append(kwargs)
+            yield
+
+        with patch(
+            "vllm_ascend.spec_decode.dspark_proposer.set_ascend_forward_context",
+            forward_context_manager,
+        ):
+            proposer.dummy_run(num_tokens=10, num_reqs=2)
+
+        proposer._pad_draft_buffers.assert_called_once_with(10, 10)
+        proposer._runnable.assert_called_once()
+        assert proposer._runnable.call_args.kwargs["num_input_tokens"] == 10
+        assert forward_context_kwargs[0]["num_tokens"] == 10
+        assert forward_context_kwargs[0]["num_actual_tokens"] == 10
+        assert forward_context_kwargs[0]["num_tokens_across_dp"] is tokens_across_dp
+
+
 class TestDSparkPositionsFullUnderMultiDp(_DSparkProposerTestBase):
     """Guard: under multi-DP the dspark draft proposer must hand DSA attention a
     full-length positions buffer so ``positions[:num_input_tokens]`` never reads
