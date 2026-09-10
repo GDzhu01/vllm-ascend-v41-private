@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Node-local BF16/INT8 Engram storage, independent of model TP."""
+"""Node-local Engram storage with fixed head ownership for BF16/INT8 HBM."""
 
 import json
 import socket
@@ -12,6 +12,7 @@ import torch.distributed as dist
 from safetensors import safe_open
 from torch import nn
 
+from vllm_ascend.ops.triton.engram import lookup_engram_heads, select_engram_rows
 from vllm_ascend.ops.triton.engram_int8 import gather_dequantize_engram_int8
 
 _OFFLOAD_BUFFER_CACHE_SIZE = 8
@@ -59,13 +60,13 @@ def unpack_engram_int8_rows(payload, width):
 
 
 class EngramQueryGroup:
-    """One node group shared by all Engram layers; TP leaders submit queries.
+    """Node-local groups shared by all Engram layers.
 
     All ranks (including idle DP replicas) must call lookup in the same order.
-    Counts and all-to-all split sizes are eager metadata, not graph inputs.
+    HBM uses fixed-size DP/TP gathers; legacy offload uses TP-leader routing.
     """
 
-    def __init__(self, group, cpu_group, tp_group, tp_source):
+    def __init__(self, group, cpu_group, tp_group, tp_source, dp_group=None):
         self.group = group
         self.cpu_group = cpu_group
         self.tp_group = tp_group
@@ -77,6 +78,12 @@ class EngramQueryGroup:
         self.rank = dist.get_rank(group)
         self.size = dist.get_world_size(group)
         self.is_source = dist.get_rank() == tp_source
+        self.tp_size = dist.get_world_size(tp_group)
+        self.tp_rank = dist.get_rank(tp_group)
+        self.dp_size = self.size // self.tp_size
+        self.dp_rank = self.rank // self.tp_size
+        self.dp_group = dp_group
+        self.head_shard_rank = self.tp_rank * self.dp_size + self.dp_rank
 
     @classmethod
     def from_vllm(cls, parallel):
@@ -97,26 +104,35 @@ class EngramQueryGroup:
         node_groups = [[ep.ranks[i] for i, host in enumerate(hosts) if host == name] for name in dict.fromkeys(hosts)]
         node_sizes = {len(ranks) for ranks in node_groups}
         if len(node_sizes) != 1:
-            raise ValueError(
-                "Engram requires equal rank counts on every node: "
-                f"{node_groups}"
-            )
+            raise ValueError(f"Engram requires equal rank counts on every node: {node_groups}")
         selected = None
         for ranks in node_groups:
             # Every world rank creates groups in the same order.
             cpu = dist.new_group(ranks, backend="gloo")
             device = dist.new_group(ranks, backend=dist.get_backend(ep.device_group))
+            dp_group = None
+            if len(ranks) % tp.world_size:
+                raise ValueError("Engram requires complete TP replicas on each node")
+            for tp_rank in range(tp.world_size):
+                peers = ranks[tp_rank :: tp.world_size]
+                group = dist.new_group(peers, backend=dist.get_backend(ep.device_group))
+                if dist.get_rank() in peers:
+                    dp_group = group
             if dist.get_rank() in ranks:
                 if not set(tp.ranks).issubset(ranks):
                     raise ValueError("Engram requires each TP group to stay within one node")
-                selected = cls(device, cpu, tp.device_group, tp.ranks[0])
+                node_rank = ranks.index(dist.get_rank())
+                replica_start = node_rank // tp.world_size * tp.world_size
+                if ranks[replica_start : replica_start + tp.world_size] != list(tp.ranks):
+                    raise ValueError("Engram requires TP-contiguous node ranks")
+                selected = cls(device, cpu, tp.device_group, tp.ranks[0], dp_group)
         return selected
 
 
 class NodeShardedEngram(nn.Module):
     """Contiguous row shards; only BF16 rows cross the node-local fabric."""
 
-    def __init__(self, rows, width, query_group, device=None, storage_format="bf16"):
+    def __init__(self, rows, width, query_group, device=None, storage_format="bf16", head_sizes=None):
         super().__init__()
         if storage_format not in ("bf16", "int8", "fp8", "mxfp8"):
             raise ValueError("Engram storage_format must be bf16, int8, fp8, or mxfp8")
@@ -137,10 +153,33 @@ class NodeShardedEngram(nn.Module):
         self._offload_buffer_bytes_limit = _OFFLOAD_BUFFER_BYTES_LIMIT
         self._offload_buffer_index = {}
         self._offload_events = {}
-        # Ceil partition leaves at most size-1 unused rows, never a replica.
-        self.shard_rows = (rows + query_group.size - 1) // query_group.size
-        self.start = query_group.rank * self.shard_rows
-        self.end = min(self.start + self.shard_rows, rows)
+        self.head_sizes = tuple(head_sizes) if head_sizes is not None else None
+        if self.head_sizes is not None:
+            if storage_format not in ("bf16", "int8"):
+                raise ValueError("Head-sharded Engram requires BF16/INT8 HBM storage")
+            if len(self.head_sizes) < query_group.size or sum(self.head_sizes) > rows or min(self.head_sizes) <= 0:
+                raise ValueError("Engram needs at least one complete hash head per shard and valid bucket sizes")
+            heads = len(self.head_sizes)
+            rank = query_group.head_shard_rank
+            # Balance complete heads, including layouts not divisible by TP*DP.
+            self.head_start = rank * heads // query_group.size
+            self.head_count = (rank + 1) * heads // query_group.size - self.head_start
+            self.padded_heads = (heads + query_group.size - 1) // query_group.size
+            self.start = sum(self.head_sizes[: self.head_start])
+            self.end = sum(self.head_sizes[: self.head_start + self.head_count])
+            gather_indices = [
+                shard * self.padded_heads + index
+                for shard in range(query_group.size)
+                for index in range((shard + 1) * heads // query_group.size - shard * heads // query_group.size)
+            ]
+            self.register_buffer(
+                "_head_gather_indices", torch.tensor(gather_indices, dtype=torch.int64, device=device), persistent=False
+            )
+        else:
+            # Legacy CPU-offload routing uses equal contiguous row shards.
+            self.shard_rows = (rows + query_group.size - 1) // query_group.size
+            self.start = query_group.rank * self.shard_rows
+            self.end = min(self.start + self.shard_rows, rows)
         if self.start >= rows:
             raise ValueError("Engram table must have at least one row per rank")
         self._empty_flat = torch.empty(0, dtype=torch.int64, device="cpu")
@@ -154,11 +193,7 @@ class NodeShardedEngram(nn.Module):
                 dtype=(
                     torch.int8
                     if storage_format == "int8"
-                    else (
-                        torch.float8_e4m3fn
-                        if storage_format in ("fp8", "mxfp8")
-                        else torch.bfloat16
-                    )
+                    else (torch.float8_e4m3fn if storage_format in ("fp8", "mxfp8") else torch.bfloat16)
                 ),
                 device=(torch.device("cpu") if storage_format in ("fp8", "mxfp8") else device),
                 pin_memory=False,
@@ -295,8 +330,8 @@ class NodeShardedEngram(nn.Module):
                         raise ValueError(f"{scale_key}: expected FP32 [{self.rows}, {self.width // 32}]")
                     for start in range(self.start, self.end, chunk_rows):
                         stop = min(start + chunk_rows, self.end)
-                        self.weight.data[start-self.start:stop-self.start].copy_(tensor[start:stop])
-                        self.weight_scale[start-self.start:stop-self.start].copy_(scale[start:stop])
+                        self.weight.data[start - self.start : stop - self.start].copy_(tensor[start:stop])
+                        self.weight_scale[start - self.start : stop - self.start].copy_(scale[start:stop])
                 return
             if self.storage_format in ("fp8", "mxfp8"):
                 if source_dtype not in ("F8_E4M3", "F8_E4M3FN") or scale_key not in index:
@@ -307,8 +342,8 @@ class NodeShardedEngram(nn.Module):
                         raise ValueError(f"{scale_key}: expected [{self.rows}, {self.width // 32}]")
                     for start in range(self.start, self.end, chunk_rows):
                         stop = min(start + chunk_rows, self.end)
-                        self.weight.data[start-self.start:stop-self.start].copy_(tensor[start:stop])
-                        self.weight_scale[start-self.start:stop-self.start].copy_(scale[start:stop])
+                        self.weight.data[start - self.start : stop - self.start].copy_(tensor[start:stop])
+                        self.weight_scale[start - self.start : stop - self.start].copy_(scale[start:stop])
                 return
             if source_dtype != "BF16":
                 raise ValueError(f"{key}: expected BF16 source for {self.storage_format}")
@@ -409,8 +444,7 @@ class NodeShardedEngram(nn.Module):
         if buffers is None:
             buffers = (
                 torch.empty(metadata.numel(), dtype=metadata.dtype, device=device),
-                torch.empty(self.query_group.size * metadata.numel(),
-                            dtype=metadata.dtype, device=device),
+                torch.empty(self.query_group.size * metadata.numel(), dtype=metadata.dtype, device=device),
             )
             self._metadata_device_buffers[key] = buffers
         metadata_device, gathered_device = buffers
@@ -420,6 +454,60 @@ class NodeShardedEngram(nn.Module):
         # consumption local to this route so the reusable device buffer remains
         # safe for the next collective.
         return list(gathered_device.reshape(self.query_group.size, *metadata.shape).cpu().unbind(0))
+
+    @staticmethod
+    def _fixed_gather(value, group, size):
+        if size == 1:
+            return value.unsqueeze(0)
+        gathered = torch.empty((size * value.shape[0], *value.shape[1:]), dtype=value.dtype, device=value.device)
+        dist.all_gather_into_tensor(gathered, value.contiguous(), group=group)
+        return gathered.view(size, *value.shape)
+
+    def route_heads(self, tables, hashes, token_slot):
+        """HBM-only fixed-size DP/TP exchange; no CPU routing or split sizes."""
+        q = self.query_group
+        num_tokens = hashes.shape[0]
+        if num_tokens > token_slot:
+            raise ValueError("Engram batch exceeds the shared DP token slot")
+        if q.dp_size > 1 and q.dp_group is None:
+            raise RuntimeError("Engram head sharding requires its node-local DP group")
+        if num_tokens < token_slot:
+            padded = hashes.new_full((token_slot, *hashes.shape[1:]), -1)
+            padded[:num_tokens].copy_(hashes)
+        else:
+            padded = hashes
+        gathered_hashes = self._fixed_gather(padded, q.dp_group, q.dp_size).flatten(0, 1)
+        results = []
+        for layer, table in enumerate(tables):
+            ids = gathered_hashes[:, layer]
+            if ids.device.type == "npu":
+                rows = lookup_engram_heads(table, ids)
+            else:
+                # CPU reference for collective/loader tests, not a serving path.
+                local = ids[:, table.head_start : table.head_start + table.head_count] - table.start
+                valid = (local >= 0) & (local < table.end - table.start)
+                values = table.lookup_local(local.clamp(0, table.end - table.start - 1))
+                rows = values.new_zeros((ids.shape[0], table.padded_heads, table.width))
+                rows[:, : table.head_count] = values.masked_fill(~valid.unsqueeze(-1), 0)
+            if q.dp_size > 1:
+                gathered_rows = self._fixed_gather(rows, q.dp_group, q.dp_size)
+                if rows.device.type == "npu":
+                    rows = select_engram_rows(
+                        gathered_rows, num_tokens, q.dp_rank * token_slot, q.dp_size * table.padded_heads
+                    )
+                else:
+                    rows = gathered_rows[:, q.dp_rank * token_slot : q.dp_rank * token_slot + num_tokens]
+                    rows = rows.permute(1, 0, 2, 3).reshape(num_tokens, q.dp_size * table.padded_heads, table.width)
+            gathered_rows = self._fixed_gather(rows, q.tp_group, q.tp_size)
+            if rows.device.type == "npu":
+                rows = select_engram_rows(
+                    gathered_rows, num_tokens, 0, len(table.head_sizes), table._head_gather_indices
+                )
+            else:
+                rows = gathered_rows.permute(1, 0, 2, 3).reshape(num_tokens, q.size * table.padded_heads, table.width)
+                rows = rows.index_select(1, table._head_gather_indices)
+            results.append(rows)
+        return results
 
     @torch.inference_mode()
     def forward(self, ids):

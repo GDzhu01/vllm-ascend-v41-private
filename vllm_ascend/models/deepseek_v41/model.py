@@ -34,7 +34,7 @@ from vllm_ascend.models.deepseek_v4.model import (
 
 from .compressor import DeepseekV41Compressor, _read, text_config_of
 from .engram_gate import engram_gate
-from .engram_hash import PagedNgramHistory
+from .engram_hash import DeviceNgramHistory, EngramLayout, PagedNgramHistory
 from .engram_hbm import EngramQueryGroup, NodeShardedEngram
 from .indexer import DeepseekV41Indexer
 
@@ -464,14 +464,21 @@ class DeepseekV41Model(DeepseekV4Model):
         # Read the storage choice after AscendConfig validation.
         ascend_config = get_ascend_config()
         storage_format = ascend_config.engram_storage
+        self._engram_on_device = ascend_config.enable_engram and storage_format in ("bf16", "int8")
         if ascend_config.enable_engram:
             query_group = EngramQueryGroup.from_vllm(vllm_config.parallel_config)
-            for layer_id, rows in zip(config.engram_layer_ids, config.engram_num_embeddings):
+            layout = EngramLayout.from_args(config)
+            for slot, (layer_id, rows) in enumerate(zip(config.engram_layer_ids, config.engram_num_embeddings)):
                 self.layers[layer_id].engram.embed = NodeShardedEngram(
                     rows,
                     config.engram_head_dim,
                     query_group,
                     storage_format=storage_format,
+                    head_sizes=(
+                        tuple(size for order in layout.primes[slot] for size in order)
+                        if self._engram_on_device
+                        else None
+                    ),
                 )
         self.engram_history = None
         self._engram_input_buffers = None
@@ -490,12 +497,42 @@ class DeepseekV41Model(DeepseekV4Model):
                 if not torch.equal(rotation, torch.block_diag(*[block] * (config.hidden_size // 32))):
                     raise ValueError("Engram gate requires repeated block32 global rotation")
             self.engram_rotation.copy_(block)
+            if self._engram_on_device:
+                device = self.layers[config.engram_layer_ids[0]].engram.embed.weight.device
+                self.engram_history = DeviceNgramHistory(self.engram_history, device)
+
+    def _prepare_engram_hbm(self, input_ids, positions):
+        config = self.config
+        context = get_forward_context()
+        tables = [self.layers[layer_id].engram.embed for layer_id in config.engram_layer_ids]
+        columns = (config.engram_max_ngram_size - 1) * config.engram_n_heads
+        hashes = None
+        first = self.layers[0].self_attn.dsa_attn.swa_cache_layer
+        if context.attn_metadata is not None and self.engram_history is not None:
+            meta = context.attn_metadata[first.prefix]
+            if self.engram_history.ensure_cache(first.kv_cache[0], meta.storage_block_size):
+                hashes, mask = self.engram_history.update(input_ids, positions, meta)
+        if hashes is None:
+            hashes = torch.full(
+                (positions.shape[0], len(tables), columns), -1, dtype=torch.int64, device=positions.device
+            )
+            mask = torch.zeros(positions.shape[0], dtype=torch.bool, device=positions.device)
+        token_slot = positions.shape[0]
+        if tables[0].query_group.dp_size > 1:
+            if context.dp_metadata is None:
+                raise RuntimeError("HBM Engram requires the runner's DP token metadata")
+            # Already CPU-resident scheduler metadata; no device counts are read.
+            token_slot = int(context.dp_metadata.num_tokens_across_dp_cpu.max())
+        routed = tables[0].route_heads(tables, hashes, token_slot)
+        return {layer: values.flatten(1) for layer, values in zip(config.engram_layer_ids, routed)}, mask
 
     def prepare_engram(self, input_ids, positions):
         """Eager boundary: every DP participates, including metadata-free dummies."""
         config = self.config
         if not get_ascend_config().enable_engram:
             return {}, torch.empty(0, dtype=torch.bool, device=positions.device)
+        if self._engram_on_device:
+            return self._prepare_engram_hbm(input_ids, positions)
         columns = (config.engram_max_ngram_size - 1) * config.engram_n_heads
         hashes = torch.empty((0, len(config.engram_layer_ids), columns), dtype=torch.int64, device="cpu")
         mask = torch.empty(0, dtype=torch.bool, device="cpu")

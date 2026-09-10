@@ -224,17 +224,27 @@ def test_gate_preserves_masked_rows():
     hidden = torch.randn(3, 4, 32).bfloat16()
     key = torch.randn(3, 4, 32).bfloat16()
     value = torch.randn(3, 32).bfloat16()
-    out = gate(hidden, key, value, torch.randn(4, 32), torch.eye(32),
-               torch.tensor([True, False, True]), 1e-5)
+    out = gate(hidden, key, value, torch.randn(4, 32), torch.eye(32), torch.tensor([True, False, True]), 1e-5)
     assert torch.equal(out[1], hidden[1])
     assert torch.isfinite(out.float()).all()
 
 
 def test_hash_causal_barrier():
     h = hash_mod.PagedNgramHistory.__new__(hash_mod.PagedNgramHistory)
-    h.token_map = torch.arange(100); h.pad_id = 2; h.image_token_id = 99; h.lookback = 2
-    h.primes = torch.tensor([[[101, 103]]]); h.offsets = torch.tensor([[0, 101]])
-    h.multipliers = torch.tensor([[3, 5]]); h.pages = {}
-    values, mask = h.update(torch.tensor([0, 5, 9, 99, 13, 17]), torch.arange(6),
-                             torch.zeros(6, dtype=torch.long), torch.tensor([[5, 1]]), 4)
+    h.token_map = torch.arange(100)
+    h.pad_id = 2
+    h.image_token_id = 99
+    h.lookback = 2
+    h.image_pad_token_id = 98
+    h.primes = torch.tensor([[[101, 103]]])
+    h.offsets = torch.tensor([[0, 101]])
+    h.multipliers = torch.tensor([[3, 5]])
+    h.pages = {}
+    values, mask = h.update(
+        torch.tensor([0, 5, 9, 99, 13, 17]),
+        torch.arange(6),
+        torch.zeros(6, dtype=torch.long),
+        torch.tensor([[5, 1]]),
+        4,
+    )
     assert values.shape == (6, 1, 2) and not mask[3]
