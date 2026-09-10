@@ -97,10 +97,7 @@ class EngramQueryGroup:
         node_groups = [[ep.ranks[i] for i, host in enumerate(hosts) if host == name] for name in dict.fromkeys(hosts)]
         node_sizes = {len(ranks) for ranks in node_groups}
         if len(node_sizes) != 1:
-            raise ValueError(
-                "Engram requires equal rank counts on every node: "
-                f"{node_groups}"
-            )
+            raise ValueError(f"Engram requires equal rank counts on every node: {node_groups}")
         selected = None
         for ranks in node_groups:
             # Every world rank creates groups in the same order.
@@ -116,12 +113,14 @@ class EngramQueryGroup:
 class NodeShardedEngram(nn.Module):
     """Contiguous row shards; only BF16 rows cross the node-local fabric."""
 
-    def __init__(self, rows, width, query_group, device=None, storage_format="bf16"):
+    def __init__(self, rows, width, query_group, device=None, storage_format="bf16", cpu_offload=False):
         super().__init__()
         if storage_format not in ("bf16", "int8", "fp8", "mxfp8"):
             raise ValueError("Engram storage_format must be bf16, int8, fp8, or mxfp8")
         if storage_format in ("int8", "fp8", "mxfp8") and width % 32:
             raise ValueError("INT8 Engram requires a width divisible by 32")
+        if cpu_offload and storage_format == "bf16":
+            raise ValueError("Engram CPU offload requires compressed storage")
         self.storage_format = storage_format
         self.rows, self.width = rows, width
         self.query_group = query_group
@@ -131,7 +130,8 @@ class NodeShardedEngram(nn.Module):
         # the threshold as a local rollback knob for future kernel changes.
         self.use_triton_int8 = True
         self.triton_int8_min_rows = 1
-        self.offload_pinned = storage_format in ("fp8", "mxfp8")
+        self.offload_pinned = cpu_offload or storage_format in ("fp8", "mxfp8")
+        storage_device = torch.device("cpu") if self.offload_pinned else device
         self._offload_buffers = OrderedDict()
         self._offload_buffer_bytes = 0
         self._offload_buffer_bytes_limit = _OFFLOAD_BUFFER_BYTES_LIMIT
@@ -154,20 +154,17 @@ class NodeShardedEngram(nn.Module):
                 dtype=(
                     torch.int8
                     if storage_format == "int8"
-                    else (
-                        torch.float8_e4m3fn
-                        if storage_format in ("fp8", "mxfp8")
-                        else torch.bfloat16
-                    )
+                    else (torch.float8_e4m3fn if storage_format in ("fp8", "mxfp8") else torch.bfloat16)
                 ),
-                device=(torch.device("cpu") if storage_format in ("fp8", "mxfp8") else device),
+                device=storage_device,
                 pin_memory=False,
             ),
             requires_grad=False,
         )
         if storage_format == "int8":
             self.register_buffer(
-                "weight_scale", torch.empty(self.end - self.start, width // 32, dtype=torch.float32, device=device)
+                "weight_scale",
+                torch.empty(self.end - self.start, width // 32, dtype=torch.float32, device=storage_device),
             )
         elif storage_format in ("fp8", "mxfp8"):
             self.register_buffer(
@@ -200,7 +197,7 @@ class NodeShardedEngram(nn.Module):
             return torch.empty((*ids.shape, self.width), dtype=torch.bfloat16, device=self.weight.device)
         original_shape = ids.shape
         flat_ids = ids.reshape(-1)
-        if self.storage_format == "int8":
+        if self.storage_format == "int8" and not self.offload_pinned:
             if (
                 self.use_triton_int8
                 and self.weight.device.type == "npu"
@@ -213,7 +210,7 @@ class NodeShardedEngram(nn.Module):
                 codes = torch.index_select(self.weight, 0, flat_ids)
                 scales = torch.index_select(self.weight_scale, 0, flat_ids)
                 rows = dequantize_engram_rows(codes, scales)
-        elif self.storage_format in ("fp8", "mxfp8"):
+        elif self.storage_format in ("int8", "fp8", "mxfp8"):
             # index_select avoids the extra advanced-indexing wrapper on the
             # CPU-resident PLE table and keeps row selection explicit.
             rows = torch.index_select(self.weight, 0, flat_ids)
@@ -275,12 +272,35 @@ class NodeShardedEngram(nn.Module):
     def load_checkpoint(self, model_path, key, chunk_rows=65536):
         """Load BF16, INT8, FP8, or MXFP8 Engram tensors with bounded IO.
 
-        FP8/MXFP8 remain CPU resident (PLE_OFFLOAD); only decoded BF16 rows
+        Offloaded INT8 and FP8/MXFP8 remain CPU resident; only decoded BF16 rows
         enter the node-local all-to-all response buffer.
         """
         root = Path(model_path)
-        index = json.loads((root / "quant_model_weights.safetensors.index.json").read_text())["weight_map"]
         scale_key = key.removesuffix(".weight") + ".scale"
+        index_path = None
+        index = None
+        found_indexes = []
+        for name in ("model.safetensors.index.json", "quant_model_weights.safetensors.index.json"):
+            candidate = root / name
+            if not candidate.is_file():
+                continue
+            found_indexes.append(candidate)
+            candidate_index = json.loads(candidate.read_text())["weight_map"]
+            required = {key}
+            if self.storage_format in ("fp8", "mxfp8"):
+                required.add(scale_key)
+            if required.issubset(candidate_index):
+                index_path = candidate
+                index = candidate_index
+                break
+        if index_path is None:
+            if found_indexes:
+                names = ", ".join(path.name for path in found_indexes)
+                raise KeyError(f"{key}: not present in {names}")
+            raise FileNotFoundError(
+                f"{root}: Engram loader requires model.safetensors.index.json or "
+                "quant_model_weights.safetensors.index.json"
+            )
         with safe_open(root / index[key], framework="pt", device="cpu") as file:
             tensor = file.get_slice(key)
             if tensor.get_shape() != [self.rows, self.width]:
@@ -295,20 +315,23 @@ class NodeShardedEngram(nn.Module):
                         raise ValueError(f"{scale_key}: expected FP32 [{self.rows}, {self.width // 32}]")
                     for start in range(self.start, self.end, chunk_rows):
                         stop = min(start + chunk_rows, self.end)
-                        self.weight.data[start-self.start:stop-self.start].copy_(tensor[start:stop])
-                        self.weight_scale[start-self.start:stop-self.start].copy_(scale[start:stop])
+                        self.weight.data[start - self.start : stop - self.start].copy_(tensor[start:stop])
+                        self.weight_scale[start - self.start : stop - self.start].copy_(scale[start:stop])
                 return
             if self.storage_format in ("fp8", "mxfp8"):
                 if source_dtype not in ("F8_E4M3", "F8_E4M3FN") or scale_key not in index:
                     raise ValueError(f"{key}: {self.storage_format} requires FP8 weight and .scale")
                 with safe_open(root / index[scale_key], framework="pt", device="cpu") as sf:
                     scale = sf.get_slice(scale_key)
-                    if scale.get_shape() != [self.rows, self.width // 32]:
-                        raise ValueError(f"{scale_key}: expected [{self.rows}, {self.width // 32}]")
+                    if scale.get_shape() != [self.rows, self.width // 32] or scale.get_dtype() not in (
+                        "F8_E8M0",
+                        "F8_E8M0FNU",
+                    ):
+                        raise ValueError(f"{scale_key}: expected FP8 UE8M0 [{self.rows}, {self.width // 32}]")
                     for start in range(self.start, self.end, chunk_rows):
                         stop = min(start + chunk_rows, self.end)
-                        self.weight.data[start-self.start:stop-self.start].copy_(tensor[start:stop])
-                        self.weight_scale[start-self.start:stop-self.start].copy_(scale[start:stop])
+                        self.weight.data[start - self.start : stop - self.start].copy_(tensor[start:stop])
+                        self.weight_scale[start - self.start : stop - self.start].copy_(scale[start:stop])
                 return
             if source_dtype != "BF16":
                 raise ValueError(f"{key}: expected BF16 source for {self.storage_format}")
@@ -409,8 +432,7 @@ class NodeShardedEngram(nn.Module):
         if buffers is None:
             buffers = (
                 torch.empty(metadata.numel(), dtype=metadata.dtype, device=device),
-                torch.empty(self.query_group.size * metadata.numel(),
-                            dtype=metadata.dtype, device=device),
+                torch.empty(self.query_group.size * metadata.numel(), dtype=metadata.dtype, device=device),
             )
             self._metadata_device_buffers[key] = buffers
         metadata_device, gathered_device = buffers
