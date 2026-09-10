@@ -32,6 +32,63 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
 class TestDummyRunSlotInvalidation(unittest.TestCase):
+    def test_padded_speculative_dummy_preserves_logical_query_lengths(self):
+        # DSA CP rounds 186 tokens to 192 without adding a logical request.
+        # Also cover dispatchers that pad the request count itself.
+        for num_tokens, padded_tokens, padded_reqs in ((186, 192, 31), (12, 24, 4)):
+            with self.subTest(num_tokens=num_tokens):
+                runner = NPUModelRunner.__new__(NPUModelRunner)
+                runner.uniform_decode_query_len = 6
+                runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=4096, max_num_seqs=32)
+                runner.dynamic_eplb = False
+                runner.dcp_size = 1
+                runner.speculative_config = None
+                runner._has_gdn = True
+                runner.vllm_config = MagicMock()
+                agreed_counts = torch.tensor([padded_tokens, 192], dtype=torch.int32)
+                runner._determine_batch_execution_and_padding = MagicMock(
+                    return_value=(
+                        CUDAGraphMode.FULL,
+                        SimpleNamespace(num_tokens=padded_tokens, num_reqs=padded_reqs),
+                        False,
+                        agreed_counts,
+                        None,
+                    )
+                )
+                runner.synchronize_input_prep = nullcontext
+                runner._should_build_dummy_attn_metadata = MagicMock(return_value=True)
+                runner.optimistic_seq_lens_cpu = torch.zeros(32, dtype=torch.int32)
+                runner.seq_lens = MagicMock()
+                runner.arange_np = np.arange(4096, dtype=np.int32)
+                runner.query_pos = SimpleNamespace(np=np.zeros(4096, dtype=np.int32))
+                runner.query_start_loc = SimpleNamespace(np=np.zeros(33, dtype=np.int32), copy_to_gpu=MagicMock())
+                runner.gdn_query_start_loc = SimpleNamespace(np=np.zeros(33, dtype=np.int32), copy_to_gpu=MagicMock())
+
+                def check_offsets(
+                    *args,
+                    runner=runner,
+                    num_tokens=num_tokens,
+                    padded_tokens=padded_tokens,
+                    padded_reqs=padded_reqs,
+                    agreed_counts=agreed_counts,
+                ):
+                    num_reqs = num_tokens // 6
+                    expected = np.concatenate(
+                        (np.arange(num_reqs + 1) * 6, np.full(padded_reqs - num_reqs, num_tokens))
+                    )
+                    np.testing.assert_array_equal(runner.query_start_loc.np[: padded_reqs + 1], expected)
+                    np.testing.assert_array_equal(runner.gdn_query_start_loc.np[: padded_reqs + 1], expected)
+                    np.testing.assert_array_equal(runner.query_pos.np[:num_tokens], np.tile(np.arange(6), num_reqs))
+                    torch.testing.assert_close(agreed_counts, torch.tensor([padded_tokens, 192], dtype=torch.int32))
+                    raise RuntimeError("logical query lengths checked")
+
+                runner._pad_query_start_loc_for_fia = check_offsets
+                with (
+                    patch("vllm_ascend.worker.model_runner_v1.using_paged_attention", return_value=False),
+                    self.assertRaisesRegex(RuntimeError, "logical query lengths checked"),
+                ):
+                    runner._dummy_run(num_tokens, uniform_decode=True, cudagraph_runtime_mode=CUDAGraphMode.FULL)
+
     def test_padded_dummy_preserves_other_dp_token_counts(self):
         for token_counts in ([24, 8], [8, 24], [8, 8]):
             with self.subTest(token_counts=token_counts):
