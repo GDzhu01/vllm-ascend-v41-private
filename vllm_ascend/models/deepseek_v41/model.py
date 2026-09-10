@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import vllm.envs as envs
 from safetensors import safe_open
 from transformers import AutoTokenizer
 from vllm.distributed import get_pp_group
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v41 import (
@@ -30,6 +31,12 @@ from vllm_ascend.models.deepseek_v4.model import (
     DeepseekV2DecoderLayer,
     DeepseekV4Attention,
     DeepseekV4Model,
+)
+from vllm_ascend.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_reduce_scatter,
+    sp_shard,
 )
 
 from .compressor import DeepseekV41Compressor, _read, text_config_of
@@ -347,6 +354,13 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
 
     def __init__(self, vllm_config, prefix, **kwargs):
         super().__init__(vllm_config, prefix, **kwargs)
+        self.use_sequence_parallel = (
+            vllm_config.parallel_config.use_sequence_parallel_moe
+        )
+        # Leave the TP partial sums for the reduce-scatter below. The mHC
+        # and MoE paths then stay sharded between attention calls.
+        if self.use_sequence_parallel:
+            self.self_attn.wo_b.reduce_results = False
         config = vllm_config.model_config.hf_config
         engram_enabled = get_ascend_config().enable_engram
         if engram_enabled and self.layer_idx in config.engram_layer_ids:
@@ -399,6 +413,7 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
         llama_4_scaling=None,
         input_ids=None,
     ):
+        use_sequence_parallel = getattr(self, "use_sequence_parallel", False)
         residual = hidden_states
         x, attn_post, attn_comb, attn_pre = self.hc_pre(
             hidden_states,
@@ -408,7 +423,11 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
             pre_mix,
         )
         x = self.input_layernorm(x)
+        if use_sequence_parallel:
+            x = sp_all_gather(x)[: positions.shape[0]]
         x = self.self_attn(positions, x, llama_4_scaling)
+        if use_sequence_parallel:
+            x = sp_reduce_scatter(x)
         hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
@@ -420,7 +439,12 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
             attn_pre,
         )
         x, x_fp32 = self.rms_norm_cast(x)
-        x = self.mlp(x, input_ids=input_ids, hidden_states_fp32=x_fp32)
+        x = self.mlp(
+            x,
+            input_ids=input_ids,
+            hidden_states_fp32=x_fp32,
+            already_sequence_parallel=use_sequence_parallel,
+        )
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
         return hidden_states, ffn_pre
 
@@ -438,6 +462,9 @@ class DeepseekV41Model(DeepseekV4Model):
         ):
             raise ValueError("Engram HBM shards require --safetensors-load-strategy lazy")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.use_sequence_parallel = (
+            vllm_config.parallel_config.use_sequence_parallel_moe
+        )
         # V4.1 collapses with the last block's ffn_pre; it has no hc_head
         # projection in the checkpoint.
         del self.hc_head_fn, self.hc_head_base, self.hc_head_scale, self.hc_norm
@@ -572,12 +599,28 @@ class DeepseekV41Model(DeepseekV4Model):
     ):
         if not get_pp_group().is_first_rank or not get_pp_group().is_last_rank:
             raise NotImplementedError("V4.1 eager milestone currently requires PP=1")
+        use_sequence_parallel = getattr(self, "use_sequence_parallel", False)
         hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
         if engram_lookups is None:
             lookups, token_mask = self.prepare_engram(input_ids, positions)
         else:
             lookups, token_mask = engram_lookups, engram_mask
         self.shared_attention_state.reset()
+        full_num_tokens = positions.shape[0]
+        if use_sequence_parallel:
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                forward_context = get_forward_context()
+                forward_context.is_padding = sp_padding_mask(
+                    forward_context.is_padding,
+                    hidden_states,
+                )
+            hidden_states = sp_shard(hidden_states)
+            input_ids = sp_shard(input_ids)
+            token_mask = sp_shard(token_mask)
+            lookups = {
+                layer_idx: sp_shard(lookup)
+                for layer_idx, lookup in lookups.items()
+            }
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
         pre_mix[:, 0] = 1.0
@@ -591,7 +634,10 @@ class DeepseekV41Model(DeepseekV4Model):
             # DSpark consumes the residual stream entering its configured
             # target layers. The runner expresses checkpoint IDs as one-based.
             if layer.layer_idx + 1 in self.aux_hidden_state_layers:
-                aux_hidden_states.append(hidden_states.mean(dim=1))
+                aux_hidden_state = hidden_states.mean(dim=1)
+                if use_sequence_parallel:
+                    aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
+                aux_hidden_states.append(aux_hidden_state)
             if layer.engram is not None and token_mask.numel():
                 n = hidden_states.shape[0]
                 # Graph captures keep lookup buffers at static capacity; the
@@ -612,6 +658,8 @@ class DeepseekV41Model(DeepseekV4Model):
             hidden_states, pre_mix = layer(positions, hidden_states, pre_mix, None, input_ids=moe_input_ids)
         assert last_layer is not None
         hidden_states = last_layer.hc_collapse(hidden_states, pre_mix)
+        if use_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         hidden_states = self.norm(hidden_states)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states

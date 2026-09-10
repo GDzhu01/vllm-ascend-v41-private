@@ -376,6 +376,7 @@ class DeepseekV4MoE(nn.Module):
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         hidden_states_fp32: torch.Tensor | None = None,
+        already_sequence_parallel: bool = False,
     ) -> torch.Tensor:
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
@@ -389,7 +390,7 @@ class DeepseekV4MoE(nn.Module):
         # This avoids duplicate computation in self.experts.
         # TODO: We can replace the all_reduce at the end of attn with a
         # reduce_scatter instead of chunking here.
-        if self.is_sequence_parallel:
+        if self.is_sequence_parallel and not already_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
             if hidden_states_fp32 is not None:
                 hidden_states_fp32 = sequence_parallel_chunk(hidden_states_fp32)
@@ -435,7 +436,7 @@ class DeepseekV4MoE(nn.Module):
         else:
             final_hidden_states = fused_moe_out
 
-        if self.is_sequence_parallel:
+        if self.is_sequence_parallel and not already_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, 0)
             final_hidden_states = final_hidden_states[:num_tokens]
         elif self.tp_size > 1 and fused_moe_out_is_tuple:

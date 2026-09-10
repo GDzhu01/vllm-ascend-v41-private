@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from tests.deepseek_v41_reference import hc_mixes_reference, hc_post_reference
+from vllm_ascend.models.deepseek_v41 import model as deepseek_v41_module
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41DecoderLayer
 
 
@@ -92,7 +93,44 @@ def test_v41_forward_threads_pre_mix_through_fused_hc_pre():
     assert layer.hc_pre.call_args_list[0].args[-1] is incoming_pre
     assert layer.hc_pre.call_args_list[1].args[-1] is attn_pre
     layer.rms_norm_cast.assert_called_once_with(collapsed)
-    layer.mlp.assert_called_once_with(normalized, input_ids=input_ids, hidden_states_fp32=normalized_fp32)
+    layer.mlp.assert_called_once_with(
+        normalized,
+        input_ids=input_ids,
+        hidden_states_fp32=normalized_fp32,
+        already_sequence_parallel=False,
+    )
+
+
+def test_v41_forward_gathers_attention_and_keeps_moe_sharded(monkeypatch):
+    layer = _layer()
+    layer.use_sequence_parallel = True
+    hidden_states = torch.randn(2, 4, 8, dtype=torch.bfloat16)
+    collapsed = torch.randn(2, 8, dtype=torch.bfloat16)
+    post = torch.randn(2, 4, dtype=torch.float32)
+    comb = torch.randn(2, 4, 4, dtype=torch.float32)
+    pre = torch.randn(2, 4, dtype=torch.float32)
+    layer.hc_attn_fn = torch.nn.Parameter(torch.empty(24, 32))
+    layer.hc_attn_scale = torch.nn.Parameter(torch.empty(3))
+    layer.hc_attn_base = torch.nn.Parameter(torch.empty(24))
+    layer.hc_ffn_fn = torch.nn.Parameter(torch.empty(24, 32))
+    layer.hc_ffn_scale = torch.nn.Parameter(torch.empty(3))
+    layer.hc_ffn_base = torch.nn.Parameter(torch.empty(24))
+    layer.hc_pre = MagicMock(side_effect=[(collapsed, post, comb, pre)] * 2)
+    layer.input_layernorm = MagicMock(side_effect=lambda value: value)
+    layer.rms_norm_cast = MagicMock(return_value=(collapsed, collapsed.float()))
+    layer.self_attn = MagicMock(side_effect=lambda _positions, value, _scaling: value)
+    layer.mlp = MagicMock(side_effect=lambda value, **_kwargs: value)
+    layer.hc_post = MagicMock(side_effect=lambda _x, residual, _post, _comb: residual)
+    all_gather = MagicMock(return_value=collapsed)
+    reduce_scatter = MagicMock(return_value=collapsed)
+    monkeypatch.setattr(deepseek_v41_module, "sp_all_gather", all_gather)
+    monkeypatch.setattr(deepseek_v41_module, "sp_reduce_scatter", reduce_scatter)
+
+    layer.forward(torch.arange(2), hidden_states, pre, input_ids=torch.tensor([1, 2]))
+
+    all_gather.assert_called_once_with(collapsed)
+    reduce_scatter.assert_called_once_with(collapsed)
+    assert layer.mlp.call_args.kwargs["already_sequence_parallel"] is True
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
