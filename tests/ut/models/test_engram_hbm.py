@@ -32,7 +32,7 @@ hash_mod = load_module("engram_hash")
 gate = gate_mod.engram_gate
 
 
-@pytest.mark.parametrize("cp", [False, True])
+@pytest.mark.parametrize("cp", ["none", "legacy", "v41", "v41_empty_rank"])
 @pytest.mark.parametrize("cpu_mirrors", [False, True])
 def test_engram_history_metadata_uses_full_requests(cp, cpu_mirrors):
     boundaries = torch.tensor([0, 3, 9], dtype=torch.int32)
@@ -43,9 +43,18 @@ def test_engram_history_metadata_uses_full_requests(cp, cpu_mirrors):
         # The CPU mirrors must avoid touching the device tensors.
         fields.update(query_start_loc=None, block_table=None)
     request = SimpleNamespace(**fields)
-    if cp:
+    if cp == "legacy":
         request.cp_metadata = SimpleNamespace(local_query_start_loc=torch.tensor([0, 0, 2]))
         metadata = SimpleNamespace(req_metadata=request, block_tables=None)
+    elif cp.startswith("v41"):
+        local = torch.tensor([0, 0, 0] if cp == "v41_empty_rank" else [0, 0, 2])
+        metadata = SimpleNamespace(
+            global_metadata=request,
+            query_start_loc=local,
+            query_start_loc_cpu=local,
+            block_table=None,
+            storage_block_size=4,
+        )
     else:
         metadata = request
     actual_boundaries, actual_pages, block_size = hash_mod.engram_history_metadata(metadata)
