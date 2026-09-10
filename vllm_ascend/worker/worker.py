@@ -1098,7 +1098,13 @@ class NPUWorker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         self.log_memory_stats()
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
-        self.model_runner._dummy_run(num_tokens, uniform_decode=True)
+        kwargs = {"uniform_decode": True}
+        if not self.use_v2_model_runner:
+            # Idle DP passes can run while PD receives into allocated pages.
+            # V1 dummy ring IDs are not scheduler-owned: suppress both their
+            # initialization and writes so they cannot overwrite live KV.
+            kwargs["skip_ring_state_update"] = True
+        self.model_runner._dummy_run(num_tokens, **kwargs)
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""

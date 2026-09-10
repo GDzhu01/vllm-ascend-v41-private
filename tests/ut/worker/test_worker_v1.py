@@ -16,6 +16,23 @@ kw_module = importlib.import_module("vllm_ascend.model_executor.warmup.kernel_wa
 
 
 class TestNPUWorker(TestBase):
+    def test_idle_dummy_batch_preserves_v1_ring_state(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        for use_v2 in (False, True):
+            for query_len in (1, 8):
+                with self.subTest(use_v2=use_v2, query_len=query_len):
+                    worker = NPUWorker.__new__(NPUWorker)
+                    worker.use_v2_model_runner = use_v2
+                    worker.log_memory_stats = MagicMock()
+                    worker.model_runner = MagicMock()
+                    worker.model_runner.uniform_decode_query_len = query_len
+                    worker.execute_dummy_batch()
+                    kwargs = {"uniform_decode": True}
+                    if not use_v2:
+                        kwargs["skip_ring_state_update"] = True
+                    worker.model_runner._dummy_run.assert_called_once_with(query_len, **kwargs)
+
     def setUp(self):
         """Setup test environment"""
         # Create configuration mocks

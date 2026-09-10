@@ -2196,7 +2196,11 @@ class NPUModelRunner(GPUModelRunner):
                         # returns True. before returning early here we call
                         # dummy run to ensure coordinate_batch_across_dp
                         # is called into to avoid out of sync issues.
-                        self._dummy_run(1, skip_gdn_state_update=True)
+                        self._dummy_run(
+                            1,
+                            skip_gdn_state_update=True,
+                            skip_ring_state_update=True,
+                        )
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
                         return EMPTY_MODEL_RUNNER_OUTPUT
@@ -3198,6 +3202,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         skip_gdn_state_update: bool = False,
+        skip_ring_state_update: bool = False,
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
         batch_descriptor: BatchDescriptor | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
@@ -3466,7 +3471,7 @@ class NPUModelRunner(GPUModelRunner):
             elif isinstance(builder, DeepseekV41MetadataBuilder):
                 extra_attn_metadata_args = dict(
                     num_actual_reqs=num_reqs,
-                    skip_ring_state_update=skip_gdn_state_update,
+                    skip_ring_state_update=skip_ring_state_update,
                     common_v41_metadata=common_v41_metadata,
                     full_graph_mode=cudagraph_runtime_mode == CUDAGraphMode.FULL,
                 )
@@ -3619,6 +3624,7 @@ class NPUModelRunner(GPUModelRunner):
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
         skip_gdn_state_update: bool = False,
+        skip_ring_state_update: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -3781,7 +3787,7 @@ class NPUModelRunner(GPUModelRunner):
                 # Dummy requests bypass scheduler allocation. Give each active
                 # request a distinct non-null state ID before metadata/capture.
                 for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
-                    if skip_gdn_state_update or not is_circular_spec(group.kv_cache_spec):
+                    if skip_ring_state_update or not is_circular_spec(group.kv_cache_spec):
                         continue
                     if num_reqs >= self.kv_cache_config.num_blocks:
                         raise ValueError("Insufficient ring pages for dummy graph requests")
@@ -3817,6 +3823,7 @@ class NPUModelRunner(GPUModelRunner):
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
                     skip_gdn_state_update=skip_gdn_state_update,
+                    skip_ring_state_update=skip_ring_state_update,
                 )
         with self.maybe_dummy_run_with_lora(
             self.lora_config,

@@ -1588,6 +1588,7 @@ class TestNPUModelRunnerDebugger(unittest.TestCase):
         runner._dummy_run.assert_called_once_with(
             1,
             skip_gdn_state_update=True,
+            skip_ring_state_update=True,
         )
         runner._start_dump_data.assert_not_called()
 

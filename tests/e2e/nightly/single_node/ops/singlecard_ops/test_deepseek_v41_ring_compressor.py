@@ -101,6 +101,20 @@ def test_projected_ring_graph_replay_uses_new_metadata_and_request_ids():
         torch.testing.assert_close(out.cpu(), expected, rtol=0.016, atol=1e-5)
         torch.testing.assert_close(state.cpu(), expected_state, rtol=0, atol=0)
 
+    # Replay the same graph as an idle DP pass while live/transferred pages
+    # remain resident. Even nonfinite dummy projections must not write them.
+    state.copy_(initial)
+    kv.fill_(float("nan"))
+    scores.fill_(float("nan"))
+    controls = meta_cpu.clone()
+    controls[1].zero_()
+    controls[4].zero_()
+    meta.copy_(controls)
+    graph.replay()
+    torch.npu.synchronize()
+    torch.testing.assert_close(state.cpu(), initial, rtol=0, atol=0)
+    assert torch.count_nonzero(out).item() == 0
+
 
 def test_empty_projected_batch_keeps_ring_untouched():
     state, initial, _, _, _ = _inputs(0, 0)
