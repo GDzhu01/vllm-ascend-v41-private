@@ -40,7 +40,7 @@ from vllm_ascend.models.common.ops.sequence_parallel import (
 
 from .compressor import DeepseekV41Compressor, _read, text_config_of
 from .engram_gate import engram_gate
-from .engram_hash import PagedNgramHistory
+from .engram_hash import PagedNgramHistory, engram_history_metadata
 from .engram_hbm import EngramQueryGroup, NodeShardedEngram
 from .indexer import DeepseekV41Indexer
 
@@ -531,23 +531,15 @@ class DeepseekV41Model(DeepseekV4Model):
         if metadata is not None and self.engram_history is not None:
             first = self.layers[0].self_attn.dsa_attn.swa_cache_layer
             meta = metadata[first.prefix]
-            boundaries = (
-                meta.query_start_loc_cpu
-                if getattr(meta, "query_start_loc_cpu", None) is not None
-                else meta.query_start_loc.detach().cpu()
-            ).long()
+            boundaries, block_table, block_size = engram_history_metadata(meta)
             n = int(boundaries[-1])
             requests = torch.repeat_interleave(torch.arange(len(boundaries) - 1, device="cpu"), boundaries.diff())
             hashes, mask = self.engram_history.update(
                 input_ids[:n].cpu().long(),
                 positions[:n].cpu().long(),
                 requests,
-                (
-                    meta.block_table_cpu
-                    if getattr(meta, "block_table_cpu", None) is not None
-                    else meta.block_table.detach().cpu()
-                ),
-                meta.storage_block_size,
+                block_table,
+                block_size,
             )
         lookups = {}
         tables = [self.layers[layer_id].engram.embed for layer_id in config.engram_layer_ids]

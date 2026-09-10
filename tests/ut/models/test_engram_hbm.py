@@ -7,6 +7,7 @@ import json
 import sys
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -29,6 +30,28 @@ hbm = load_module("engram_hbm")
 gate_mod = load_module("engram_gate")
 hash_mod = load_module("engram_hash")
 gate = gate_mod.engram_gate
+
+
+@pytest.mark.parametrize("cp", [False, True])
+@pytest.mark.parametrize("cpu_mirrors", [False, True])
+def test_engram_history_metadata_uses_full_requests(cp, cpu_mirrors):
+    boundaries = torch.tensor([0, 3, 9], dtype=torch.int32)
+    pages = torch.tensor([[7, 8, 9], [12, 13, 14]], dtype=torch.int32)
+    fields = dict(query_start_loc=boundaries, block_table=pages, storage_block_size=4)
+    if cpu_mirrors:
+        fields.update(query_start_loc_cpu=boundaries, block_table_cpu=pages)
+        # The CPU mirrors must avoid touching the device tensors.
+        fields.update(query_start_loc=None, block_table=None)
+    request = SimpleNamespace(**fields)
+    if cp:
+        request.cp_metadata = SimpleNamespace(local_query_start_loc=torch.tensor([0, 0, 2]))
+        metadata = SimpleNamespace(req_metadata=request, block_tables=None)
+    else:
+        metadata = request
+    actual_boundaries, actual_pages, block_size = hash_mod.engram_history_metadata(metadata)
+    assert torch.equal(actual_boundaries, boundaries.long())
+    assert torch.equal(actual_pages, pages)
+    assert block_size == 4
 
 
 def _worker(rank, rendezvous):

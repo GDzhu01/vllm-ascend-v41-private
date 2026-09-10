@@ -10,6 +10,25 @@ _HISTORY_SLAB_MIN_TOKENS = 16
 _PAGE_WRITE_NUMPY_MIN_TOKENS = 16
 
 
+def engram_history_metadata(metadata):
+    """Read full-request SWA pages, before attention's local CP slicing.
+
+    DSA stores these fields directly; DSA_CP wraps them in req_metadata.
+    Its cp_metadata contains local query boundaries and must not be used
+    with the replicated input token stream consumed by Engram.
+    """
+    request_metadata = getattr(metadata, "req_metadata", None)
+    if request_metadata is None:
+        request_metadata = metadata
+    boundaries = getattr(request_metadata, "query_start_loc_cpu", None)
+    if boundaries is None:
+        boundaries = request_metadata.query_start_loc.detach().cpu()
+    block_table = getattr(request_metadata, "block_table_cpu", None)
+    if block_table is None:
+        block_table = request_metadata.block_table.detach().cpu()
+    return boundaries.long(), block_table, request_metadata.storage_block_size
+
+
 def valid_engram_token_mask(
     input_ids: torch.Tensor,
     image_token_id: int,
