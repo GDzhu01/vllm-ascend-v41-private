@@ -65,6 +65,13 @@ def _scores(q, k, w, qs, ks, ratio, residual, mask=3):
     return score, visible
 
 
+def _mask_non_candidates(score, membership):
+    # A2/A3 retain reachable non-candidates as low-priority TopK fillers.
+    # Causal padding must remain -inf; the A5 kernel is unchanged.
+    penalty = -torch.inf if is_950() else -1e30
+    score.masked_fill_(~membership & torch.isfinite(score), penalty)
+
+
 def _check_topk(score, indices, count):
     indices = indices.cpu().reshape(score.shape[0], -1)
     for row, idx in zip(score, indices):
@@ -177,7 +184,7 @@ def test_native_qli_candidate(ratio, length, mode):
         score, visible = _scores(*data[:5], ratio, ratio - 1)
         block_ids = candidate_in.cpu().reshape(data[0].shape[0], -1)
         membership = (torch.arange(length)[None, None, :] // 8 == block_ids[:, :, None]).any(1)
-        score.masked_fill_(~membership, -torch.inf)
+        _mask_non_candidates(score, membership)
     output, candidates = _invoke(data, layout, ratio, mode, candidates=candidate_in)
     _check_topk(score, output, min(128, length))
     if mode == 1:
@@ -322,7 +329,7 @@ def test_model_indexer_mixed_batch(ratio, zero_first):
         )
         block_ids = candidates[start:end].cpu().reshape(end - start, -1)
         keep = (torch.arange(lengths[i])[None, None, :] // 8 == block_ids[:, :, None]).any(1)
-        score.masked_fill_(~keep, -torch.inf)
+        _mask_non_candidates(score, keep)
         _check_topk(score, consumer_out[start:end], 128)
         valid = consumer_out[start:end].cpu()
         valid = torch.where(valid < 0, torch.iinfo(torch.int32).max, valid)
@@ -374,7 +381,7 @@ def test_64_head_candidate_consumer(ratio):
     _check_candidates(score, visible, candidates, 64)
     block_ids = candidates.cpu().reshape(1, -1)
     keep = (torch.arange(1025)[None, None, :] // 8 == block_ids[:, :, None]).any(1)
-    score.masked_fill_(~keep, -torch.inf)
+    _mask_non_candidates(score, keep)
     output, _ = _invoke(data, "TND", ratio, 2, candidates=candidates)
     _check_topk(score, output, 128)
 
@@ -388,6 +395,34 @@ def test_position_topk_width(topk):
     _check_candidates(score, visible, candidates, 64)
     block_ids = candidates.cpu().reshape(1, -1)
     keep = (torch.arange(4097)[None, None, :] // 8 == block_ids[:, :, None]).any(1)
-    score.masked_fill_(~keep, -torch.inf)
+    _mask_non_candidates(score, keep)
     output, _ = _invoke(data, "TND", 2, 2, candidates=candidates, topk=topk)
     _check_topk(score, output, topk)
+
+
+@pytest.mark.skipif(is_950(), reason="Candidate fill semantics changed only on A2/A3")
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("length,qlen", [(91, 5), (4096, 1)])
+def test_candidate_shortfall_keeps_reachable_indices(length, qlen, strided):
+    topk = 2048
+    data = _data(length, qlen=qlen, strided=strided)
+    score, visible = _scores(*data[:5], 1, 0)
+    block_ids = torch.arange(64, dtype=torch.int32).repeat(qlen, 1)
+    block_ids[:, 9:11] = -1
+    block_ids[block_ids >= (length + 7) // 8] = -1
+    candidates = block_ids.unsqueeze(1).npu()
+    membership = (torch.arange(length)[None, None, :] // 8 == block_ids[:, :, None]).any(1)
+    _mask_non_candidates(score, membership)
+
+    output, _ = _invoke(data, "TND", 1, 2, candidates=candidates, topk=topk)
+    _check_topk(score, output, topk)
+    # Missing candidate blocks must not turn reachable tokens into -1 slots.
+    for row, indices in enumerate(output.cpu().reshape(qlen, topk)):
+        valid = indices[indices >= 0].long()
+        reachable = torch.arange(int(visible[row]))
+        candidate_positions = reachable[membership[row, : reachable.numel()]]
+        assert torch.isin(candidate_positions, valid).all()
+        outside_count = (~membership[row, valid]).sum().item()
+        assert outside_count == min(topk, reachable.numel()) - candidate_positions.numel()
+        if reachable.numel() <= topk:
+            assert torch.equal(valid.sort().values, reachable)

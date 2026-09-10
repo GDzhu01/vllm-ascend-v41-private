@@ -128,8 +128,7 @@ private:
     LocalTensor<int32_t> globalTopkIndice_;
     LocalTensor<float> globalTopkUb_;
     LocalTensor<float> globalBlockTopkUb_;
-    LocalTensor<float> candIsOut_;       // mode=2: position 级 0/1 (1=候选外)
-    LocalTensor<int32_t> candIsOutI32_;  // mode=2: isOut 的 int32 形式
+    LocalTensor<float> candIsOut_;       // mode=2: position 级 0/1 (1=候选外), 仅用于分数降级 (R11 leak)
     LocalTensor<float> candNegHuge_;     // -1e30 常量
     GlobalTensor<int32_t> outputIdxOffsetGm_;        // A15: 每行输出索引偏移 (仅 sparse_indices)
     bool isOutputIdxOffsetValid_ = false;            // A15: offset 是否传入 (经 InitVecCandidateTensor 传递)
@@ -515,13 +514,9 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::BuildCandidateMask(const QLIV2Common
     VecMinsScalar(posDist, posDist, 1.0f, s2BaseSize_);
     PipeBarrier<PIPE_V>();
     candIsOut_ = posDist;
-    // isOut 的 int32 形式 (供索引置 -1)。
-    // 注意: f32->s32 仅 RINT/FLOOR/CEIL/ROUND/TRUNC 合法 (CAST_NONE 为 assert no-op);
-    // 且必须放在 [14336,16384), 避开 ProcessVec1 中 pen/idxPen 使用的 [4096,6144)
-    LocalTensor<int32_t> isOutI32 = tmp[14336].template ReinterpretCast<int32_t>();
-    Cast(isOutI32, posDist, RoundMode::CAST_RINT, s2BaseSize_);
-    PipeBarrier<PIPE_V>();
-    candIsOutI32_ = isOutI32;
+    // R11 (leak 语义, §1.6): isOut 仅用于分数降级 (pen 链), 索引保留真实位置号 —
+    // 候选外可达位置作为 topk 填充泄漏成有效索引 (对齐模型 where(idxs < compress_lens) 语义),
+    // 不再把候选外索引改 -1 (原 isOutI32/CAST_RINT 链已删)。
 }
 
 // mode=1 (is_candidate_source): 块内 amax (log2(blockSize) 轮 Max 树) + pin 尾块 + 块级排序/归并
@@ -558,7 +553,7 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessCandBlockTopk(const QLIV2Comm
     //  (实测 innerS1Idx=1 行的填充被 SortAll 抢跑覆盖); 禁止 s32->f32 Cast (v220 无此组合)。
     //  改为纯 int32 向量算术: idx' = idx - (idx+1)*isPad, isPad = clamp(idx - thr, 0, 1),
     //  thr = base + realBlockNum - 1; 所有指令 count=blockNumPad (64 对齐), 按 64 分块避免 mask 寄存器限制。
-    //  scratch 用 mode=1 独占区 [14336,15360) (mode=2 的 isOutI32 也用 14336, 两模式互斥),
+    //  scratch 用 mode=1 独占区 [14336,15360) (mode=2 的 isOutI32 已随 R11 leak 改造删除),
     //  避开主路径 tmpSortBuf [4096,12288), 消除跨迭代残留读的隐患)
     LocalTensor<int32_t> idxScr = tmp[14336].template ReinterpretCast<int32_t>();      // 等差源
     LocalTensor<int32_t> thrI = tmp[14592].template ReinterpretCast<int32_t>();        // 阈值
@@ -846,7 +841,8 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
             PipeBarrier<PIPE_V>();
             AscendC::Mul(mmInUb, mmInUb, kScaleUb, cuS2Len);
             PipeBarrier<PIPE_V>();
-            // mode=2 (use_candidate): 候选块外 score 减至极小值 (S4a, 纯算术无 NaN)
+            // mode=2 (use_candidate, R11 leak): 候选块外 score 降级 NEG_HUGE (S4a, 纯算术无 NaN);
+            // 仅降级排序资格、不取消入选资格 — 不足 topk 时候选外可达位置作为填充泄漏 (§1.6)
             if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER) {
                 BuildCandidateMask(info, cuS1Idx, cuBaseS2Idx, innerS1Idx);
                 PipeBarrier<PIPE_V>();
@@ -875,16 +871,10 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
             }
             Adds(sortIndiceUbInt, globalTopkIndice_, static_cast<int32_t>(cuBaseS2Idx), cuS2Len);
             PipeBarrier<PIPE_V>();
-            // mode=2: 候选块外索引同步置 -1: idx' = idx - isOut*(idx+1)
-            if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER) {
-                LocalTensor<int32_t> idxPen = tmpBuf_.Get<float>()[4864].template ReinterpretCast<int32_t>();
-                Adds(idxPen, sortIndiceUbInt, 1, cuS2Len);
-                PipeBarrier<PIPE_V>();
-                Mul(idxPen, idxPen, candIsOutI32_, cuS2Len);
-                PipeBarrier<PIPE_V>();
-                Sub(sortIndiceUbInt, sortIndiceUbInt, idxPen, cuS2Len);
-                PipeBarrier<PIPE_V>();
-            }
+            // R11 (leak 语义, §1.6): 候选块外索引不再置 -1 —
+            // 分数已在 S4a 降级 NEG_HUGE (仍高于 -inf: 不足 topk 时作为填充入选, 排候选内之后),
+            // 索引保留真实位置号, 与模型 where(idxs < compress_lens, idxs + offset, -1) 等价:
+            // 仅不可达位置 (score -inf 沉底 + 尾部 -1 填充) 输出 -1。
             // mode=1 (is_candidate_source): 块化 amax + pin + 块级排序归并 (S5a/S6a)
             if (constInfo_.candidateMode == CANDIDATE_MODE_SOURCE) {
                 ProcessCandBlockTopk(info, cuS1Idx, cuS2Len, cuS2LenVecAlign, cuRealAcSeq, innerS1Idx);
