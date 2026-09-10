@@ -233,6 +233,7 @@ def test_v41_dspark_propagates_delayed_mix_and_collapses_final_stream():
     model = DeepseekV41DSparkModel.__new__(DeepseekV41DSparkModel)
     torch.nn.Module.__init__(model)
     model.hc_mult = 2
+    model.needs_moe_input_ids = False
     model.embed_tokens = torch.nn.Embedding(4, 3)
     seen = []
 
@@ -256,6 +257,7 @@ def test_v41_target_emits_input_residual_for_selected_aux_layers():
     model = DeepseekV41Model.__new__(DeepseekV41Model)
     torch.nn.Module.__init__(model)
     model.hc_mult = 2
+    model.needs_moe_input_ids = False
     model.embed_tokens = torch.nn.Embedding(4, 3)
     model.norm = torch.nn.Identity()
     model.shared_attention_state = MagicMock()
@@ -267,6 +269,7 @@ def test_v41_target_emits_input_residual_for_selected_aux_layers():
         def __init__(self, idx):
             super().__init__()
             self.layer_idx = idx
+            self.engram = None
 
         def forward(self, positions, hidden, pre_mix, scaling, input_ids=None):
             return hidden + 1, pre_mix
@@ -275,7 +278,10 @@ def test_v41_target_emits_input_residual_for_selected_aux_layers():
     ids = torch.tensor([0, 1])
     with patch("vllm_ascend.models.deepseek_v41.model.get_pp_group",
                return_value=MagicMock(is_first_rank=True, is_last_rank=True)):
-        output, aux = model.forward(ids, torch.tensor([0, 1]), None)
+        output, aux = model.forward(
+            ids, torch.tensor([0, 1]), None, engram_lookups={},
+            engram_mask=torch.empty(0, dtype=torch.bool),
+        )
     embedded = model.embed_tokens(ids)
     torch.testing.assert_close(output, embedded + 3)
     assert len(aux) == 2
@@ -301,7 +307,12 @@ def test_v41_dspark_decoder_uses_draft_experts_instead_of_target_config():
         speculative_config=SimpleNamespace(draft_model_config=SimpleNamespace(hf_text_config=draft)),
         quant_config=None,
     )
-    factory = MagicMock(side_effect=lambda *args, **kwargs: torch.nn.Module())
+    def make_layer(*args, **kwargs):
+        layer = torch.nn.Module()
+        layer.mlp = SimpleNamespace(gate=SimpleNamespace(tid2eid=None, bias_vl=None))
+        return layer
+
+    factory = MagicMock(side_effect=make_layer)
     with ExitStack() as stack:
         for name in ("VocabParallelEmbedding", "ColumnParallelLinear", "RMSNorm", "DSparkMarkovHead", "DSparkConfidenceHead"):
             stack.enter_context(patch.object(shared, name, side_effect=lambda *args, **kwargs: torch.nn.Identity()))

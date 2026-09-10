@@ -317,7 +317,7 @@ class DeepseekV41EagerAttentionImpl:
         positions = metadata.positions[: hidden_states.shape[0]]
         cos, sin = metadata.rope(attn.rotary_emb.layername, hidden_states.shape[0])
         kv = self._project_kv(attn, hidden_states, cos, sin)
-        scatter_cache_v2(attn.dsa_attn.swa_cache_layer.kv_cache[0], metadata.swa.slot_mapping, kv)
+        scatter_cache_sk(attn.dsa_attn.swa_cache_layer.kv_cache[0], metadata.swa.slot_mapping, kv)
         if self.role.is_kv_source:
             self._write_compressed_source(attn, hidden_states, positions, cos, sin, metadata)
 
@@ -333,12 +333,13 @@ class DeepseekV41EagerAttentionImpl:
             self._write_compressed_source(attn, hidden_states, positions, cos, sin, metadata)
         return q, qr
 
-    def _project_output(self, attn, output, hidden_states, metadata):
+    def _project_output(self, attn, output, hidden_states, metadata, projected=None):
         padded = output
         if output.shape[0] != hidden_states.shape[0]:
             padded = output.new_zeros((hidden_states.shape[0], output.shape[1], output.shape[2]))
             padded[: output.shape[0]] = output
-        projected = torch.empty_like(hidden_states)
+        if projected is None:
+            projected = torch.empty_like(hidden_states)
         attn.dsa_attn.dsa_attn.impl._forward_o_proj(padded, projected)
         return projected
 
@@ -545,9 +546,7 @@ class DeepseekV41EagerAttentionImpl:
         if attn.head_dim != 512:
             raise ValueError(f"SparseFlashMla requires head_dim 512, got {attn.head_dim}")
         if attn.window_size != 128:
-            raise ValueError(
-                f"A2/A3 SparseFlashMla requires sliding_window 128, got {attn.window_size}"
-            )
+            raise ValueError(f"A2/A3 SparseFlashMla requires sliding_window 128, got {attn.window_size}")
         num_heads = q.shape[1]
         if not 1 <= num_heads <= 128 or num_heads & (num_heads - 1):
             raise ValueError(
@@ -648,7 +647,7 @@ class DeepseekV41EagerAttentionImpl:
         else:
             heads = attn.n_heads if getattr(attn, "enable_dsa_cp", False) else attn.n_local_heads
             attention_output = hidden_states.new_empty((0, heads, attn.head_dim))
-        output.copy_(self._project_output(attn, attention_output, hidden_states, metadata))
+        self._project_output(attn, attention_output, hidden_states, metadata, projected=output)
         return output
 
 

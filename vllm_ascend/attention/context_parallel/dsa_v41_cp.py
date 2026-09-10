@@ -5,7 +5,6 @@
 from dataclasses import replace
 
 import torch
-
 from vllm.distributed import get_tp_group
 
 from vllm_ascend.attention.context_parallel.dsa_common import restore_tp_heads
@@ -28,9 +27,7 @@ class _ReplicatedCacheMetadataBuilder(DeepseekV41MetadataBuilder):
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._global_builder = DeepseekV41MetadataBuilder(
-            kv_cache_spec, layer_names, vllm_config, device
-        )
+        self._global_builder = DeepseekV41MetadataBuilder(kv_cache_spec, layer_names, vllm_config, device)
 
     def enable_device_metadata(self):
         super().enable_device_metadata()
@@ -47,9 +44,10 @@ class _ReplicatedCacheMetadataBuilder(DeepseekV41MetadataBuilder):
         shared = kwargs.get("common_v41_metadata")
         if shared is not None:
             global_kwargs["common_v41_metadata"] = shared.setdefault("cp_global", {})
-        return self._global_builder.build(
-            common_prefix_len, common, fast_build, **global_kwargs
-        )
+        batch_shared = kwargs.get("common_v41_batch_metadata")
+        if batch_shared is not None:
+            global_kwargs["common_v41_batch_metadata"] = batch_shared.setdefault("cp_global", {})
+        return self._global_builder.build(common_prefix_len, common, fast_build, **global_kwargs)
 
 
 class DeepseekV41CPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
@@ -64,7 +62,9 @@ class DeepseekV41CPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False, **kwargs):
         common = common_attn_metadata
         global_metadata = self._build_global_metadata(common_prefix_len, common, fast_build, kwargs)
-        seq_lens_cpu = common._seq_lens_cpu if getattr(common, "_seq_lens_cpu", None) is not None else common.seq_lens_cpu
+        seq_lens_cpu = (
+            common._seq_lens_cpu if getattr(common, "_seq_lens_cpu", None) is not None else common.seq_lens_cpu
+        )
         start, end, per_rank, padded, qsl, seq_lens = AscendDSACPMetadataBuilder._build_local_token_metadata(
             self,
             common.num_reqs,
@@ -139,11 +139,14 @@ class DeepseekV41CPImpl(DeepseekV41EagerAttentionImpl):
         # Replicated caches were updated before the TP token slice.
         return self._project_q(attn, hidden_states, cos, sin)
 
-    def _project_output(self, attn, output, hidden_states, metadata):
+    def _project_output(self, attn, output, hidden_states, metadata, projected=None):
         _, _, per_rank, _ = metadata.swa.cp_token_range
         padded = output.new_zeros((per_rank, output.shape[1], output.shape[2]))
         padded[: output.shape[0]] = output
         exchanged = restore_tp_heads(padded, get_tp_group())
         # The inherited V4 module owns quantized weights and TP projection logic.
-        projected = attn.dsa_attn.dsa_attn.impl._forward_o_proj(exchanged)
-        return projected[: hidden_states.shape[0]]
+        if projected is None:
+            projected = torch.empty_like(hidden_states)
+        local_output = attn.dsa_attn.dsa_attn.impl._forward_o_proj(exchanged)
+        projected.copy_(local_output[: hidden_states.shape[0]])
+        return projected

@@ -331,12 +331,10 @@ def test_model_registration_and_binding(runtime):
     assert len(owned_names) == 51
 
 
-@pytest.mark.parametrize("feature", ["spec", "pd", "pp", "graph"])
+@pytest.mark.parametrize("feature", ["spec", "pp", "graph"])
 def test_unsupported_runtime_fails_before_registration(runtime, feature):
     if feature == "spec":
         runtime.speculative_config = object()
-    elif feature == "pd":
-        runtime.kv_transfer_config = object()
     elif feature == "pp":
         runtime.parallel_config.pipeline_parallel_size = 2
     else:
@@ -1256,7 +1254,9 @@ def test_v41_cp_metadata_preserves_global_compression_and_local_causality(
     )
     spec = collect_specs(runtime)["model.layers.2.self_attn.long_kv_cache"]
     builder = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu"))
-    metadata = builder.build(0, _cp_common())
+    metadata = builder.build(
+        0, _cp_common(), common_v41_metadata={}, common_v41_batch_metadata={}
+    )
     assert metadata.query_start_loc.tolist() == query_offsets
     assert metadata.query_start_loc.dtype == torch.int32
     pointer = metadata.query_start_loc.data_ptr()
@@ -1367,12 +1367,15 @@ def test_v41_cp_empty_query_rank_still_exchanges_output(monkeypatch):
     monkeypatch.setattr("vllm_ascend.attention.context_parallel.dsa_v41_cp.restore_tp_heads", exchange)
     projection = SimpleNamespace(_forward_o_proj=lambda tensor: tensor.flatten(1))
     attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=projection)))
+    destination = torch.empty((3, 6))
     output = impl._project_output(
         attn,
         torch.empty((0, 4, 3)),
         torch.empty((3, 6)),
         SimpleNamespace(swa=SimpleNamespace(cp_token_range=(3, 4, 1, 4))),
+        projected=destination,
     )
+    assert output.data_ptr() == destination.data_ptr()
     assert calls[0].shape == (1, 4, 3)
     assert torch.count_nonzero(calls[0]) == 0
     assert output.shape == (3, 6)
