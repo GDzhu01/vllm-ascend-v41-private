@@ -3,7 +3,9 @@
 """Aurora / DeepSeek-V4.1 dSPark draft model for Ascend."""
 
 import torch
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -19,6 +21,11 @@ from vllm_ascend.models.deepseek_v4.dspark import (
 )
 from vllm_ascend.models.deepseek_v4.model import AscendDeepseekV4SWACache, DeepseekV4Attention
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41DecoderLayer
+from vllm_ascend.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_shard,
+)
 
 
 class DeepseekV41DSparkSWACache(AscendDeepseekV4SWACache):
@@ -73,6 +80,9 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
         if self.num_dspark_layers != 3:
             raise ValueError("Aurora's DSpark cache group requires exactly three draft layers")
         self.mtp_start_layer_idx = config.num_hidden_layers
+        self.use_sequence_parallel = (
+            vllm_config.parallel_config.use_sequence_parallel_moe
+        )
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -119,6 +129,16 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids).unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        full_num_tokens = positions.shape[0]
+        if self.use_sequence_parallel:
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                forward_context = get_forward_context()
+                forward_context.is_padding = sp_padding_mask(
+                    forward_context.is_padding,
+                    hidden_states,
+                )
+            hidden_states = sp_shard(hidden_states)
+            input_ids = sp_shard(input_ids)
         pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
         pre_mix[:, 0] = 1.0
         last_layer = None
@@ -135,7 +155,10 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
                 input_ids=moe_input_ids,
             )
         assert last_layer is not None
-        return last_layer.hc_collapse(hidden_states, pre_mix)
+        hidden_states = last_layer.hc_collapse(hidden_states, pre_mix)
+        if self.use_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        return hidden_states
 
 
 @support_torch_compile

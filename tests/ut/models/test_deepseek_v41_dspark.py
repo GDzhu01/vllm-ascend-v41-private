@@ -3,7 +3,7 @@
 """Deferred torch checks for Aurora DSpark model/cache integration."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
@@ -18,6 +18,7 @@ from vllm_ascend.models.deepseek_v41.dspark import (
     DeepseekV41DSparkDecoderLayer,
     DeepseekV41DSparkSWACache,
 )
+from vllm_ascend.models.deepseek_v41 import dspark as deepseek_v41_dspark_module
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41Model
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -99,3 +100,47 @@ def test_v41_draft_disables_only_its_backend_post_projection_q_norm():
         draft = DeepseekV41DSparkAttention()
     assert draft.dsa_attn.dsa_attn.impl.apply_q_norm is False
     assert ordinary_backend.apply_q_norm is True
+
+
+def test_v41_draft_sequence_parallel_shards_inputs_and_restores_output(monkeypatch):
+    class Layer:
+        @staticmethod
+        def hc_collapse(hidden, pre_mix):
+            return hidden.mean(dim=1)
+
+        def __call__(self, positions, hidden, pre_mix, unused, input_ids):
+            return hidden, pre_mix
+
+    hidden = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    input_ids = torch.tensor([11, 12, 13, 14])
+    padding = torch.tensor([False, True, False, False])
+    forward_context = SimpleNamespace(is_padding=padding)
+    sharded_hidden = hidden[:2].unsqueeze(1).repeat(1, 4, 1)
+    sharded_ids = input_ids[:2]
+    gathered = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    sp_shard = MagicMock(side_effect=[sharded_hidden, sharded_ids])
+    sp_all_gather = MagicMock(return_value=gathered)
+    padding_mask = MagicMock(return_value=torch.tensor([False, True]))
+    monkeypatch.setattr(deepseek_v41_dspark_module, "sp_shard", sp_shard)
+    monkeypatch.setattr(deepseek_v41_dspark_module, "sp_all_gather", sp_all_gather)
+    monkeypatch.setattr(deepseek_v41_dspark_module, "sp_padding_mask", padding_mask)
+    monkeypatch.setattr(deepseek_v41_dspark_module, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(deepseek_v41_dspark_module, "get_forward_context", lambda: forward_context)
+    monkeypatch.setattr(deepseek_v41_dspark_module.envs, "VLLM_MOE_SKIP_PADDING", True)
+
+    model = SimpleNamespace(
+        embed_tokens=MagicMock(return_value=hidden),
+        hc_mult=4,
+        use_sequence_parallel=True,
+        needs_moe_input_ids=False,
+        layers={"40": Layer()},
+    )
+
+    output = DeepseekV41DSparkModel.forward(model, input_ids, torch.arange(4))
+
+    padding_mask.assert_called_once()
+    assert forward_context.is_padding.tolist() == [False, True]
+    assert sp_shard.call_args_list[0].args[0].shape == (4, 4, 4)
+    assert sp_shard.call_args_list[1].args[0] is input_ids
+    sp_all_gather.assert_called_once()
+    torch.testing.assert_close(output, gathered[:4])
