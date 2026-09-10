@@ -12,7 +12,10 @@ from vllm.triton_utils import tl, triton
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens", "num_actual_tokens", "num_reqs", "num_slots", "vocab_size", "search_steps"],
+    do_not_specialize_on_alignment=["ids", "positions", "query_start", "blocks"],
+)
 def _hash_kernel(
     ids,
     positions,
@@ -43,7 +46,7 @@ def _hash_kernel(
     LAYERS: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_H: tl.constexpr,
-    SEARCH_STEPS: tl.constexpr,
+    search_steps,
 ):
     token = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     layer = tl.program_id(1)
@@ -51,7 +54,7 @@ def _hash_kernel(
     valid = (token < num_tokens) & (token < num_actual_tokens) & (token < total_query)
     lo = tl.full((BLOCK_T,), 0, tl.int32)
     hi = tl.full((BLOCK_T,), num_reqs, tl.int32)
-    for _ in tl.static_range(SEARCH_STEPS):
+    for _ in range(search_steps):
         mid = (lo + hi) // 2
         end = tl.load(query_start + mid + 1, lo < hi, other=0)
         right = token >= end
@@ -73,15 +76,22 @@ def _hash_kernel(
     for shift in tl.static_range(LOOKBACK):
         previous = position - shift
         in_batch = valid & (previous >= chunk_start) & (token >= shift)
-        source_id = tl.load(ids + (token - shift) * ids_stride, in_batch, other=-1)
+        source_index = tl.where(in_batch, token - shift, 0)
+        source_id = tl.load(ids + source_index * ids_stride, in_batch, other=-1)
         source_valid = in_batch & (source_id >= 0) & (source_id < vocab_size)
-        mapped = tl.load(token_map + source_id, source_valid, other=-1)
+        mapped = tl.load(token_map + tl.where(source_valid, source_id, 0), source_valid, other=-1)
         mapped = tl.where((source_id == image_id) | (source_id == image_pad_id), -1, mapped)
         column = previous // cache_block_size
         from_cache = valid & ~in_batch & (previous >= 0) & (column < block_columns)
-        block = tl.load(blocks + request * block_stride + column, from_cache, other=-1).to(tl.int64)
+        block_index = tl.where(from_cache, request * block_stride + column, 0)
+        block = tl.load(blocks + block_index, from_cache, other=-1).to(tl.int64)
         slot = block * cache_block_size + previous % cache_block_size
-        cached = tl.load(cache + slot, from_cache & (slot >= 0) & (slot < num_slots), other=-1)
+        cache_valid = from_cache & (slot >= 0) & (slot < num_slots)
+        # Ascend may form scalar GM addresses even for masked lanes. Keep
+        # inactive addresses inside the allocation, including when expandable
+        # segments leave the page preceding the history cache unmapped.
+        safe_slot = tl.where(cache_valid, slot, 0)
+        cached = tl.load(cache + safe_slot, cache_valid, other=-1)
         source = tl.where(in_batch, mapped, cached).to(tl.int64)
         blocked |= (previous < 0) | (source < 0)
         value = tl.where(blocked, pad_id, source)
@@ -102,7 +112,10 @@ def _hash_kernel(
             )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens", "num_actual_tokens", "num_reqs", "num_slots", "vocab_size"],
+    do_not_specialize_on_alignment=["ids", "slots", "query_start"],
+)
 def _write_history_kernel(
     ids,
     token_map,
@@ -129,9 +142,10 @@ def _write_history_kernel(
     slot = block * cache_block_size + offset
     valid &= (block >= 0) & (offset >= 0) & (slot < num_slots)
     source = tl.load(ids + token * ids_stride, valid, other=-1)
-    mapped = tl.load(token_map + source, valid & (source >= 0) & (source < vocab_size), other=-1)
+    source_valid = valid & (source >= 0) & (source < vocab_size)
+    mapped = tl.load(token_map + tl.where(source_valid, source, 0), source_valid, other=-1)
     mapped = tl.where((source == image_id) | (source == image_pad_id), -1, mapped)
-    tl.store(cache + slot, mapped, valid)
+    tl.store(cache + tl.where(valid, slot, 0), mapped, valid)
 
 
 def hash_engram(input_ids, positions, metadata, state):
@@ -203,7 +217,10 @@ def hash_engram(input_ids, positions, metadata, state):
     return hashes, keep
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["vocab_start", "vocab_end", "tokens"],
+    do_not_specialize_on_alignment=["ids"],
+)
 def _lookup_heads_kernel(
     weight,
     scales,
@@ -261,7 +278,7 @@ def lookup_engram_heads(table, ids):
     return output
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["elements", "source_tokens", "token_start"])
 def _select_rows_kernel(
     source,
     output,

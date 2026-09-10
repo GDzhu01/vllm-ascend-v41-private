@@ -16,6 +16,43 @@ from vllm_ascend.ops.triton.engram import lookup_engram_heads, select_engram_row
 BLOCK_SIZE = 128
 
 
+@pytest.mark.parametrize("block", [0, -1, 100000])
+@torch.inference_mode()
+def test_device_hash_masked_history_address(block):
+    """Run in a fresh process with PYTORCH_NPU_ALLOC_CONF=expandable_segments:True.
+
+    A large history allocation can begin at a mapped segment boundary. The
+    graph warmup's inactive cache reads must not address the preceding page.
+    """
+    device = torch.device("npu:0")
+    torch.npu.set_device(device)
+    reference = _history()
+    state = DeviceNgramHistory(reference, device)
+    state.cache = torch.full((2 * 1024 * 1024,), -1, dtype=torch.int32, device=device)
+    ids = torch.zeros(192, dtype=torch.int32, device=device)
+    positions = torch.full((192,), 127, dtype=torch.int64, device=device)
+    metadata = SimpleNamespace(
+        query_start_loc=torch.arange(0, 193, 6, dtype=torch.int32, device=device),
+        block_table=torch.full((32, 1024), block, dtype=torch.int32, device=device),
+        slot_mapping=torch.full((192, 2), -1, dtype=torch.int32, device=device),
+        num_actual_reqs=32,
+        num_actual_tokens=192,
+        storage_block_size=BLOCK_SIZE,
+    )
+    actual, mask = state.update(ids, positions, metadata)
+    rolling = torch.zeros(2, dtype=torch.int64)
+    expected = []
+    for shift in range(4):
+        value = 0 if shift == 0 else reference.pad_id
+        rolling ^= value * reference.multipliers[:, shift]
+        if shift:
+            expected.append(rolling[:, None] % reference.primes[:, shift - 1])
+    expected = torch.cat(expected, dim=-1) + reference.offsets
+    torch.testing.assert_close(actual.cpu(), expected.expand(192, -1, -1), rtol=0, atol=0)
+    assert mask.cpu().all()
+    assert (state.cache.cpu() == -1).all()
+
+
 def _history():
     history = PagedNgramHistory.__new__(PagedNgramHistory)
     history.token_map = torch.arange(100, dtype=torch.int64)
@@ -34,6 +71,54 @@ def _history():
     history.multipliers = compute_hash_multipliers((1, 14), 4, 100)
     history.pages = {}
     return history
+
+
+@torch.inference_mode()
+def test_engram_dynamic_batches_reuse_jit_kernels():
+    from vllm_ascend.ops.triton import engram as kernels
+
+    device = torch.device("npu:0")
+    torch.npu.set_device(device)
+    reference = _history()
+    state = DeviceNgramHistory(reference, device)
+    state.cache = torch.full((2 * 1024 * 1024,), -1, dtype=torch.int32, device=device)
+    sizes = reference.primes[0].flatten().tolist()
+    table = NodeShardedEngram(sum(sizes), 256, SimpleNamespace(size=1, head_shard_rank=0), device, "int8", sizes)
+    rows = (torch.arange(sum(sizes) * 256).reshape(-1, 256).float() % 31 - 15).bfloat16()
+    table.set_rows(0, rows)
+    functions = (
+        kernels._hash_kernel,
+        kernels._write_history_kernel,
+        kernels._lookup_heads_kernel,
+        kernels._select_rows_kernel,
+    )
+    baseline = None
+    for requests, length in ((1, 1), (2, 17), (3, 33), (7, 7), (8, 16), (16, 3), (32, 6), (1, 127)):
+        tokens = requests * length
+        # Shift addresses to exercise pointer-alignment specialization as well.
+        offset = requests % 2
+        ids = torch.zeros(tokens + offset, dtype=torch.int32, device=device)[offset:]
+        positions = torch.full((tokens + offset,), 127, dtype=torch.int64, device=device)[offset:]
+        metadata = SimpleNamespace(
+            query_start_loc=torch.arange(0, tokens + 1, length, dtype=torch.int32, device=device),
+            block_table=torch.zeros((requests, 1024), dtype=torch.int32, device=device),
+            slot_mapping=torch.full((tokens, 2), -1, dtype=torch.int32, device=device),
+            num_actual_reqs=requests,
+            num_actual_tokens=tokens,
+            storage_block_size=BLOCK_SIZE,
+        )
+        hashes, mask = state.update(ids, positions, metadata)
+        looked_up = kernels.lookup_engram_heads(table, hashes[:, 0])
+        # Change both the source token count and rank-local token offset.
+        gathered = torch.cat((looked_up, looked_up), dim=0).unsqueeze(0)
+        actual = kernels.select_engram_rows(gathered, tokens, tokens, len(sizes))
+        torch.testing.assert_close(actual.cpu(), looked_up.cpu(), rtol=0, atol=0)
+        assert mask.cpu().all()
+        counts = tuple(len(fn.cache[torch.npu.current_device()]) for fn in functions)
+        if baseline is None:
+            baseline = counts
+        else:
+            assert counts == baseline, (requests, length, baseline, counts)
 
 
 def _inputs(start, length, device):
