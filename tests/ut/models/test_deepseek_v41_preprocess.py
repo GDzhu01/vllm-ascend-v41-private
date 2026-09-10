@@ -100,7 +100,7 @@ def test_preprocess_equivalence_and_stream_dependencies(monkeypatch, share_quant
     monkeypatch.setattr(torch.npu, "current_stream", lambda: main)
     monkeypatch.setattr(dsa_v41, "dsv4_dsa_overlap_stream", lambda: aux)
     monkeypatch.setattr(dsa_v41, "npu_stream_switch", switch)
-    monkeypatch.setattr(dsa_v41, "scatter_cache_v2", scatter)
+    monkeypatch.setattr(dsa_v41, "scatter_cache_sk", scatter)
     monkeypatch.setattr(torch.ops._C_ascend, "inplace_partial_rotary_mul", rope, raising=False)
     torch.manual_seed(7)
     cache = torch.zeros(2, num_tokens, 4)

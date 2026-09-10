@@ -28,7 +28,7 @@ from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41MetadataBuilder,
     compressed_slot_mapping,
     pad_sparse_indices,
-    scatter_cache_v2,
+    scatter_cache_sk,
 )
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41DraftSWASpec,
@@ -564,7 +564,7 @@ def test_scatter_cache_redirects_invalid_rows_to_null_row():
     assert cache[0, 3, 0].tolist() == [7.0, 8.0]
 
 
-def test_scatter_cache_v2_consumes_prepared_coordinates_and_preserves_stride(
+def test_scatter_cache_sk_consumes_prepared_coordinates_and_preserves_stride(
     monkeypatch,
 ):
     backing = torch.zeros(3 * 128, dtype=torch.uint8)
@@ -582,11 +582,11 @@ def test_scatter_cache_v2_consumes_prepared_coordinates_and_preserves_stride(
 
     monkeypatch.setattr(
         torch.ops._C_ascend,
-        "npu_scatter_nd_update_v2",
+        "npu_scatter_nd_update_sk",
         scatter,
         raising=False,
     )
-    scatter_cache_v2(cache, indices, values)
+    scatter_cache_sk(cache, indices, values)
 
     var, actual_indices, updates = calls[0]
     assert var.shape == (3, 4, 2)
@@ -1077,7 +1077,7 @@ def test_ring_source_reuses_prepared_store_coordinates(monkeypatch, num_tokens, 
         torch.testing.assert_close(coordinates, expected)
 
     monkeypatch.setattr(dsa_v41, "wait_for_device_metadata", lambda *args: events.append("wait"))
-    monkeypatch.setattr(dsa_v41, "scatter_cache_v2", store)
+    monkeypatch.setattr(dsa_v41, "scatter_cache_sk", store)
     monkeypatch.setattr(torch.ops._C_ascend, "inplace_partial_rotary_mul", lambda *args, **kwargs: None, raising=False)
     attn = SimpleNamespace(
         compressor=SimpleNamespace(wkv=lambda x: x, wgate=lambda x: x, pool_projected=pool),

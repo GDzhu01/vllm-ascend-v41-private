@@ -10,7 +10,7 @@ import torch_npu  # noqa: F401
 
 from tests.deepseek_v41_cache_utils import allocate_cache_views, make_cache_config
 from tests.deepseek_v41_reference import scatter_cache
-from vllm_ascend.attention.dsa_v41 import scatter_cache_v2
+from vllm_ascend.attention.dsa_v41 import scatter_cache_sk
 from vllm_ascend.models.deepseek_v4.dspark import DeepseekV4DSparkModel
 from vllm_ascend.utils import enable_custom_op
 
@@ -85,7 +85,7 @@ def test_fused_store_matches_reference_in_layer_slots(name, rows, width, dtype):
 
     _reference_scatter(expected[name], slots, values)
     indices = _slot_mapping_2d(slots, rows)
-    scatter_cache_v2(actual[name], indices, values)
+    scatter_cache_sk(actual[name], indices, values)
     torch.npu.synchronize()
 
     for expected_raw, actual_raw in zip(expected_backing, actual_backing):
@@ -127,8 +127,8 @@ def test_indexer_dynamic_quant_and_fused_store_match_reference(kind):
     _reference_scatter(expected_key, slots, reference_key)
     _reference_scatter(expected_scale, slots, reference_scale.to(torch.float16))
     indices = _slot_mapping_2d(slots, rows)
-    scatter_cache_v2(actual_key, indices, actual_quant)
-    scatter_cache_v2(
+    scatter_cache_sk(actual_key, indices, actual_quant)
+    scatter_cache_sk(
         actual_scale,
         indices,
         actual_quant_scale.unsqueeze(-1).to(torch.float16),
@@ -165,7 +165,7 @@ def test_negative_coordinates_do_not_modify_packed_backing(name, plane, width, d
     # than the contiguous stride implied by the visible plane shape.
     squeezed = cache.squeeze(-2)
     assert squeezed.stride(0) > squeezed.shape[1] * squeezed.stride(1)
-    scatter_cache_v2(cache, indices, values)
+    scatter_cache_sk(cache, indices, values)
     torch.npu.synchronize()
 
     for expected_raw, actual_raw in zip(before, backing):

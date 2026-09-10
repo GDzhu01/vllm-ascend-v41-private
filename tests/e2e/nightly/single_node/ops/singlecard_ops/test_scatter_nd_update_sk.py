@@ -115,3 +115,25 @@ def test_scatter_nd_update_sk_duplicate_indices(var_dtype, idx_dtype, contiguous
     gc.collect()
     torch.npu.empty_cache()
     torch.npu.reset_peak_memory_stats()
+
+
+def test_scatter_nd_update_sk_preserves_high_strided_physical_address():
+    """Keep packed-cache addresses above FP32's exact integer range exact.
+
+    V4/V4.1 cache planes are views whose first-axis stride is the containing
+    slot's page size.  The logical coordinate is deliberately tiny while its
+    physical element offset exceeds 2**24, which used to be unsafe when the
+    linear address entered the FP32 sort path.
+    """
+    stride0 = (1 << 24) + 17
+    backing = torch.zeros(stride0 + 8, dtype=torch.int8, device="npu")
+    cache = torch.as_strided(backing, size=(2, 4, 1), stride=(stride0, 1, 1))
+    indices = torch.tensor([[1, 3]], dtype=torch.int32, device="npu")
+    update = torch.tensor([[73]], dtype=torch.int8, device="npu")
+
+    torch.ops._C_ascend.npu_scatter_nd_update_sk(cache, indices, update)
+    torch.npu.synchronize()
+
+    assert backing[stride0 + 3].item() == 73
+    assert backing[stride0 + 2].item() == 0
+    assert backing[stride0 + 4].item() == 0

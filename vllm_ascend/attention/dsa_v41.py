@@ -204,7 +204,7 @@ def _request_counts(common: Any, num_reqs: int):
     return num_decodes, num_decode_tokens, num_prefills, num_prefill_tokens
 
 
-def scatter_cache_v2(
+def scatter_cache_sk(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     values: torch.Tensor,
@@ -213,7 +213,7 @@ def scatter_cache_v2(
 
     V4.1 cache planes can be views into a larger layer-outermost slot, so the
     physical page stride is not necessarily the contiguous stride implied by
-    the plane shape. ``npu_scatter_nd_update_v2`` preserves that stride and
+    the plane shape. ``npu_scatter_nd_update_sk`` preserves that stride and
     treats the builder's ``[-1, -1]`` coordinates as skipped rows, matching V4.
     """
     if slot_mapping.ndim != 2 or slot_mapping.shape[-1] != 2:
@@ -223,7 +223,7 @@ def scatter_cache_v2(
     cache = cache.squeeze(-2)
     indices = slot_mapping[: values.shape[0]]
     updates = values.to(cache.dtype).contiguous()
-    torch.ops._C_ascend.npu_scatter_nd_update_v2(cache, indices, updates)
+    torch.ops._C_ascend.npu_scatter_nd_update_sk(cache, indices, updates)
 
 
 def pad_sparse_indices(indices: torch.Tensor, topk: int) -> torch.Tensor:
@@ -305,7 +305,7 @@ class DeepseekV41EagerAttentionImpl:
     def preprocess(self, attn, hidden_states, cos, sin, swa_metadata):
         """Project Q/KV and populate this layer's SWA cache on the current stream."""
         q, qr, kv = self._project_q_kv(attn, hidden_states, cos, sin)
-        scatter_cache_v2(
+        scatter_cache_sk(
             attn.dsa_attn.swa_cache_layer.kv_cache[0],
             swa_metadata.slot_mapping,
             kv,
@@ -364,7 +364,7 @@ class DeepseekV41EagerAttentionImpl:
                 rotary_mode="interleave",
                 partial_slice=[attn.nope_head_dim, attn.head_dim],
             )
-            scatter_cache_v2(
+            scatter_cache_sk(
                 attn.dsa_attn.swa_cache_layer.kv_cache[0],
                 swa_metadata.slot_mapping,
                 kv.squeeze(1),
@@ -442,7 +442,7 @@ class DeepseekV41EagerAttentionImpl:
             rotary_mode="interleave",
             partial_slice=[attn.nope_head_dim, attn.head_dim],
         )
-        scatter_cache_v2(
+        scatter_cache_sk(
             attn.long_kv_cache.kv_cache[0],
             long_slots,
             latent.squeeze(1),
