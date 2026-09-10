@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Adapted from the DeepSeek V4.1 reference inference/engram.py.
+import weakref
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 from sympy import isprime
+
+from vllm_ascend.ops.triton.engram import hash_engram
 
 _HISTORY_SLAB_MIN_TOKENS = 16
 _PAGE_WRITE_NUMPY_MIN_TOKENS = 16
@@ -253,3 +256,30 @@ class PagedNgramHistory:
             rolling = torch.bitwise_xor(rolling, products[..., shift])
             hashes.append(rolling[..., None] % self.primes[:, shift - 1])
         return torch.cat(hashes, -1) + self.offsets, mask
+
+
+class DeviceNgramHistory:
+    """HBM token history sharing the lifetime and physical slots of SWA KV."""
+
+    def __init__(self, history, device):
+        for name in ("token_map", "primes", "offsets", "multipliers"):
+            setattr(self, name, getattr(history, name).to(device))
+        self.pad_id = history.pad_id
+        self.image_token_id = history.image_token_id
+        self.image_pad_token_id = history.image_pad_token_id
+        self.lookback = history.lookback
+        self.cache = None
+        self._kv_cache_ref = None
+
+    def ensure_cache(self, kv_cache, block_size):
+        if kv_cache.numel() == 0:
+            self.cache = None
+            self._kv_cache_ref = None
+            return False
+        if self._kv_cache_ref is None or self._kv_cache_ref() is not kv_cache:
+            self.cache = torch.full((kv_cache.shape[0] * block_size,), -1, dtype=torch.int32, device=kv_cache.device)
+            self._kv_cache_ref = weakref.ref(kv_cache)
+        return True
+
+    def update(self, input_ids, positions, metadata):
+        return hash_engram(input_ids, positions, metadata, self)
