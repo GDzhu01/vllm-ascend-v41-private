@@ -3690,7 +3690,7 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
         if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
-            num_tokens_across_dp[:] = num_tokens_padded
+            num_tokens_across_dp[self.dp_rank] = num_tokens_padded
             num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
 
         if self.dynamic_eplb:
