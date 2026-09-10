@@ -10,7 +10,7 @@ from vllm.triton_utils import tl, triton
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows", "blocks_per_core"])
 def _prepare_indexer_indices_kernel(
     selected_ptr,
     positions_ptr,
@@ -18,15 +18,15 @@ def _prepare_indexer_indices_kernel(
     num_rows,
     TOPK: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
-    BLOCKS_PER_CORE: tl.constexpr,
+    blocks_per_core,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
     SENTINEL: tl.constexpr,
     SORT_KEY_SHIFT: tl.constexpr,
     NEGATIVE_KEY_BASE: tl.constexpr,
 ):
-    first_block = tl.program_id(0) * BLOCKS_PER_CORE
-    last_block = tl.minimum(first_block + BLOCKS_PER_CORE, tl.cdiv(num_rows, BLOCK_ROWS))
+    first_block = tl.program_id(0) * blocks_per_core
+    last_block = tl.minimum(first_block + blocks_per_core, tl.cdiv(num_rows, BLOCK_ROWS))
     columns = tl.arange(0, BLOCK_COLS)
     for block in range(first_block, last_block):
         rows = block * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
@@ -81,7 +81,7 @@ def prepare_indexer_indices(selected: torch.Tensor, positions: torch.Tensor, com
         num_rows,
         TOPK=topk,
         COMPRESS_RATIO=compress_ratio,
-        BLOCKS_PER_CORE=blocks_per_core,
+        blocks_per_core=blocks_per_core,
         BLOCK_ROWS=block_rows,
         BLOCK_COLS=block_cols,
         SENTINEL=torch.iinfo(torch.int32).max,

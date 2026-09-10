@@ -8,21 +8,21 @@ from vllm.triton_utils import tl, triton
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows", "blocks_per_core"])
 def _quantize_indexer_query_kernel(
     query_ptr,
     quantized_ptr,
     scale_ptr,
     num_rows,
-    BLOCKS_PER_CORE: tl.constexpr,
+    blocks_per_core,
     BLOCK_ROWS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     QUANT_MAX: tl.constexpr,
     MIN_SCALE: tl.constexpr,
 ):
-    first_block = tl.program_id(0) * BLOCKS_PER_CORE
+    first_block = tl.program_id(0) * blocks_per_core
     columns = tl.arange(0, HEAD_DIM)
-    for block in range(BLOCKS_PER_CORE):
+    for block in range(blocks_per_core):
         rows = (first_block + block) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
         offsets = rows[:, None] * HEAD_DIM + columns[None, :]
         query = tl.load(query_ptr + offsets, rows[:, None] < num_rows, other=0).to(tl.float32)
@@ -61,7 +61,7 @@ def quantize_indexer_query(query: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
         quantized,
         scale,
         num_rows,
-        BLOCKS_PER_CORE=triton.cdiv(num_blocks, grid),
+        blocks_per_core=triton.cdiv(num_blocks, grid),
         BLOCK_ROWS=block_rows,
         HEAD_DIM=query.shape[-1],
         QUANT_MAX=127.0,

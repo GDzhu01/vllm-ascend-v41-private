@@ -61,9 +61,10 @@ def test_quantize_indexer_query_noncontiguous(heads):
 
 
 @pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("tokens", [3, 129])
 @torch.inference_mode()
-def test_quantize_indexer_query_graph_replay(heads):
-    query = torch.randn(3, heads, 128, dtype=torch.bfloat16, device="npu")
+def test_quantize_indexer_query_graph_replay(heads, tokens):
+    query = torch.randn(tokens, heads, 128, dtype=torch.bfloat16, device="npu")
     quantize_indexer_query(query)
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
