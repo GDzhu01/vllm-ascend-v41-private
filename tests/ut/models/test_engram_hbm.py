@@ -253,11 +253,15 @@ def test_gate_preserves_masked_rows():
     assert torch.isfinite(out.float()).all()
 
 
-def test_hash_causal_barrier():
+@pytest.mark.parametrize("barrier_token", [98, 99])
+def test_hash_causal_barrier(barrier_token):
     h = hash_mod.PagedNgramHistory.__new__(hash_mod.PagedNgramHistory)
     h.token_map = torch.arange(100); h.pad_id = 2; h.image_token_id = 99; h.lookback = 2
+    h.image_pad_token_id = 98
     h.primes = torch.tensor([[[101, 103]]]); h.offsets = torch.tensor([[0, 101]])
     h.multipliers = torch.tensor([[3, 5]]); h.pages = {}
-    values, mask = h.update(torch.tensor([0, 5, 9, 99, 13, 17]), torch.arange(6),
+    values, mask = h.update(torch.tensor([0, 5, 9, barrier_token, 13, 17]), torch.arange(6),
                              torch.zeros(6, dtype=torch.long), torch.tensor([[5, 1]]), 4)
     assert values.shape == (6, 1, 2) and not mask[3]
+    # The first token on the next page must hash against padding, not the image.
+    assert values[4, 0, 0].item() == ((13 * 3) ^ (h.pad_id * 5)) % 101
