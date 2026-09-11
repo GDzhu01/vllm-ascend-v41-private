@@ -3734,16 +3734,17 @@ class NPUModelRunner(GPUModelRunner):
                 self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
                 self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
 
-                cum_num_tokens = self._get_cumsum_and_arange(num_scheduled_tokens, self.query_pos.np)
-                self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
-                self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1].fill(cum_num_tokens[-1])
+                # Pad request lengths with zeros; token padding does not add
+                # logical queries. Keep the active schedule for other consumers.
+                padded_num_scheduled_tokens = np.pad(num_scheduled_tokens, (0, num_reqs_padded - num_reqs))
+                cum_num_tokens = self._get_cumsum_and_arange(padded_num_scheduled_tokens, self.query_pos.np)
+                self.query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                 self.query_start_loc.copy_to_gpu()
                 if self._has_gdn:
                     if skip_gdn_state_update:
                         self.gdn_query_start_loc.np.fill(0)
                     else:
-                        self.gdn_query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
-                        self.gdn_query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1].fill(cum_num_tokens[-1])
+                        self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                     self.gdn_query_start_loc.copy_to_gpu()
 
                 if not profile_cpp:

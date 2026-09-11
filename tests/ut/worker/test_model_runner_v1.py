@@ -36,7 +36,7 @@ class TestDummyRunSlotInvalidation(unittest.TestCase):
     def test_padded_speculative_dummy_preserves_logical_query_lengths(self):
         # DSA CP rounds 186 tokens to 192 without adding a logical request.
         # Also cover dispatchers that pad the request count itself.
-        for num_tokens, padded_tokens, padded_reqs in ((186, 192, 31), (12, 24, 4)):
+        for num_tokens, padded_tokens, padded_reqs in ((186, 192, 31), (12, 24, 4), (6, 24, 4), (12, 12, 2)):
             with self.subTest(num_tokens=num_tokens):
                 runner = NPUModelRunner.__new__(NPUModelRunner)
                 runner.uniform_decode_query_len = 6
@@ -83,6 +83,17 @@ class TestDummyRunSlotInvalidation(unittest.TestCase):
                     torch.testing.assert_close(agreed_counts, torch.tensor([padded_tokens, 192], dtype=torch.int32))
                     raise RuntimeError("logical query lengths checked")
 
+                get_cumsum = runner._get_cumsum_and_arange
+
+                def check_padded_schedule(schedule, arange, num_tokens=num_tokens, padded_reqs=padded_reqs):
+                    num_reqs = num_tokens // 6
+                    expected = np.concatenate((np.full(num_reqs, 6), np.zeros(padded_reqs - num_reqs)))
+                    np.testing.assert_array_equal(schedule, expected)
+                    self.assertEqual(schedule.dtype, np.int32)
+                    self.assertEqual(int(schedule.sum()), num_tokens)
+                    return get_cumsum(schedule, arange)
+
+                runner._get_cumsum_and_arange = check_padded_schedule
                 runner._pad_query_start_loc_for_fia = check_offsets
                 with (
                     patch("vllm_ascend.worker.model_runner_v1.using_paged_attention", return_value=False),
