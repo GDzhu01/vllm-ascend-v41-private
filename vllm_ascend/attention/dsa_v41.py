@@ -26,9 +26,10 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
 )
 
-from vllm_ascend.attention.dsa_v1 import dsv4_dsa_overlap_stream
+from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41CompressorStateSpec,
+    DeepseekV41DraftSWASpec,
     DeepseekV41FullSpec,
     DeepseekV41IndexerSpec,
     DeepseekV41SWASpec,
@@ -123,6 +124,8 @@ class DeepseekV41Metadata(AttentionMetadata):
     attn_state: Any = None
     is_prefilling: torch.Tensor | None = None
     causal: bool | torch.Tensor = True
+    ori_sparse_indices: torch.Tensor | None = None
+    ori_mask_mode: int = 4
     ori_win_left: int = 0
     ori_win_right: int = 0
     smla_metadata: torch.Tensor | None = None
@@ -585,6 +588,7 @@ class DeepseekV41EagerAttentionImpl:
             q,
             ori_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0],
             cmp_kv=source_cache,
+            ori_sparse_indices=metadata.swa.ori_sparse_indices,
             cmp_sparse_indices=cmp_indices,
             ori_block_table=ori_block_table,
             cmp_block_table=cmp_block_table,
@@ -596,10 +600,10 @@ class DeepseekV41EagerAttentionImpl:
             metadata=op_metadata,
             softmax_scale=attn.softmax_scale,
             cmp_ratio=ratio,
-            ori_mask_mode=4,
+            ori_mask_mode=metadata.swa.ori_mask_mode,
             cmp_mask_mode=3 if has_compressed else 0,
-            ori_win_left=attn.window_size - 1,
-            ori_win_right=0,
+            ori_win_left=metadata.swa.ori_win_left,
+            ori_win_right=metadata.swa.ori_win_right,
             layout_q="TND",
             layout_kv="PA_BBND",
             topk_value_mode=1,
@@ -720,6 +724,13 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             **kwargs,
         )
 
+    def build_for_drafting(self, common_attn_metadata, draft_index, **kwargs):
+        if not isinstance(self.kv_cache_spec, DeepseekV41DraftSWASpec):
+            raise TypeError("V4.1 drafting requires a draft SWA cache")
+        # DSpark issues one eager block per step. Group-local tables and slots
+        # remain independent; the builder owns the operator metadata buffers.
+        return self.build(0, common_attn_metadata)
+
     def enable_device_metadata(self) -> None:
         self._device_metadata_enabled = True
         if self._build_compressor_metadata and isinstance(self.kv_cache_spec, DeepseekV41CompressorStateSpec):
@@ -799,7 +810,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         common = common_attn_metadata
         is_compressor_state = isinstance(spec, DeepseekV41CompressorStateSpec)
         ratio = getattr(spec, "compress_ratio", 1)
-        if isinstance(spec, DeepseekV41SWASpec):
+        if isinstance(spec, (DeepseekV41SWASpec, DeepseekV41DraftSWASpec)):
             cache_kind = "swa"
         elif isinstance(spec, DeepseekV41FullSpec):
             cache_kind = "long_kv"
@@ -912,6 +923,23 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         n_local_heads = int(kwargs.get("num_query_heads", n_local_heads))
         head_dim = int(_config_value(text_config, "head_dim"))
         index_topk = int(_config_value(text_config, "index_topk"))
+        ori_sparse_indices = kwargs.get("ori_sparse_indices")
+        noncausal = not bool(getattr(common, "causal", True))
+        if noncausal and not isinstance(spec, DeepseekV41DraftSWASpec):
+            raise ValueError("V4.1 noncausal attention requires a DSpark draft SWA cache")
+        if noncausal and ori_sparse_indices is None:
+            ori_sparse_indices, _ = build_dspark_swa_indices(
+                common.block_table_tensor[:num_reqs],
+                self.vllm_config.speculative_config.num_speculative_tokens,
+                window_size,
+                spec.storage_block_size,
+                common.query_start_loc[:num_reqs + 1],
+                seq_lens,
+                num_actual_tokens,
+            )
+        ori_mask_mode = 0 if noncausal else 4
+        ori_win_left = max(0, window_size - 1)
+        ori_win_right = 0
         operator_ratio = 0 if cache_kind == "swa" else ratio
         smla_metadata = None
         qli_metadata = None
@@ -934,13 +962,13 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                     max_seqlen_q=int(getattr(common, "max_query_len", 0)),
                     max_seqlen_ori_kv=int(getattr(common, "max_seq_len", 0)),
                     max_seqlen_cmp_kv=(coordinates["max_cache_seq_len"] if has_compressed else 0),
-                    ori_topk=0,
+                    ori_topk=ori_sparse_indices.shape[-1] if ori_sparse_indices is not None else 0,
                     cmp_topk=index_topk if has_compressed else 0,
                     cmp_ratio=operator_ratio,
-                    ori_mask_mode=4,
+                    ori_mask_mode=ori_mask_mode,
                     cmp_mask_mode=3 if has_compressed else 0,
-                    ori_win_left=max(0, window_size - 1),
-                    ori_win_right=0,
+                    ori_win_left=ori_win_left,
+                    ori_win_right=ori_win_right,
                     layout_q="TND",
                     layout_kv="PA_BBND",
                     has_ori_kv=True,
@@ -1089,8 +1117,10 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             attn_state=getattr(common, "attn_state", None),
             is_prefilling=getattr(common, "is_prefilling", None),
             causal=getattr(common, "causal", True),
-            ori_win_left=max(0, window_size - 1),
-            ori_win_right=0,
+            ori_sparse_indices=ori_sparse_indices,
+            ori_mask_mode=ori_mask_mode,
+            ori_win_left=ori_win_left,
+            ori_win_right=ori_win_right,
             smla_metadata=smla_metadata,
             qli_metadata=qli_metadata,
             cmp_residual=cmp_residual_buffer,

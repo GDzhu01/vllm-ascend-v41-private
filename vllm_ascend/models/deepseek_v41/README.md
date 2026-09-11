@@ -70,6 +70,13 @@ no whole-context gather is introduced by allocation.
 
 ### DSpark in the same four slots
 
+Aurora DSpark uses `DeepseekV41CacheBackend` and the V4.1 execution path for
+both DSA_CP settings. Noncausal draft queries pass explicit physical SWA
+indices to SparseFlashMla with mask mode 0. CP slices these global indices
+and preserves the full visible KV length for each local request. Context KV
+writes use the same stride-aware cache scatter as the target model. The V1
+proposer remains eager; this routing does not enable draft graph capture.
+
 The optional Aurora DSpark model adds one group, G12, containing exactly three
 `DeepseekV41DraftSWASpec` resources: `mtp.0.self_attn.swa_cache`,
 `mtp.1.self_attn.swa_cache`, and `mtp.2.self_attn.swa_cache`. They occupy offset

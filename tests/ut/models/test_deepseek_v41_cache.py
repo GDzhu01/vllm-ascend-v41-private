@@ -1538,3 +1538,32 @@ def test_v41_cp_query_preparation_does_not_rewrite_global_caches():
     impl.preprocess.assert_not_called()
     impl.multistream_preprocess.assert_not_called()
     impl._write_compressed_source.assert_not_called()
+
+
+@pytest.mark.parametrize("rank", [None, 0, 1, 7])
+def test_dspark_v41_noncausal_metadata_preserves_full_visible_block(runtime, monkeypatch, rank):
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
+    from vllm_ascend.core.deepseek_v41 import DeepseekV41DraftSWASpec
+
+    runtime.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    spec = DeepseekV41DraftSWASpec(
+        block_size=128, num_kv_heads=1, head_size=8, dtype=torch.bfloat16,
+        sliding_window=128, cache_dtype_str="bfloat16", model_version="deepseek_v4",
+    )
+    common = _cp_common().replace(causal=False)
+    full = DeepseekV41MetadataBuilder(spec, [], runtime, torch.device("cpu")).build_for_drafting(common, 1)
+    assert full.ori_mask_mode == 0
+    assert full.ori_sparse_indices.shape[0] == 4
+    # Every query of the first request can see its complete draft block.
+    torch.testing.assert_close(full.ori_sparse_indices[0], full.ori_sparse_indices[2])
+    assert full.ori_sparse_indices[0, 0, :3].tolist() == [0, 1, 2]
+    if rank is None:
+        return
+    monkeypatch.setattr(
+        "vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
+        lambda: SimpleNamespace(world_size=8, rank_in_group=rank),
+    )
+    local = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu")).build_for_drafting(common, 1)
+    torch.testing.assert_close(local.ori_sparse_indices, full.ori_sparse_indices[rank:rank + 1])
+    assert local.seq_lens.tolist() == ([3, 0] if rank < 3 else [0, 0])
+    assert local.ori_mask_mode == 0

@@ -11,6 +11,8 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models.utils import maybe_prefix
 
+from vllm_ascend.attention.context_parallel.dsa_v41_cp import get_v41_cp_classes
+from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheBackend, scatter_cache_sk
 from vllm_ascend.core.deepseek_v41 import DeepseekV41DraftSWASpec, validate_cache_runtime
 from vllm_ascend.models.deepseek_v4.dspark import (
     DeepseekV4DSparkModel,
@@ -20,11 +22,13 @@ from vllm_ascend.models.deepseek_v4.dspark import (
     _get_dspark_num_mtp_layers,
 )
 from vllm_ascend.models.deepseek_v4.model import AscendDeepseekV4SWACache, DeepseekV4Attention
-from vllm_ascend.models.deepseek_v41.model import DeepseekV41DecoderLayer
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
     sp_shard,
+)
+from vllm_ascend.models.deepseek_v41.model import (
+    DeepseekV41Attention, DeepseekV41DecoderLayer, DeepseekV41LayerRole,
 )
 
 
@@ -41,6 +45,9 @@ class DeepseekV41DSparkSWACache(AscendDeepseekV4SWACache):
             model_version=spec.model_version,
         )
 
+    def get_attn_backend(self):
+        return DeepseekV41CacheBackend
+
 
 class DeepseekV41DSparkAttention(DeepseekV4Attention):
     swa_cache_cls = DeepseekV41DSparkSWACache
@@ -51,6 +58,25 @@ class DeepseekV41DSparkAttention(DeepseekV4Attention):
             raise ValueError("Aurora DSpark supports only uncompressed draft SWA layers")
         # V4.1 applies Q LoRA RMSNorm only, without a second per-head Q norm.
         self.dsa_attn.dsa_attn.impl.apply_q_norm = False
+        self.shared_state = None
+        prefix = kwargs["prefix"]
+        self.v41_impl = get_v41_cp_classes()[1](
+            prefix=prefix,
+            role=DeepseekV41LayerRole(
+                layer_idx=int(prefix.split(".")[-2]), compress_ratio=0,
+                kv_source_layer=None, index_source_layer=None,
+                is_kv_source=False, is_index_source=False,
+                is_candidate_source=False, uses_candidate_filter=False, engram_slot=None,
+            ),
+            topology=None, long_kv_source_prefix=None, index_k_source_prefix=None,
+        )
+        self.v41_layer_name = f"{prefix}.v41_attn"
+        context = kwargs["vllm_config"].compilation_config.static_forward_context
+        if self.v41_layer_name in context:
+            raise ValueError(f"Duplicate V4.1 attention layer: {self.v41_layer_name}")
+        context[self.v41_layer_name] = self
+
+    forward = DeepseekV41Attention.forward
 
 
 class DeepseekV41DSparkDecoderLayer(DeepseekV41DecoderLayer):
@@ -126,6 +152,19 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel):
         last_layer = self.layers[str(last_layer_idx)]
         last_layer.norm = self.norm
         last_layer.markov_head = self.markov_head
+
+    def _store_standard_swa_kv(self, shared_kv, slot_mapping, attn=None):
+        if slot_mapping is None or slot_mapping.numel() == 0:
+            return
+        cache = attn.dsa_attn.swa_cache_layer
+        if slot_mapping.ndim == 1:
+            valid = slot_mapping >= 0
+            physical = slot_mapping.clamp_min(0)
+            slot_mapping = torch.stack(
+                (physical // cache.block_size, physical % cache.block_size), dim=-1
+            ).to(torch.int32)
+            slot_mapping.masked_fill_(~valid.unsqueeze(-1), -1)
+        scatter_cache_sk(cache.kv_cache[0], slot_mapping, shared_kv.squeeze(1))
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids).unsqueeze(-2).repeat(1, self.hc_mult, 1)

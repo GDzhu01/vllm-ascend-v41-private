@@ -82,6 +82,7 @@ class DeepseekV41CPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
             common.num_input_tokens,
             common.query_start_loc_cpu,
             seq_lens_cpu,
+            is_noncausal=not bool(getattr(common, "causal", True)),
         )
         actual_end = min(end, common.num_actual_tokens)
         actual_start = min(start, actual_end)
@@ -94,6 +95,8 @@ class DeepseekV41CPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
         # beyond this rank's token interval from each request's device length.
         query_ends = common.query_start_loc_cpu[1 : common.num_reqs + 1]
         suffix = query_ends - query_ends.clamp(min=actual_start, max=actual_end)
+        if not bool(getattr(common, "causal", True)):
+            suffix = torch.zeros_like(suffix)
         local_seq_lens = (common.seq_lens[: common.num_reqs] - suffix.to(common.seq_lens.device)).clamp_min(0)
         local_seq_lens = torch.where(query_start_loc[1:] > query_start_loc[:-1], local_seq_lens, 0)
         local_common = common.replace(
@@ -117,6 +120,8 @@ class DeepseekV41CPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
                 global_metadata.cos[actual_start:actual_end],
                 global_metadata.sin[actual_start:actual_end],
             )
+        if global_metadata.ori_sparse_indices is not None:
+            kwargs["ori_sparse_indices"] = global_metadata.ori_sparse_indices[actual_start:actual_end]
         local = super().build(common_prefix_len, local_common, fast_build, **kwargs)
         return replace(local, global_metadata=global_metadata, cp_token_range=(start, end, per_rank, padded))
 
