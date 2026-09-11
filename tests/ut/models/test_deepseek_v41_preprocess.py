@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm_ascend.attention import dsa_v41
+from vllm_ascend.attention.context_parallel import dsa_v41_cp
 
 
 def test_dsa_v41_custom_op_forwards_its_output_buffer(monkeypatch):
@@ -29,8 +30,9 @@ def test_dsa_v41_custom_op_forwards_its_output_buffer(monkeypatch):
 
 @pytest.mark.parametrize("share_quant", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 5])
+@pytest.mark.parametrize("cp", [False, True])
 @torch.inference_mode()
-def test_preprocess_equivalence_and_stream_dependencies(monkeypatch, share_quant, num_tokens):
+def test_preprocess_equivalence_and_stream_dependencies(monkeypatch, share_quant, num_tokens, cp):
     """Check Q/qr/cache parity and the cross-stream producer/consumer ordering."""
     trace = []
     active = "main"
@@ -89,7 +91,8 @@ def test_preprocess_equivalence_and_stream_dependencies(monkeypatch, share_quant
         trace.append((active, "rope", "apply"))
         # Exercise the in-place write on a view, including Q/KV partial slices.
         start, end = kwargs["partial_slice"]
-        x[..., start:end].neg_()
+        assert x.shape[0] == cos.shape[0] == sin.shape[0]
+        x[..., start:end].mul_(cos).add_(sin)
 
     def scatter(cache, slots, values):
         trace.append((active, "cache", "scatter"))
@@ -101,6 +104,9 @@ def test_preprocess_equivalence_and_stream_dependencies(monkeypatch, share_quant
     monkeypatch.setattr(dsa_v41, "dsv4_dsa_overlap_stream", lambda: aux)
     monkeypatch.setattr(dsa_v41, "npu_stream_switch", switch)
     monkeypatch.setattr(dsa_v41, "scatter_cache_sk", scatter)
+    monkeypatch.setattr(dsa_v41_cp, "dsv4_dsa_overlap_stream", lambda: aux)
+    monkeypatch.setattr(dsa_v41_cp, "npu_stream_switch", switch)
+    monkeypatch.setattr(dsa_v41_cp, "scatter_cache_sk", scatter)
     monkeypatch.setattr(torch.ops._C_ascend, "inplace_partial_rotary_mul", rope, raising=False)
     torch.manual_seed(7)
     cache = torch.zeros(2, num_tokens, 4)
@@ -116,7 +122,8 @@ def test_preprocess_equivalence_and_stream_dependencies(monkeypatch, share_quant
         wkv=kv,
         q_norm=norm("q"),
         kv_norm=norm("kv"),
-        n_local_heads=2,
+        n_local_heads=1 if cp else 2,
+        n_heads=2,
         head_dim=4,
         nope_head_dim=2,
         dsa_attn=SimpleNamespace(
@@ -129,17 +136,26 @@ def test_preprocess_equivalence_and_stream_dependencies(monkeypatch, share_quant
         slots[-1] = -1
     metadata = SimpleNamespace(slot_mapping=slots)
     hidden = torch.randn(num_tokens, 8)
-    impl = object.__new__(dsa_v41.DeepseekV41EagerAttentionImpl)
-    expected_q, expected_qr = impl.preprocess(attn, hidden, None, None, metadata)
+    cos, sin = torch.randn(num_tokens, 1, 1, 2), torch.randn(num_tokens, 1, 1, 2)
+    start = num_tokens // 2 if cp else 0
+    local_hidden, local_cos, local_sin = hidden[start:], cos[start:], sin[start:]
+    impl = object.__new__(dsa_v41_cp.DeepseekV41CPImpl if cp else dsa_v41.DeepseekV41EagerAttentionImpl)
+    if cp:
+        expected_q, expected_qr = impl._project_q(attn, local_hidden, local_cos, local_sin)
+        scatter(cache, slots, impl._project_kv(attn, hidden, cos, sin))
+    else:
+        expected_q, expected_qr = impl.preprocess(attn, hidden, cos, sin, metadata)
     expected_cache = cache.clone()
     cache.zero_()
     trace.clear()
-    q, qr = impl.multistream_preprocess(attn, hidden, None, None, metadata)
+    kwargs = dict(kv_hidden_states=hidden, kv_cos=cos, kv_sin=sin) if cp else {}
+    q, qr = impl.multistream_preprocess(attn, local_hidden, local_cos, local_sin, metadata, **kwargs)
     torch.testing.assert_close(q, expected_q)
     torch.testing.assert_close(qr, expected_qr)
     torch.testing.assert_close(cache, expected_cache)
     assert qr.is_floating_point()
-    assert ("aux", "kv", "quantize") in trace if not share_quant else ("aux", "kv", "quantize") not in trace
+    assert (("aux", "kv", "quantize") in trace) == (cp or not share_quant)
+    assert trace.count(("aux", "cache", "scatter")) == 1
     kv_mm = trace.index(("aux", "kv", "matmul"))
     kv_done = trace[kv_mm + 1]
     assert kv_done[:2] == ("aux", "record")
@@ -157,7 +173,9 @@ def test_forward_selects_preprocess_from_v1_switch(monkeypatch, enabled):
     impl.role = SimpleNamespace(is_kv_source=False)
     hidden = torch.zeros(1, 8)
     q, qr = torch.zeros(1, 2, 4), torch.zeros(1, 6)
-    metadata = SimpleNamespace(positions=torch.zeros(1), swa=object(), rope=lambda *args: (None, None))
+    metadata = SimpleNamespace(
+        positions=torch.zeros(1), swa=SimpleNamespace(num_actual_tokens=1), rope=lambda *args: (None, None)
+    )
     impl._get_layer_metadata = Mock(return_value=metadata)
     impl.preprocess = Mock(return_value=(q, qr))
     impl.multistream_preprocess = Mock(return_value=(q, qr))
@@ -184,3 +202,81 @@ def test_forward_selects_preprocess_from_v1_switch(monkeypatch, enabled):
     unused.assert_not_called()
     assert result is output
     assert torch.count_nonzero(output) == 0
+
+
+@pytest.mark.parametrize("local_tokens", [0, 2])
+@pytest.mark.parametrize("is_source", [False, True])
+def test_cp_multistream_forward_preserves_full_cache_updates(monkeypatch, local_tokens, is_source):
+    impl = object.__new__(dsa_v41_cp.DeepseekV41CPImpl)
+    impl.role = SimpleNamespace(is_kv_source=is_source)
+    hidden = torch.arange(40, dtype=torch.float32).reshape(5, 8)
+    global_cos, global_sin = torch.ones(4), torch.ones(4)
+    local_cos, local_sin = global_cos[2 : 2 + local_tokens], global_sin[2 : 2 + local_tokens]
+    metadata = SimpleNamespace(
+        swa=SimpleNamespace(num_actual_tokens=local_tokens, cp_token_range=(2, 4, 2, 4)),
+        positions=torch.arange(2, 2 + local_tokens),
+        rope=lambda *args: (local_cos, local_sin),
+    )
+    global_metadata = SimpleNamespace(
+        swa=SimpleNamespace(num_actual_tokens=4),
+        positions=torch.arange(4),
+        rope=lambda *args: (global_cos, global_sin),
+    )
+    impl._get_layer_metadata = Mock(return_value=metadata)
+    impl._global_layer_metadata = Mock(return_value=global_metadata)
+    q, qr = torch.zeros(local_tokens, 2, 4), torch.zeros(local_tokens, 6)
+    impl.multistream_preprocess = Mock(return_value=(q, qr))
+    impl._update_caches = Mock()
+    impl._write_compressed_source = Mock()
+    impl._select_sparse_indices = Mock(return_value=None)
+    impl._attention = Mock(return_value=q)
+    impl._project_output = Mock(side_effect=lambda *args, projected: projected.zero_())
+    attn = SimpleNamespace(
+        rotary_emb=SimpleNamespace(layername="layer"),
+        n_heads=2,
+        head_dim=4,
+        nope_head_dim=2,
+        dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=SimpleNamespace(multistream_dsv4_dsa_overlap=True))),
+    )
+    monkeypatch.setattr(dsa_v41_cp, "get_forward_context", lambda: SimpleNamespace(attn_metadata={}))
+    monkeypatch.setattr(torch.ops._C_ascend, "inplace_partial_rotary_mul", lambda *args, **kwargs: None, raising=False)
+    output = torch.ones_like(hidden)
+    assert impl.forward(attn, None, hidden, output) is output
+    impl._project_output.assert_called_once()
+    assert torch.count_nonzero(output) == 0
+    if local_tokens:
+        impl._update_caches.assert_not_called()
+        impl.multistream_preprocess.assert_called_once()
+        args, kwargs = impl.multistream_preprocess.call_args
+        torch.testing.assert_close(args[1], hidden[2:4])
+        assert args[2] is local_cos and args[3] is local_sin
+        assert args[4] is global_metadata.swa
+        torch.testing.assert_close(kwargs["kv_hidden_states"], hidden[:4])
+        assert kwargs["kv_cos"] is global_cos and kwargs["kv_sin"] is global_sin
+        assert impl._write_compressed_source.call_count == int(is_source)
+        if is_source:
+            args = impl._write_compressed_source.call_args.args
+            torch.testing.assert_close(args[1], hidden[:4])
+            torch.testing.assert_close(args[2], global_metadata.positions)
+            assert args[-1] is global_metadata
+        assert impl._select_sparse_indices.call_args.args[-1] is metadata
+    else:
+        impl.multistream_preprocess.assert_not_called()
+        impl._update_caches.assert_called_once()
+        args = impl._update_caches.call_args.args
+        torch.testing.assert_close(args[1], hidden[:4])
+        assert args[2] is global_metadata
+        impl._write_compressed_source.assert_not_called()
+        impl._attention.assert_not_called()
+
+
+def test_cp_disabled_overlap_delegates_to_serial_forward(monkeypatch):
+    impl = object.__new__(dsa_v41_cp.DeepseekV41CPImpl)
+    serial = Mock(return_value=object())
+    monkeypatch.setattr(dsa_v41.DeepseekV41EagerAttentionImpl, "forward", serial)
+    attn = SimpleNamespace(
+        dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=SimpleNamespace(multistream_dsv4_dsa_overlap=False)))
+    )
+    hidden, output = torch.zeros(2, 8), torch.empty(2, 8)
+    assert impl.forward(attn, None, hidden, output) is serial.return_value
+    serial.assert_called_once_with(attn, None, hidden, output)

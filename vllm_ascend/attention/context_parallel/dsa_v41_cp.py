@@ -6,12 +6,19 @@ from dataclasses import replace
 
 import torch
 from vllm.distributed import get_tp_group
+from vllm.forward_context import get_forward_context
 
 from vllm_ascend.attention.context_parallel.dsa_common import restore_tp_heads
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
-from vllm_ascend.attention.dsa_v41 import DeepseekV41EagerAttentionImpl, DeepseekV41MetadataBuilder, _config_value
+from vllm_ascend.attention.dsa_v1 import dsv4_dsa_overlap_stream
+from vllm_ascend.attention.dsa_v41 import (
+    DeepseekV41EagerAttentionImpl,
+    DeepseekV41MetadataBuilder,
+    _config_value,
+    scatter_cache_sk,
+)
 from vllm_ascend.attention.utils import enable_pcp
-from vllm_ascend.utils import enable_dsa_cp
+from vllm_ascend.utils import enable_dsa_cp, npu_stream_switch
 
 
 def get_v41_cp_classes():
@@ -115,6 +122,115 @@ class DeepseekV41CPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
 
 
 class DeepseekV41CPImpl(DeepseekV41EagerAttentionImpl):
+    def multistream_preprocess(self, attn, hidden_states, cos, sin, swa_metadata, *, kv_hidden_states, kv_cos, kv_sin):
+        """Overlap local-token Q with replicated full-token KV preprocessing."""
+        main_stream = torch.npu.current_stream()
+        aux_stream = dsv4_dsa_overlap_stream()
+        v1_impl = attn.dsa_attn.dsa_attn.impl
+        wq_a, wkv, wq_b = v1_impl.cv_wq_a, v1_impl.cv_wkv, v1_impl.cv_wq_b
+
+        # Q and KV own different token ranges, even with identical quantizers.
+        q_quant, q_scale = wq_a.quantize(hidden_states)
+        q_quant_done = main_stream.record_event()
+        with npu_stream_switch(aux_stream, enabled=True):
+            aux_stream.wait_event(q_quant_done)
+            kv_quant, kv_scale = wkv.quantize(kv_hidden_states)
+            kv_quant_done = aux_stream.record_event()
+        q_a = wq_a.matmul(q_quant, q_scale, bias=attn.wq_a.bias)
+
+        # Serialize Cube matmuls while overlapping Q Vector work with KV Cube.
+        part2_start = main_stream.record_event()
+        main_stream.wait_event(kv_quant_done)
+        with npu_stream_switch(aux_stream, enabled=True):
+            aux_stream.wait_event(part2_start)
+            kv = wkv.matmul(kv_quant, kv_scale, bias=attn.wkv.bias)
+            kv_matmul_done = aux_stream.record_event()
+        qr = attn.q_norm(q_a)
+        q_b_quant, q_b_scale = wq_b.quantize(qr)
+
+        # KV Vector work uses global RoPE and global cache slots.
+        part3_start = main_stream.record_event()
+        main_stream.wait_event(kv_matmul_done)
+        with npu_stream_switch(aux_stream, enabled=True):
+            aux_stream.wait_event(part3_start)
+            kv = attn.kv_norm(kv).view(-1, 1, attn.head_dim)
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                kv.unsqueeze(1),
+                kv_cos,
+                kv_sin,
+                rotary_mode="interleave",
+                partial_slice=[attn.nope_head_dim, attn.head_dim],
+            )
+            scatter_cache_sk(attn.dsa_attn.swa_cache_layer.kv_cache[0], swa_metadata.slot_mapping, kv.squeeze(1))
+        q = wq_b.matmul(q_b_quant, q_b_scale, bias=attn.wq_b.bias).unflatten(-1, (attn.n_heads, attn.head_dim))
+        main_stream.wait_stream(aux_stream)
+        torch.ops._C_ascend.inplace_partial_rotary_mul(
+            q.unsqueeze(1),
+            cos,
+            sin,
+            rotary_mode="interleave",
+            partial_slice=[attn.nope_head_dim, attn.head_dim],
+        )
+        return q.to(hidden_states.dtype), qr
+
+    def forward(self, attn, positions, hidden_states, output: torch.Tensor | None = None):
+        if not attn.dsa_attn.dsa_attn.impl.multistream_dsv4_dsa_overlap:
+            return super().forward(attn, positions, hidden_states, output)
+        if output is None:
+            output = torch.empty_like(hidden_states)
+        metadata_by_prefix = get_forward_context().attn_metadata
+        if metadata_by_prefix is None:
+            output.zero_()
+            return output
+        metadata = self._get_layer_metadata(metadata_by_prefix)
+        global_metadata = self._global_layer_metadata(metadata_by_prefix)
+        kv_hidden_states = hidden_states[: global_metadata.swa.num_actual_tokens]
+        start, _, _, _ = metadata.swa.cp_token_range
+        local_hidden_states = hidden_states[start : start + metadata.swa.num_actual_tokens]
+        num_tokens = local_hidden_states.shape[0]
+        if num_tokens:
+            positions = metadata.positions[:num_tokens]
+            cos, sin = metadata.rope(attn.rotary_emb.layername, num_tokens)
+            kv_cos, kv_sin = global_metadata.rope(attn.rotary_emb.layername, kv_hidden_states.shape[0])
+            q, qr = self.multistream_preprocess(
+                attn,
+                local_hidden_states,
+                cos,
+                sin,
+                global_metadata.swa,
+                kv_hidden_states=kv_hidden_states,
+                kv_cos=kv_cos,
+                kv_sin=kv_sin,
+            )
+            # The stream join above precedes compressor/indexer reads. Each
+            # replicated cache plane is updated once, with full-token metadata.
+            if self.role.is_kv_source:
+                self._write_compressed_source(
+                    attn,
+                    kv_hidden_states,
+                    global_metadata.positions[: kv_hidden_states.shape[0]],
+                    kv_cos,
+                    kv_sin,
+                    global_metadata,
+                )
+            compressed_indices = self._select_sparse_indices(
+                attn, local_hidden_states, qr, positions, cos, sin, metadata
+            )
+            attention_output = self._attention(attn, q, metadata, compressed_indices)
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                attention_output.unsqueeze(1),
+                cos,
+                -sin,
+                rotary_mode="interleave",
+                partial_slice=[attn.nope_head_dim, attn.head_dim],
+            )
+        else:
+            # Empty query ranks still maintain replicated caches and exchange.
+            self._update_caches(attn, kv_hidden_states, global_metadata)
+            attention_output = hidden_states.new_empty((0, attn.n_heads, attn.head_dim))
+        self._project_output(attn, attention_output, hidden_states, metadata, projected=output)
+        return output
+
     def _global_layer_metadata(self, metadata_by_prefix):
         global_by_prefix = {}
         # The runner also includes DSpark's native DSA metadata in this map.
