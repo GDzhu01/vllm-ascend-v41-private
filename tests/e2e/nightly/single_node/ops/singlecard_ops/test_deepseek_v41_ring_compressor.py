@@ -160,3 +160,45 @@ def test_projected_ring_rejects_incompatible_views(invalid):
         out = out.float()
     with pytest.raises(ValueError):
         compressor_from_projected(kv, scores, state, meta, out, max_query_len=1, num_cores=1)
+
+
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_mixed_prefill_first_residual_uses_ring_at_projection_boundary(graph_mode):
+    """First request history must not read row -1 of packed projections."""
+    torch.manual_seed(1301)
+    kv_cpu = torch.randn(3968, 512)
+    scores_cpu = torch.randn_like(kv_cpu)
+    # Allocate projections before other large tensors to exercise their boundary.
+    kv, scores = kv_cpu.npu(), scores_cpu.npu()
+    initial = torch.zeros(5954, 32, 1024, dtype=torch.float32)
+    blocks = [12, 145, 278, 411, 544, 677]
+    for block in blocks:
+        initial[block] = torch.randn(32, 1024)
+    state = initial.npu()
+    controls = torch.tensor(
+        [[1301, 1301, 1366, 0, 0, 0],
+         [6, 6, 15, 1338, 1300, 1303],
+         [0, 6, 12, 27, 1365, 2665],
+         [0, 6, 12, 27, 1365, 2665],
+         blocks], dtype=torch.int32,
+    )
+    meta = controls.npu()
+    out = torch.empty_like(kv, dtype=torch.bfloat16)
+    cores = _cube_core_num()
+    expected_state = initial.clone()
+    expected = _reference(kv_cpu, scores_cpu, expected_state, controls)
+
+    def run():
+        compressor_from_projected(kv, scores, state, meta, out, max_query_len=1338, num_cores=cores)
+
+    run()
+    if graph_mode:
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, capture_error_mode="thread_local", auto_dispatch_capture=True):
+            run()
+        state.copy_(initial)
+        graph.replay()
+    torch.npu.synchronize()
+    torch.testing.assert_close(out.cpu(), expected, rtol=0.016, atol=1e-5)
+    torch.testing.assert_close(state.cpu(), expected_state, rtol=0, atol=0)

@@ -103,6 +103,9 @@ def _pooled_blocked(
     组覆盖全局 token [group_idx*RATIO, (group_idx+1)*RATIO)：seg_off >= 0 读
     投影大矩阵 (seg_row_base+seg_off)，< 0 为段前残余，读 cache
     (cache_row, token_pos % CACHE_SIZE)。"""
+    # Keep masked history lanes inside the projection allocation. Ascend may
+    # form a DMA address for a masked lane before applying the load mask.
+    # The original masks and ring selection still supply all history values.
     score_max = tl.full((HEAD_DIM,), -float("inf"), dtype=tl.float32)
     for chunk0 in range(0, RATIO_PAD, CHUNK_ROWS):
         rows = chunk0 + tl.arange(0, CHUNK_ROWS)
@@ -111,7 +114,7 @@ def _pooled_blocked(
         seg_off = token_pos - start_pos
         in_seg = seg_off >= 0
         score_seg = tl.load(
-            score_ptr + (seg_row_base + seg_off)[:, None] * HEAD_DIM + offs_h[None, :],
+            score_ptr + (seg_row_base + tl.maximum(seg_off, 0))[:, None] * HEAD_DIM + offs_h[None, :],
             mask=(row_valid & in_seg)[:, None],
             other=0.0,
         )
@@ -135,7 +138,7 @@ def _pooled_blocked(
         seg_off = token_pos - start_pos
         in_seg = seg_off >= 0
         score_seg = tl.load(
-            score_ptr + (seg_row_base + seg_off)[:, None] * HEAD_DIM + offs_h[None, :],
+            score_ptr + (seg_row_base + tl.maximum(seg_off, 0))[:, None] * HEAD_DIM + offs_h[None, :],
             mask=(row_valid & in_seg)[:, None],
             other=0.0,
         )
@@ -159,7 +162,7 @@ def _pooled_blocked(
         seg_off = token_pos - start_pos
         in_seg = seg_off >= 0
         score_seg = tl.load(
-            score_ptr + (seg_row_base + seg_off)[:, None] * HEAD_DIM + offs_h[None, :],
+            score_ptr + (seg_row_base + tl.maximum(seg_off, 0))[:, None] * HEAD_DIM + offs_h[None, :],
             mask=(row_valid & in_seg)[:, None],
             other=0.0,
         )
@@ -176,7 +179,7 @@ def _pooled_blocked(
         score = tl.where(row_valid[:, None], score, -float("inf"))
         prob = tl.exp(score - score_max[None, :]) / exp_sum[None, :]
         kv_seg = tl.load(
-            kv_ptr + (seg_row_base + seg_off)[:, None] * HEAD_DIM + offs_h[None, :],
+            kv_ptr + (seg_row_base + tl.maximum(seg_off, 0))[:, None] * HEAD_DIM + offs_h[None, :],
             mask=(row_valid & in_seg)[:, None],
             other=0.0,
         )
