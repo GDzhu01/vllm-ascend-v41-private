@@ -992,6 +992,48 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_engram_ple_offload_is_explicit_and_typed(self, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {
+            "enable_engram_ple_offload": "true",
+            "engram_model_path": "/tmp/fp8",
+        }
+        config = init_ascend_config(vc)
+        self.assertTrue(config.enable_engram_ple_offload)
+        self.assertEqual(config.engram_storage, "fp8")
+        self.assertEqual(config.engram_model_path, "/tmp/fp8")
+        self.assertFalse(
+            AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False)).enable_engram_ple_offload
+        )
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_engram_ple_offload_rejects_disabled_engram(self, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"enable_engram_ple_offload": True, "enable_engram": False}
+        with self.assertRaisesRegex(ValueError, "PLE_OFFLOAD"):
+            init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_engram_ple_offload_preserves_explicit_int8(self, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"enable_engram_ple_offload": True, "engram_storage": "int8"}
+        config = init_ascend_config(vc)
+        self.assertTrue(config.enable_engram_ple_offload)
+        self.assertEqual(config.engram_storage, "int8")
+        self.assertIsNone(config.engram_model_path)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_engram_model_path_requires_ple_offload(self, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"engram_model_path": "/tmp/fp8"}
+        with self.assertRaisesRegex(ValueError, "requires enable_engram_ple_offload"):
+            init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_a_family_additional_config_gets_typed_validation(self, mock_fix):
         vc = VllmConfig()
         vc.additional_config = {

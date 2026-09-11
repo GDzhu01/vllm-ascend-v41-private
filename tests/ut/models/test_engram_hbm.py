@@ -177,6 +177,37 @@ def test_fp8_offload_cross_dp_and_idle(tmp_path):
     mp.spawn(_fp8_offload_worker, args=(f"file://{tmp_path / 'fp8'}",), nprocs=4, join=True)
 
 
+def _int8_offload_worker(rank, rendezvous):
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=60))
+    for ranks in ([0, 1], [2, 3]):
+        group = dist.new_group(ranks)
+        if rank in ranks:
+            tp = group
+    query = hbm.EngramQueryGroup(dist.group.WORLD, dist.group.WORLD, tp, rank // 2 * 2)
+    tables, references = [], []
+    for rows in (71, 83):
+        table = hbm.NodeShardedEngram(rows, 256, query, storage_format="int8", cpu_offload=True)
+        codes = (torch.arange(rows * 256).reshape(rows, 256) % 256 - 128).to(torch.int8)
+        scales = 2.0 ** (torch.arange(rows * 8).reshape(rows, 8) % 7 - 3)
+        table.weight.data.copy_(codes[table.start : table.end])
+        table.weight_scale.copy_(scales[table.start : table.end])
+        tables.append(table)
+        references.append((codes.float().reshape(rows, 8, 32) * scales.unsqueeze(-1)).flatten(1).bfloat16())
+    for a, b in [(0, 0), (1, 0), (0, 17), (3, 7), (31, 1), (1, 31), (1, 1)] * 3:
+        count = (a, b)[rank // 2]
+        ids = [(torch.arange(count * 24).reshape(count, 24) * 7 + rank // 2) % table.rows for table in tables]
+        outputs = tables[0].route_many(tables, ids)
+        for table, output, reference, indices in zip(tables, outputs, references, ids):
+            assert table.weight.device.type == table.weight_scale.device.type == "cpu"
+            assert torch.equal(output.view(torch.int16), reference[indices].view(torch.int16)), (rank, a, b)
+    dist.destroy_process_group()
+
+
+def test_int8_offload_two_tables_variable_and_idle(tmp_path):
+    mp.spawn(_int8_offload_worker, args=(f"file://{tmp_path / 'int8_offload'}",), nprocs=4, join=True)
+
+
 def test_shard_loader(tmp_path):
     weights = torch.arange(29 * 8).reshape(29, 8).to(torch.bfloat16)
     key = "layers.1.engram.embed.weight"
@@ -195,6 +226,134 @@ def test_shard_loader(tmp_path):
         table.load_checkpoint(tmp_path, key, chunk_rows=3)
         pieces.append(table.weight)
     assert torch.equal(torch.cat(pieces), weights)
+
+
+def test_fp8_shard_loader_uses_matching_index_and_decodes_on_cpu(tmp_path):
+    rows, width = 19, 32
+    key = "layers.1.engram.embed.weight"
+    scale_key = "layers.1.engram.embed.scale"
+    codes = torch.arange(rows * width, dtype=torch.float32).reshape(rows, width)
+    codes = (codes.remainder(240) - 120).to(torch.float8_e4m3fn)
+    scales = torch.tensor([[1.0], [2.0], [0.5], [4.0], [8.0]] * 4, dtype=torch.float8_e8m0fnu)[:rows]
+    save_file({key: codes, scale_key: scales}, tmp_path / "fp8.safetensors")
+    # Prefer the index containing the Engram key when both index formats exist.
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"unrelated.weight": "missing.safetensors"}})
+    )
+    (tmp_path / "quant_model_weights.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "fp8.safetensors", scale_key: "fp8.safetensors"}})
+    )
+    q = type("QueryGroup", (), {"size": 1, "rank": 0})()
+    table = hbm.NodeShardedEngram(rows, width, q, device="cpu", storage_format="fp8")
+    table.load_checkpoint(tmp_path, key, chunk_rows=3)
+    ids = torch.tensor([0, 1, 7, 18], dtype=torch.int64)
+    actual = table.lookup_local(ids)
+    expected = codes.float().reshape(rows, 1, width).mul(scales.float().reshape(rows, 1, 1))
+    expected = expected.reshape(rows, width).bfloat16()[ids]
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    assert table.weight.device.type == table.weight_scale.device.type == "cpu"
+
+
+def test_fp8_loader_rejects_non_ue8m0_scale(tmp_path):
+    rows, width = 5, 32
+    key = "layers.14.engram.embed.weight"
+    scale_key = "layers.14.engram.embed.scale"
+    save_file(
+        {
+            key: torch.ones(rows, width, dtype=torch.float8_e4m3fn),
+            scale_key: torch.ones(rows, 1, dtype=torch.float32),
+        },
+        tmp_path / "fp8.safetensors",
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "fp8.safetensors", scale_key: "fp8.safetensors"}})
+    )
+    q = type("QueryGroup", (), {"size": 1, "rank": 0})()
+    table = hbm.NodeShardedEngram(rows, width, q, device="cpu", storage_format="fp8")
+    with pytest.raises(ValueError, match="expected FP8 UE8M0"):
+        table.load_checkpoint(tmp_path, key)
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_int8_storage_loads_bf16_source_without_scale(tmp_path, cpu_offload):
+    key = "layers.1.engram.embed.weight"
+    weights = torch.linspace(-12, 12, 19 * 32).reshape(19, 32).bfloat16()
+    save_file({key: weights}, tmp_path / "weights.safetensors")
+    (tmp_path / "quant_model_weights.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "weights.safetensors"}})
+    )
+    query = type("QueryGroup", (), {"size": 4, "rank": 3})()
+    table = hbm.NodeShardedEngram(19, 32, query, device="cpu", storage_format="int8", cpu_offload=cpu_offload)
+    table.load_checkpoint(tmp_path, key, chunk_rows=2)
+    codes, scales = hbm.quantize_engram_rows(weights[15:19])
+    assert torch.equal(table.weight, codes)
+    assert torch.equal(table.weight_scale, scales)
+
+
+def test_int8_offload_loads_cpu_shard_and_reuses_pinned_slots(tmp_path):
+    key = "layers.14.engram.embed.weight"
+    scale_key = "layers.14.engram.embed.scale"
+    codes = (torch.arange(19 * 256).reshape(19, 256) % 256 - 128).to(torch.int8)
+    scales = torch.pow(2.0, torch.arange(19 * 8).reshape(19, 8) % 9 - 4)
+    save_file({key: codes, scale_key: scales}, tmp_path / "weights.safetensors")
+    (tmp_path / "quant_model_weights.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "weights.safetensors", scale_key: "weights.safetensors"}})
+    )
+    query = type("QueryGroup", (), {"size": 4, "rank": 3})()
+    # Explicit device and the enclosing default must both be overridden.
+    with torch.device("meta"):
+        table = hbm.NodeShardedEngram(19, 256, query, device="meta", storage_format="int8", cpu_offload=True)
+    assert table.weight.device.type == table.weight_scale.device.type == "cpu"
+    assert not table.weight.is_pinned() and not table.weight_scale.is_pinned()
+    table.load_checkpoint(tmp_path, key, chunk_rows=2)
+    assert torch.equal(table.weight, codes[15:19])
+    assert torch.equal(table.weight_scale, scales[15:19])
+    reference = (codes.float().reshape(19, 8, 32) * scales.unsqueeze(-1)).flatten(1).bfloat16()
+    pointers = []
+    for indices in ([0, 3, 0], [1, 2, 1], [3, 0, 2]):
+        ids = torch.tensor(indices)
+        output = table.lookup_local(ids)
+        assert output.is_pinned()
+        assert torch.equal(output.view(torch.int16), reference[ids + 15].view(torch.int16))
+        pointers.append(output.data_ptr())
+    assert pointers[0] == pointers[2] != pointers[1]
+    empty = table.lookup_local(torch.empty((0, 24), dtype=torch.long))
+    assert empty.shape == (0, 24, 256) and empty.device.type == "cpu"
+
+
+def test_int8_offload_waits_before_reusing_pinned_slot():
+    from unittest.mock import Mock
+
+    query = type("QueryGroup", (), {"size": 1, "rank": 0})()
+    table = hbm.NodeShardedEngram(5, 32, query, storage_format="int8", cpu_offload=True)
+    table.weight.data.fill_(1)
+    table.weight_scale.fill_(1)
+    ids = torch.tensor([0, 4])
+    first = table.lookup_local(ids)
+    event = Mock()
+    table._offload_events[first.data_ptr()] = event
+    table.lookup_local(ids)
+    event.synchronize.assert_not_called()
+    third = table.lookup_local(ids)
+    event.synchronize.assert_called_once_with()
+    assert first.data_ptr() == third.data_ptr()
+
+
+@pytest.mark.parametrize("scale_dtype,scale_width", [(torch.bfloat16, 8), (torch.float32, 4)])
+def test_int8_offload_rejects_invalid_scale(tmp_path, scale_dtype, scale_width):
+    key = "layers.1.engram.embed.weight"
+    scale_key = "layers.1.engram.embed.scale"
+    save_file(
+        {key: torch.ones(5, 256, dtype=torch.int8), scale_key: torch.ones(5, scale_width, dtype=scale_dtype)},
+        tmp_path / "weights.safetensors",
+    )
+    (tmp_path / "quant_model_weights.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "weights.safetensors", scale_key: "weights.safetensors"}})
+    )
+    query = type("QueryGroup", (), {"size": 1, "rank": 0})()
+    table = hbm.NodeShardedEngram(5, 256, query, storage_format="int8", cpu_offload=True)
+    with pytest.raises(ValueError, match="expected FP32"):
+        table.load_checkpoint(tmp_path, key)
 
 
 def test_cached_metadata_stays_on_cpu_with_device_context():
@@ -224,17 +383,27 @@ def test_gate_preserves_masked_rows():
     hidden = torch.randn(3, 4, 32).bfloat16()
     key = torch.randn(3, 4, 32).bfloat16()
     value = torch.randn(3, 32).bfloat16()
-    out = gate(hidden, key, value, torch.randn(4, 32), torch.eye(32),
-               torch.tensor([True, False, True]), 1e-5)
+    out = gate(hidden, key, value, torch.randn(4, 32), torch.eye(32), torch.tensor([True, False, True]), 1e-5)
     assert torch.equal(out[1], hidden[1])
     assert torch.isfinite(out.float()).all()
 
 
 def test_hash_causal_barrier():
     h = hash_mod.PagedNgramHistory.__new__(hash_mod.PagedNgramHistory)
-    h.token_map = torch.arange(100); h.pad_id = 2; h.image_token_id = 99; h.lookback = 2
-    h.primes = torch.tensor([[[101, 103]]]); h.offsets = torch.tensor([[0, 101]])
-    h.multipliers = torch.tensor([[3, 5]]); h.pages = {}
-    values, mask = h.update(torch.tensor([0, 5, 9, 99, 13, 17]), torch.arange(6),
-                             torch.zeros(6, dtype=torch.long), torch.tensor([[5, 1]]), 4)
+    h.token_map = torch.arange(100)
+    h.pad_id = 2
+    h.image_token_id = 99
+    h.image_pad_token_id = 100
+    h.lookback = 2
+    h.primes = torch.tensor([[[101, 103]]])
+    h.offsets = torch.tensor([[0, 101]])
+    h.multipliers = torch.tensor([[3, 5]])
+    h.pages = {}
+    values, mask = h.update(
+        torch.tensor([0, 5, 9, 99, 13, 17]),
+        torch.arange(6),
+        torch.zeros(6, dtype=torch.long),
+        torch.tensor([[5, 1]]),
+        4,
+    )
     assert values.shape == (6, 1, 2) and not mask[3]
