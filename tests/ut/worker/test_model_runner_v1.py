@@ -6,11 +6,12 @@ from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import torch
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, CompilationConfig
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.utils import reorder_batch_to_split_decodes_and_prefills
+from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -726,13 +727,64 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
                 runner.drafter = None
                 runner.use_aclgraph = False
 
-                runner._check_and_update_cudagraph_mode([], [])
+                with patch("vllm_ascend.worker.model_runner_v1.enable_dsa_cp", return_value=False):
+                    runner._check_and_update_cudagraph_mode([], [])
 
                 call_kwargs = compilation_config.resolve_cudagraph_mode_and_sizes.call_args.kwargs
                 self.assertEqual(
                     call_kwargs["tensor_parallel_size"],
                     expected_tp_size,
                 )
+
+    def test_dsa_cp_decode_dispatch_keys_are_actually_captured(self):
+        for tp_size, query_len, enable_sp in ((8, 6, False), (16, 6, False), (8, 6, True), (8, 1, False)):
+            with self.subTest(tp_size=tp_size, query_len=query_len, enable_sp=enable_sp):
+                runner = self._build_runner()
+                max_tokens = 32 * query_len
+                config = CompilationConfig(
+                    cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+                    cudagraph_capture_sizes=list(range(tp_size, max_tokens + 1, tp_size)),
+                    max_cudagraph_capture_size=max_tokens,
+                )
+                config.pass_config.enable_sp = enable_sp
+                runner.compilation_config = config
+                runner.parallel_config = SimpleNamespace(tensor_parallel_size=tp_size)
+                runner.vllm_config = SimpleNamespace(
+                    compilation_config=config,
+                    parallel_config=runner.parallel_config,
+                    num_speculative_tokens=query_len - 1,
+                    lora_config=None,
+                    scheduler_config=SimpleNamespace(max_num_seqs=32),
+                )
+                runner.uniform_decode_query_len = query_len
+                runner.kv_cache_config = SimpleNamespace(has_mamba_layers=False)
+                runner.max_num_reqs = 32
+                runner.cudagraph_dispatcher = CudagraphDispatcher(runner.vllm_config)
+                runner.speculative_config = None
+                runner.drafter = None
+                runner.use_aclgraph = False
+                with (
+                    patch("vllm_ascend.worker.model_runner_v1.enable_dsa_cp", return_value=True),
+                    patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=enable_sp),
+                    patch("vllm_ascend.worker.model_runner_v1.update_pass_config", return_value=nullcontext()),
+                ):
+                    runner._check_and_update_cudagraph_mode([], [])
+                    dispatcher = runner.cudagraph_dispatcher
+                    captured = set()
+                    for mode, descriptors in dispatcher.get_capture_descs():
+                        for descriptor in descriptors:
+                            actual_mode, actual_key = dispatcher.dispatch(
+                                runner._pad_for_sequence_parallelism(descriptor.num_tokens), uniform_decode=True
+                            )
+                            self.assertEqual((actual_mode, actual_key), (mode, descriptor))
+                            captured.add(actual_key)
+                    # Includes the one-request dummy used by idle DP ranks.
+                    for num_reqs in range(1, 33):
+                        mode, key = dispatcher.dispatch(
+                            runner._pad_for_sequence_parallelism(num_reqs * query_len), uniform_decode=True
+                        )
+                        self.assertEqual(mode, CUDAGraphMode.FULL)
+                        self.assertIn(key, captured)
 
     def test_sparse_c8_indexer_reuses_raw_cache_from_shared_descriptor(self):
         runner = self._build_runner()

@@ -5524,7 +5524,14 @@ class NPUModelRunner(GPUModelRunner):
         with update_pass_config(self):
             tensor_parallel_size = self.parallel_config.tensor_parallel_size
             resolver_tensor_parallel_size = tensor_parallel_size
-            if (
+            if enable_dsa_cp() and self.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
+                # DSA CP pads tokens to TP even when native MoE SP is disabled.
+                # Every dispatch key must remain unchanged by that padding;
+                # otherwise capture skips keys that idle DP decode can request.
+                graph_alignment = math.lcm(self.uniform_decode_query_len, tensor_parallel_size)
+                self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(graph_alignment, 1)
+                resolver_tensor_parallel_size = 1
+            elif (
                 self.compilation_config.pass_config.enable_sp
                 and self.uniform_decode_query_len > 1
                 and tensor_parallel_size > 1
