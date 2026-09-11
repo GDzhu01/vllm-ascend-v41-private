@@ -1353,7 +1353,48 @@ def test_v41_cp_rope_preserves_global_rows_across_builds(runtime, monkeypatch, r
     assert len(calls) == 2  # One global gather per build, including empty local ranks.
 
 
-def test_v41_cp_empty_query_rank_still_exchanges_output(monkeypatch):
+@pytest.mark.parametrize(
+    "cache_name,field,stage",
+    [
+        ("model.layers.0.self_attn.swa_cache", "smla_metadata", DeviceMetadataStage.ATTENTION),
+        ("model.layers.2.self_attn.indexer.k_cache", "qli_metadata", DeviceMetadataStage.INDEXER),
+        ("model.layers.2.self_attn.compressor.state_cache", "c2_ring_metadata", DeviceMetadataStage.COMPRESSOR),
+    ],
+)
+def test_v41_cp_builds_device_controls_only_on_consuming_side(runtime, monkeypatch, cache_name, field, stage):
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
+
+    monkeypatch.setattr(
+        "vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
+        lambda: SimpleNamespace(world_size=2, rank_in_group=0),
+    )
+    builder = DeepseekV41CPMetadataBuilder(collect_specs(runtime)[cache_name], [], runtime, torch.device("cpu"))
+    global_builder = builder._global_builder
+    compressor = stage == DeviceMetadataStage.COMPRESSOR
+    for side in (builder, global_builder):
+        # Queue native metadata operations without invoking NPU kernels on CPU.
+        side._device_metadata_enabled = True
+        side._supports_device_ops = not compressor
+    assert global_builder._smla_metadata.numel() == 0
+    assert global_builder._qli_metadata.numel() == 0
+    assert builder._c2_ring_metadata.numel() == 0
+    assert builder._c2_complete_mask.numel() == 0
+    assert builder._c2_source_positions.numel() == 0
+    assert builder._c2_source_cos.numel() == 0
+    assert builder._c2_source_sin.numel() == 0
+    for _ in range(2):
+        metadata = builder.build(0, _cp_common(), common_v41_metadata={}, common_v41_batch_metadata={})
+        owner, unused = (metadata.global_metadata, metadata) if compressor else (metadata, metadata.global_metadata)
+        assert getattr(owner, field) is not None
+        assert getattr(unused, field) is None
+        tasks = builder.take_device_metadata_tasks()
+        assert len(tasks) == 1
+        assert tasks[0].stage == stage
+        assert builder.take_device_metadata_tasks() == ()
+
+
+@pytest.mark.parametrize("local_tokens", [0, 1, 2])
+def test_v41_cp_output_exchange_only_pads_partial_ranks(monkeypatch, local_tokens):
     from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
 
     impl = DeepseekV41CPImpl("layer", SimpleNamespace(is_kv_source=False), None, None, None)
@@ -1368,16 +1409,20 @@ def test_v41_cp_empty_query_rank_still_exchanges_output(monkeypatch):
     projection = SimpleNamespace(_forward_o_proj=lambda tensor: tensor.flatten(1))
     attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=projection)))
     destination = torch.empty((3, 6))
+    local_output = torch.ones((local_tokens, 4, 3))
     output = impl._project_output(
         attn,
-        torch.empty((0, 4, 3)),
+        local_output,
         torch.empty((3, 6)),
-        SimpleNamespace(swa=SimpleNamespace(cp_token_range=(3, 4, 1, 4))),
+        SimpleNamespace(swa=SimpleNamespace(cp_token_range=(0, 2, 2, 4))),
         projected=destination,
     )
     assert output.data_ptr() == destination.data_ptr()
-    assert calls[0].shape == (1, 4, 3)
-    assert torch.count_nonzero(calls[0]) == 0
+    assert len(calls) == 1
+    assert calls[0].shape == (2, 4, 3)
+    assert (calls[0] is local_output) == (local_tokens == 2)
+    torch.testing.assert_close(calls[0][:local_tokens], local_output)
+    assert torch.count_nonzero(calls[0][local_tokens:]) == 0
     assert output.shape == (3, 6)
 
 

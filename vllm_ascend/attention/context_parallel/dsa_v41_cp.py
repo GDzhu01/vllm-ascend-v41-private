@@ -26,8 +26,12 @@ class _ReplicatedCacheMetadataBuilder(DeepseekV41MetadataBuilder):
     """Keep global cache metadata independent from local query buffers."""
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
-        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._global_builder = DeepseekV41MetadataBuilder(kv_cache_spec, layer_names, vllm_config, device)
+        super().__init__(
+            kv_cache_spec, layer_names, vllm_config, device, build_compressor_metadata=False
+        )
+        self._global_builder = DeepseekV41MetadataBuilder(
+            kv_cache_spec, layer_names, vllm_config, device, build_query_metadata=False
+        )
 
     def enable_device_metadata(self):
         super().enable_device_metadata()
@@ -139,14 +143,14 @@ class DeepseekV41CPImpl(DeepseekV41EagerAttentionImpl):
         # Replicated caches were updated before the TP token slice.
         return self._project_q(attn, hidden_states, cos, sin)
 
-    def _project_output(self, attn, output, hidden_states, metadata, projected=None):
+    def _project_output(self, attn, output, hidden_states, metadata, *, projected):
         _, _, per_rank, _ = metadata.swa.cp_token_range
-        padded = output.new_zeros((per_rank, output.shape[1], output.shape[2]))
-        padded[: output.shape[0]] = output
+        padded = output
+        if output.shape[0] != per_rank:
+            padded = output.new_zeros((per_rank, output.shape[1], output.shape[2]))
+            padded[: output.shape[0]] = output
         exchanged = restore_tp_heads(padded, get_tp_group())
         # The inherited V4 module owns quantized weights and TP projection logic.
-        if projected is None:
-            projected = torch.empty_like(hidden_states)
         local_output = attn.dsa_attn.dsa_attn.impl._forward_o_proj(exchanged)
         projected.copy_(local_output[: hidden_states.shape[0]])
         return projected

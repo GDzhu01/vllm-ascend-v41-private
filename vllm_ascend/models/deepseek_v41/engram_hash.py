@@ -14,12 +14,10 @@ def engram_history_metadata(metadata):
     """Read full-request SWA pages, before attention's local CP slicing.
 
     V4.1 CP exposes local queries directly and keeps the replicated request
-    in global_metadata. Legacy DSA_CP wraps it in req_metadata. Engram runs
-    before token slicing, so all TP ranks must use the full request lengths.
+    in global_metadata. Engram runs before token slicing, so all TP ranks
+    must use the full request lengths.
     """
     request_metadata = getattr(metadata, "global_metadata", None)
-    if request_metadata is None:
-        request_metadata = getattr(metadata, "req_metadata", None)
     if request_metadata is None:
         request_metadata = metadata
     boundaries = getattr(request_metadata, "query_start_loc_cpu", None)

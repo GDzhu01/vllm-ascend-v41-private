@@ -333,13 +333,11 @@ class DeepseekV41EagerAttentionImpl:
             self._write_compressed_source(attn, hidden_states, positions, cos, sin, metadata)
         return q, qr
 
-    def _project_output(self, attn, output, hidden_states, metadata, projected=None):
+    def _project_output(self, attn, output, hidden_states, metadata, *, projected):
         padded = output
         if output.shape[0] != hidden_states.shape[0]:
             padded = output.new_zeros((hidden_states.shape[0], output.shape[1], output.shape[2]))
             padded[: output.shape[0]] = output
-        if projected is None:
-            projected = torch.empty_like(hidden_states)
         attn.dsa_attn.dsa_attn.impl._forward_o_proj(padded, projected)
         return projected
 
@@ -652,21 +650,31 @@ class DeepseekV41EagerAttentionImpl:
 
 
 class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
-    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+    def __init__(
+        self, kv_cache_spec, layer_names, vllm_config, device, *,
+        build_query_metadata=True, build_compressor_metadata=True,
+    ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         max_tokens = getattr(vllm_config.scheduler_config, "max_num_batched_tokens", 4096)
         max_reqs = getattr(vllm_config.scheduler_config, "max_num_seqs", 256)
         self._supports_device_ops = getattr(device, "type", "cpu") != "cpu"
+        # CP uses global cache-write controls and local query controls. These
+        # roles are fixed before allocation and graph capture.
+        self._build_query_metadata = build_query_metadata
+        self._build_compressor_metadata = build_compressor_metadata
+        query_metadata_size = V41_METADATA_BUFFER_SIZE if build_query_metadata else 0
+        compressor_tokens = max_tokens if build_compressor_metadata else 0
+        compressor_reqs = max_reqs if build_compressor_metadata else 0
         self._slot_mapping = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
         self._slot_mapping_2d = torch.full((max_tokens, 2), -1, dtype=torch.int32, device=device)
         self._seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._cache_seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._cmp_residual = torch.zeros(max_reqs, dtype=torch.int32, device=device)
-        self._smla_metadata = torch.zeros(V41_METADATA_BUFFER_SIZE, dtype=torch.int32, device=device)
-        self._qli_metadata = torch.zeros(V41_METADATA_BUFFER_SIZE, dtype=torch.int32, device=device)
-        self._c2_ring_metadata = torch.zeros(5 * max_reqs, dtype=torch.int32, device=device)
-        self._c2_complete_mask = torch.zeros(max_tokens, dtype=torch.bool, device=device)
-        self._c2_source_positions = torch.zeros(max_tokens, dtype=torch.int64, device=device)
+        self._smla_metadata = torch.zeros(query_metadata_size, dtype=torch.int32, device=device)
+        self._qli_metadata = torch.zeros(query_metadata_size, dtype=torch.int32, device=device)
+        self._c2_ring_metadata = torch.zeros(5 * compressor_reqs, dtype=torch.int32, device=device)
+        self._c2_complete_mask = torch.zeros(compressor_tokens, dtype=torch.bool, device=device)
+        self._c2_source_positions = torch.zeros(compressor_tokens, dtype=torch.int64, device=device)
         text_config = vllm_config.model_config.hf_text_config
         rope_dim = int(
             _config_value(
@@ -676,7 +684,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             )
         )
         c2_rope_rows = (
-            max_tokens if self._supports_device_ops and isinstance(kv_cache_spec, DeepseekV41CompressorStateSpec) else 0
+            compressor_tokens if self._supports_device_ops and isinstance(kv_cache_spec, DeepseekV41CompressorStateSpec) else 0
         )
         self._c2_source_cos = torch.ones(
             (c2_rope_rows, 1, 1, rope_dim),
@@ -714,7 +722,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
 
     def enable_device_metadata(self) -> None:
         self._device_metadata_enabled = True
-        if isinstance(self.kv_cache_spec, DeepseekV41CompressorStateSpec):
+        if self._build_compressor_metadata and isinstance(self.kv_cache_spec, DeepseekV41CompressorStateSpec):
             if not self._c2_rope_layer_names:
                 raise RuntimeError("V4.1 compressor-state builder has no source RoPE layer")
             source_rope = get_full_cos_and_sin_dsa_for_layer(self._c2_rope_layer_names[0])
@@ -908,7 +916,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         smla_metadata = None
         qli_metadata = None
 
-        if self._supports_device_ops and cache_kind in {"swa", "long_kv"}:
+        if self._build_query_metadata and self._supports_device_ops and cache_kind in {"swa", "long_kv"}:
             has_compressed = operator_ratio in (1, 2)
             cmp_seq_lens = coordinates["cache_seq_lens"] if has_compressed else None
             cmp_residual = cmp_residual_buffer
@@ -948,7 +956,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                 build_smla_metadata,
             )
 
-        if self._supports_device_ops and cache_kind == "index_k":
+        if self._build_query_metadata and self._supports_device_ops and cache_kind == "index_k":
             residual = cmp_residual_buffer
 
             def build_qli_metadata() -> None:
@@ -985,7 +993,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         c2_source_cos = None
         c2_source_sin = None
         c2_metadata_group_id = None
-        if cache_kind == "compressor_state" and positions is not None:
+        if self._build_compressor_metadata and cache_kind == "compressor_state" and positions is not None:
             ring_meta = self._c2_ring_metadata[: 5 * num_reqs].view(5, num_reqs)
             input_positions = positions
             if self._supports_device_ops:
