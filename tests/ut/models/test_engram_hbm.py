@@ -33,15 +33,14 @@ gate = gate_mod.engram_gate
 
 
 @pytest.mark.parametrize("cp", ["none", "v41", "v41_empty_rank"])
-@pytest.mark.parametrize("cpu_mirrors", [False, True])
-def test_engram_history_metadata_uses_full_requests(cp, cpu_mirrors):
+def test_engram_history_metadata_uses_full_requests(cp):
     boundaries = torch.tensor([0, 3, 9], dtype=torch.int32)
     pages = torch.tensor([[7, 8, 9], [12, 13, 14]], dtype=torch.int32)
-    fields = dict(query_start_loc=boundaries, block_table=pages, storage_block_size=4)
-    if cpu_mirrors:
-        fields.update(query_start_loc_cpu=boundaries, block_table_cpu=pages)
-        # The CPU mirrors must avoid touching the device tensors.
-        fields.update(query_start_loc=None, block_table=None)
+    # Device tensors are intentionally unusable: history must use host mirrors.
+    fields = dict(
+        query_start_loc=None, block_table=None, storage_block_size=4,
+        query_start_loc_cpu=boundaries, block_table_cpu=pages,
+    )
     request = SimpleNamespace(**fields)
     if cp.startswith("v41"):
         local = torch.tensor([0, 0, 0] if cp == "v41_empty_rank" else [0, 0, 2])
@@ -58,6 +57,20 @@ def test_engram_history_metadata_uses_full_requests(cp, cpu_mirrors):
     assert torch.equal(actual_boundaries, boundaries.long())
     assert torch.equal(actual_pages, pages)
     assert block_size == 4
+
+
+@pytest.mark.parametrize("missing", ["query_start_loc_cpu", "block_table_cpu"])
+def test_engram_history_metadata_requires_cpu_mirrors(missing):
+    metadata = SimpleNamespace(
+        query_start_loc_cpu=torch.tensor([0, 1]),
+        block_table_cpu=torch.tensor([[7]]),
+        query_start_loc=None,
+        block_table=None,
+        storage_block_size=4,
+    )
+    setattr(metadata, missing, None)
+    with pytest.raises(ValueError, match="requires query_start_loc_cpu and block_table_cpu"):
+        hash_mod.engram_history_metadata(metadata)
 
 
 def _worker(rank, rendezvous):

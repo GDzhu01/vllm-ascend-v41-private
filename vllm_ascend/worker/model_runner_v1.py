@@ -3522,6 +3522,15 @@ class NPUModelRunner(GPUModelRunner):
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid
                 )
+            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                cm.block_table_cpu = torch.zeros((num_reqs_padded, 1), dtype=torch.int32, device="cpu")
+            else:
+                cm.block_table_cpu = self.input_batch.block_table[kv_cache_gid].get_cpu_tensor()[:num_reqs_padded]
+                if num_reqs < num_reqs_padded:
+                    # Match the device padding without modifying an H2D source
+                    # that may still be in flight.
+                    cm.block_table_cpu = cm.block_table_cpu.clone()
+                    cm.block_table_cpu[num_reqs:num_reqs_padded].zero_()
             if self.speculative_config and isinstance(self.drafter, (AscendStep3p5MTPProposer, AscendDSparkProposer)):
                 # step3p5 MTP draft layers span multiple KV cache groups; capture
                 # each group's block table / slot mapping so the proposer can

@@ -21,11 +21,11 @@ def engram_history_metadata(metadata):
     if request_metadata is None:
         request_metadata = metadata
     boundaries = getattr(request_metadata, "query_start_loc_cpu", None)
-    if boundaries is None:
-        boundaries = request_metadata.query_start_loc.detach().cpu()
     block_table = getattr(request_metadata, "block_table_cpu", None)
-    if block_table is None:
-        block_table = request_metadata.block_table.detach().cpu()
+    if boundaries is None or block_table is None:
+        raise ValueError("Engram requires query_start_loc_cpu and block_table_cpu in request metadata")
+    if boundaries.device.type != "cpu" or block_table.device.type != "cpu":
+        raise ValueError("Engram request metadata mirrors must reside on CPU")
     return boundaries.long(), block_table, request_metadata.storage_block_size
 
 
