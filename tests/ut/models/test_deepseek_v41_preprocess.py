@@ -148,8 +148,19 @@ def test_preprocess_equivalence_and_stream_dependencies(monkeypatch, share_quant
     expected_cache = cache.clone()
     cache.zero_()
     trace.clear()
-    kwargs = dict(kv_hidden_states=hidden, kv_cos=cos, kv_sin=sin) if cp else {}
-    q, qr = impl.multistream_preprocess(attn, local_hidden, local_cos, local_sin, metadata, **kwargs)
+    kwargs = {}
+    if cp:
+        impl.role = SimpleNamespace(is_kv_source=False)
+        attn.rotary_emb = SimpleNamespace(layername="layer")
+        metadata.num_actual_tokens = num_tokens
+        global_metadata = SimpleNamespace(swa=metadata, rope=lambda *args: (cos, sin))
+        metadata = SimpleNamespace(swa=SimpleNamespace(
+            num_actual_tokens=num_tokens - start, cp_token_range=(start, num_tokens, num_tokens - start, num_tokens)
+        ))
+        impl._global_layer_metadata = Mock(return_value=global_metadata)
+        monkeypatch.setattr(dsa_v41_cp, "get_forward_context", lambda: SimpleNamespace(attn_metadata={}))
+        metadata = metadata.swa
+    q, qr = impl.multistream_preprocess(attn, hidden, local_cos, local_sin, metadata, **kwargs)
     torch.testing.assert_close(q, expected_q)
     torch.testing.assert_close(qr, expected_qr)
     torch.testing.assert_close(cache, expected_cache)
@@ -234,11 +245,12 @@ def test_cp_multistream_forward_preserves_full_cache_updates(monkeypatch, local_
     attn = SimpleNamespace(
         rotary_emb=SimpleNamespace(layername="layer"),
         n_heads=2,
+        enable_dsa_cp=True,
         head_dim=4,
         nope_head_dim=2,
         dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=SimpleNamespace(multistream_dsv4_dsa_overlap=True))),
     )
-    monkeypatch.setattr(dsa_v41_cp, "get_forward_context", lambda: SimpleNamespace(attn_metadata={}))
+    monkeypatch.setattr(dsa_v41, "get_forward_context", lambda: SimpleNamespace(attn_metadata={}))
     monkeypatch.setattr(torch.ops._C_ascend, "inplace_partial_rotary_mul", lambda *args, **kwargs: None, raising=False)
     output = torch.ones_like(hidden)
     assert impl.forward(attn, None, hidden, output) is output
@@ -248,17 +260,12 @@ def test_cp_multistream_forward_preserves_full_cache_updates(monkeypatch, local_
         impl._update_caches.assert_not_called()
         impl.multistream_preprocess.assert_called_once()
         args, kwargs = impl.multistream_preprocess.call_args
-        torch.testing.assert_close(args[1], hidden[2:4])
+        torch.testing.assert_close(args[1], hidden)
         assert args[2] is local_cos and args[3] is local_sin
-        assert args[4] is global_metadata.swa
-        torch.testing.assert_close(kwargs["kv_hidden_states"], hidden[:4])
-        assert kwargs["kv_cos"] is global_cos and kwargs["kv_sin"] is global_sin
-        assert impl._write_compressed_source.call_count == int(is_source)
-        if is_source:
-            args = impl._write_compressed_source.call_args.args
-            torch.testing.assert_close(args[1], hidden[:4])
-            torch.testing.assert_close(args[2], global_metadata.positions)
-            assert args[-1] is global_metadata
+        assert args[4] is metadata.swa
+        assert not kwargs
+        # The mocked preprocessor owns compressed-cache writes.
+        impl._write_compressed_source.assert_not_called()
         assert impl._select_sparse_indices.call_args.args[-1] is metadata
     else:
         impl.multistream_preprocess.assert_not_called()

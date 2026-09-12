@@ -57,6 +57,9 @@ class TestAscendDSACPOProjTPParams(unittest.TestCase):
         tp_group = SimpleNamespace(world_size=2, rank_in_group=0)
         layer = self._OProj()
         with (
+            patch("vllm_ascend.attention.context_parallel.dsa_cp.get_ascend_config",
+                  return_value=SimpleNamespace(multistream_dsv4_dsa_overlap=True)),
+            patch("vllm_ascend.attention.context_parallel.dsa_cp.is_a5_bf16_kv_enabled", return_value=False),
             patch(
                 "vllm_ascend.attention.context_parallel.dsa_cp.enable_dsa_cp_with_o_proj_tp",
                 return_value=True,
@@ -84,9 +87,9 @@ class TestAscendDSACPOProjTPParams(unittest.TestCase):
                 n_local_groups=1,
                 window_size=1,
                 compress_ratio=1,
-                wq_a=object(),
-                wq_b=object(),
-                wkv=object(),
+                wq_a=layer,
+                wq_b=layer,
+                wkv=layer,
                 q_norm=object(),
                 kv_norm=object(),
                 swa_cache_layer=SimpleNamespace(prefix="swa"),
@@ -96,6 +99,10 @@ class TestAscendDSACPOProjTPParams(unittest.TestCase):
                 attn_sink=torch.empty(2),
             )
 
+        self.assertTrue(impl.multistream_dsv4_dsa_overlap)
+        self.assertIs(impl.cv_wq_a.linear, layer)
+        self.assertIs(impl.cv_wkv.linear, layer)
+        self.assertIs(impl.cv_wq_b.linear, layer)
         self.assertTrue(impl.enable_dsa_cp_with_o_proj_tp)
         profile.supports.assert_called_once_with(HardwareCapability.FP8_ATTENTION)
 
