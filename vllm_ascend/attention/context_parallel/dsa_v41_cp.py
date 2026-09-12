@@ -66,13 +66,42 @@ class DeepseekV41CPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         # SMLA consumes INT32 offsets at a fixed address during graph replay.
         self._cp_query_start_loc = self._seq_lens.new_zeros(self._seq_lens.numel() + 1)
+        self._cp_suffix = torch.empty_like(self._seq_lens)
+        self._cp_query_start_loc_cpu = torch.empty(
+            self._cp_query_start_loc.shape, dtype=self._cp_query_start_loc.dtype,
+            device="cpu", pin_memory=self._cp_query_start_loc.device.type != "cpu",
+        )
+        self._cp_suffix_cpu = torch.empty(
+            self._cp_suffix.shape, dtype=self._cp_suffix.dtype,
+            device="cpu", pin_memory=self._cp_suffix.device.type != "cpu",
+        )
+        self._cp_upload_done = None
+        self._cp_upload_pending = False
+
+    def _upload_cp_metadata(self, query_start_loc_cpu, suffix_cpu):
+        # A pinned source must survive until DMA finishes. Wait only when
+        # reusing this builder's staging buffers, not on every new upload.
+        if self._cp_upload_pending and not self._cp_upload_done.query():
+            self._cp_upload_done.synchronize()
+        qsl_host = self._cp_query_start_loc_cpu[: query_start_loc_cpu.numel()]
+        suffix_host = self._cp_suffix_cpu[: suffix_cpu.numel()]
+        qsl_host.copy_(query_start_loc_cpu)
+        suffix_host.copy_(suffix_cpu)
+        query_start_loc = self._cp_query_start_loc[: query_start_loc_cpu.numel()]
+        suffix = self._cp_suffix[: suffix_cpu.numel()]
+        query_start_loc.copy_(qsl_host, non_blocking=True)
+        suffix.copy_(suffix_host, non_blocking=True)
+        if query_start_loc.device.type != "cpu":
+            if self._cp_upload_done is None:
+                self._cp_upload_done = torch.npu.Event()
+            self._cp_upload_done.record(torch.npu.current_stream())
+            self._cp_upload_pending = True
+        return query_start_loc, suffix
 
     # Reuse Legacy DSACP's request intersection and causal-prefix calculation.
     _local_token_range = staticmethod(AscendDSACPMetadataBuilder._local_token_range)
 
-    def build(self, common_prefix_len, common_attn_metadata, fast_build=False, **kwargs):
-        common = common_attn_metadata
-        global_metadata = self._build_global_metadata(common_prefix_len, common, fast_build, kwargs)
+    def _build_cp_batch_metadata(self, common):
         seq_lens_cpu = (
             common._seq_lens_cpu if getattr(common, "_seq_lens_cpu", None) is not None else common.seq_lens_cpu
         )
@@ -88,8 +117,6 @@ class DeepseekV41CPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
         actual_start = min(start, actual_end)
         # Padding participates in the output exchange, not in cache reads.
         qsl = qsl.clamp_max(actual_end - actual_start).to(self._cp_query_start_loc.dtype)
-        query_start_loc = self._cp_query_start_loc[: qsl.numel()]
-        query_start_loc.copy_(qsl)
         # Device lengths are authoritative after speculative rejection; the
         # CPU mirror may still be an upper bound. Remove only the query suffix
         # beyond this rank's token interval from each request's device length.
@@ -97,19 +124,38 @@ class DeepseekV41CPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
         suffix = query_ends - query_ends.clamp(min=actual_start, max=actual_end)
         if not bool(getattr(common, "causal", True)):
             suffix = torch.zeros_like(suffix)
-        local_seq_lens = (common.seq_lens[: common.num_reqs] - suffix.to(common.seq_lens.device)).clamp_min(0)
+        query_start_loc, suffix_device = self._upload_cp_metadata(qsl, suffix)
+        local_seq_lens = (common.seq_lens[: common.num_reqs] - suffix_device).clamp_min(0)
         local_seq_lens = torch.where(query_start_loc[1:] > query_start_loc[:-1], local_seq_lens, 0)
-        local_common = common.replace(
+        coordinates = dict(
             query_start_loc=query_start_loc,
             query_start_loc_cpu=qsl,
             seq_lens=local_seq_lens,
             seq_lens_cpu=seq_lens,
             num_actual_tokens=actual_end - actual_start,
             num_input_tokens=actual_end - actual_start,
-            positions=common.positions[actual_start:actual_end],
-            slot_mapping=common.slot_mapping[actual_start:actual_end],
             max_query_len=int((qsl[1:] - qsl[:-1]).max()) if common.num_reqs else 0,
             max_seq_len=int(seq_lens.max()) if common.num_reqs else 0,
+        )
+        return (start, end, per_rank, padded), actual_start, actual_end, coordinates
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False, **kwargs):
+        common = common_attn_metadata
+        global_metadata = self._build_global_metadata(common_prefix_len, common, fast_build, kwargs)
+        # This dictionary is recreated by the runner for each metadata build.
+        # Only batch coordinates are shared; physical pages/slots remain local
+        # to each cache group. Draft builds without a shared scope recompute.
+        batch_shared = kwargs.get("common_v41_batch_metadata")
+        cp_batch = batch_shared.get("cp_batch") if batch_shared is not None else None
+        if cp_batch is None:
+            cp_batch = self._build_cp_batch_metadata(common)
+            if batch_shared is not None:
+                batch_shared["cp_batch"] = cp_batch
+        token_range, actual_start, actual_end, coordinates = cp_batch
+        local_common = common.replace(
+            **coordinates,
+            positions=common.positions[actual_start:actual_end],
+            slot_mapping=common.slot_mapping[actual_start:actual_end],
         )
         kwargs["num_query_heads"] = _config_value(self.vllm_config.model_config.hf_text_config, "num_attention_heads")
         if global_metadata.cos is not None and global_metadata.sin is not None:
@@ -123,7 +169,7 @@ class DeepseekV41CPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
         if global_metadata.ori_sparse_indices is not None:
             kwargs["ori_sparse_indices"] = global_metadata.ori_sparse_indices[actual_start:actual_end]
         local = super().build(common_prefix_len, local_common, fast_build, **kwargs)
-        return replace(local, global_metadata=global_metadata, cp_token_range=(start, end, per_rank, padded))
+        return replace(local, global_metadata=global_metadata, cp_token_range=token_range)
 
 
 class DeepseekV41CPImpl(DeepseekV41EagerAttentionImpl):
