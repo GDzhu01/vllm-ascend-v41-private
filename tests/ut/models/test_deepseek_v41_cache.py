@@ -1640,3 +1640,72 @@ def test_dspark_v41_noncausal_metadata_preserves_full_visible_block(runtime, mon
     torch.testing.assert_close(local.ori_sparse_indices, full.ori_sparse_indices[rank:rank + 1])
     assert local.seq_lens.tolist() == ([first_seq_len, 0] if rank < 3 else [0, 0])
     assert local.ori_mask_mode == 0
+
+
+@pytest.mark.parametrize("pending,complete", [(False, False), (True, True), (True, False)])
+def test_v41_cp_upload_reuses_buffers_after_dma_completion(pending, complete):
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
+
+    builder = DeepseekV41CPMetadataBuilder.__new__(DeepseekV41CPMetadataBuilder)
+    builder._cp_query_start_loc = torch.empty(5, dtype=torch.int32)
+    builder._cp_suffix = torch.empty(4, dtype=torch.int32)
+    builder._cp_query_start_loc_cpu = torch.full((5,), -7, dtype=torch.int32)
+    builder._cp_suffix_cpu = torch.full((4,), -7, dtype=torch.int32)
+    builder._cp_upload_pending = pending
+    builder._cp_upload_done = Mock()
+    builder._cp_upload_done.query.return_value = complete
+
+    def before_reuse():
+        # The previous DMA source cannot be overwritten before its event.
+        assert builder._cp_query_start_loc_cpu.tolist() == [-7] * 5
+        assert builder._cp_suffix_cpu.tolist() == [-7] * 4
+
+    builder._cp_upload_done.synchronize.side_effect = before_reuse
+    qsl = torch.tensor([0, 2, 2, 5], dtype=torch.int64)
+    suffix = torch.tensor([3, 0, 1], dtype=torch.int64)
+    device_qsl, device_suffix = builder._upload_cp_metadata(qsl, suffix)
+    assert device_qsl.data_ptr() == builder._cp_query_start_loc.data_ptr()
+    assert device_suffix.data_ptr() == builder._cp_suffix.data_ptr()
+    torch.testing.assert_close(device_qsl, qsl.int())
+    torch.testing.assert_close(device_suffix, suffix.int())
+    assert builder._cp_query_start_loc_cpu[-1].item() == -7
+    assert builder._cp_suffix_cpu[-1].item() == -7
+    assert builder._cp_upload_done.synchronize.call_count == int(pending and not complete)
+    assert builder._cp_upload_done.query.call_count == int(pending)
+    # CPU query metadata returned to other consumers remains independent.
+    builder._cp_query_start_loc_cpu.zero_()
+    assert qsl.tolist() == [0, 2, 2, 5]
+
+
+@pytest.mark.parametrize("rank", [0, 1, 7])
+def test_v41_cp_batch_cache_reuses_coordinates_but_keeps_group_slots(runtime, monkeypatch, rank):
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
+
+    monkeypatch.setattr(
+        "vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
+        lambda: SimpleNamespace(world_size=8, rank_in_group=rank),
+    )
+    spec = collect_specs(runtime)["model.layers.2.self_attn.long_kv_cache"]
+    first = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    second = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    first._build_cp_batch_metadata = Mock(wraps=first._build_cp_batch_metadata)
+    second._build_cp_batch_metadata = Mock(wraps=second._build_cp_batch_metadata)
+    common = _cp_common()
+    other = common.replace(slot_mapping=common.slot_mapping + 256, block_table_tensor=common.block_table_tensor + 2)
+    shared = {}
+    a = first.build(0, common, common_v41_metadata={}, common_v41_batch_metadata=shared)
+    b = second.build(0, other, common_v41_metadata={}, common_v41_batch_metadata=shared)
+    reference = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu")).build(0, other)
+    first._build_cp_batch_metadata.assert_called_once()
+    second._build_cp_batch_metadata.assert_not_called()
+    assert a.query_start_loc.data_ptr() == b.query_start_loc.data_ptr()
+    for name in ("query_start_loc", "query_start_loc_cpu", "seq_lens", "slot_mapping", "block_table", "positions"):
+        torch.testing.assert_close(getattr(b, name), getattr(reference, name))
+    torch.testing.assert_close(b.global_metadata.slot_mapping, reference.global_metadata.slot_mapping)
+    assert not torch.equal(a.global_metadata.slot_mapping, b.global_metadata.slot_mapping)
+    # A fresh runner scope must rebuild, even with the same shapes/pointers.
+    second.build(0, other, common_v41_metadata={}, common_v41_batch_metadata={})
+    assert second._build_cp_batch_metadata.call_count == 1
+    # Draft/standalone calls without a scope cannot reuse stale step values.
+    second.build(0, other)
+    assert second._build_cp_batch_metadata.call_count == 2
