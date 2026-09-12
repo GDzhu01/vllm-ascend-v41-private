@@ -717,39 +717,13 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             {(target_layer,), (draft_layer,), (cache_layer,)},
         )
 
-    def test_explicit_capture_sizes_must_align_spec_decode_and_sp(self):
-        for capture_sizes, expected_tp_size in (([48, 96], 1), ([16, 32], 16)):
-            with self.subTest(capture_sizes=capture_sizes):
-                runner = self._build_runner()
-                compilation_config = SimpleNamespace(
-                    pass_config=SimpleNamespace(enable_sp=True),
-                    cudagraph_capture_sizes=capture_sizes,
-                    resolve_cudagraph_mode_and_sizes=MagicMock(return_value=CUDAGraphMode.FULL_DECODE_ONLY),
-                )
-                runner.compilation_config = compilation_config
-                runner.vllm_config.compilation_config = compilation_config
-                runner.parallel_config = SimpleNamespace(tensor_parallel_size=16)
-                runner.uniform_decode_query_len = 6
-                runner.kv_cache_config = SimpleNamespace()
-                runner.max_num_reqs = 16
-                runner.cudagraph_dispatcher = MagicMock()
-                runner.cudagraph_dispatcher.get_capture_descs.return_value = []
-                runner.speculative_config = None
-                runner.drafter = None
-                runner.use_aclgraph = False
-
-                with patch("vllm_ascend.worker.model_runner_v1.enable_dsa_cp", return_value=False):
-                    runner._check_and_update_cudagraph_mode([], [])
-
-                call_kwargs = compilation_config.resolve_cudagraph_mode_and_sizes.call_args.kwargs
-                self.assertEqual(
-                    call_kwargs["tensor_parallel_size"],
-                    expected_tp_size,
-                )
-
-    def test_dsa_cp_decode_dispatch_keys_are_actually_captured(self):
-        for tp_size, query_len, enable_sp in ((8, 6, False), (16, 6, False), (8, 6, True), (8, 1, False)):
-            with self.subTest(tp_size=tp_size, query_len=query_len, enable_sp=enable_sp):
+    def test_cp_or_sp_decode_dispatch_keys_are_actually_captured(self):
+        cases = (
+            (True, 8, 6, False), (True, 16, 6, False), (True, 8, 6, True), (True, 8, 1, False),
+            (False, 8, 6, True), (False, 16, 6, True), (False, 8, 1, True),
+        )
+        for cp_enabled, tp_size, query_len, enable_sp in cases:
+            with self.subTest(cp=cp_enabled, tp_size=tp_size, query_len=query_len, enable_sp=enable_sp):
                 runner = self._build_runner()
                 max_tokens = 32 * query_len
                 config = CompilationConfig(
@@ -775,7 +749,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
                 runner.drafter = None
                 runner.use_aclgraph = False
                 with (
-                    patch("vllm_ascend.worker.model_runner_v1.enable_dsa_cp", return_value=True),
+                    patch("vllm_ascend.worker.model_runner_v1.enable_dsa_cp", return_value=cp_enabled),
                     patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=enable_sp),
                     patch("vllm_ascend.worker.model_runner_v1.update_pass_config", return_value=nullcontext()),
                 ):
