@@ -279,7 +279,7 @@ def test_request_accounting_counts_merged_full_context_once(runtime):
 def test_mixed_layouts_rejected(config, runtime):
     specs = collect_specs(runtime)
     specs["foreign"] = object()
-    with pytest.raises(ValueError, match="foreign"):
+    with pytest.raises(ValueError, match="foreign resources"):
         group_cache_specs(specs)
 
 
@@ -331,16 +331,12 @@ def test_model_registration_and_binding(runtime):
     assert len(owned_names) == 51
 
 
-@pytest.mark.parametrize("feature", ["spec", "pd", "pp", "v2", "graph"])
+@pytest.mark.parametrize("feature", ["spec", "pp", "graph"])
 def test_unsupported_runtime_fails_before_registration(runtime, feature):
     if feature == "spec":
         runtime.speculative_config = object()
-    elif feature == "pd":
-        runtime.kv_transfer_config = object()
     elif feature == "pp":
         runtime.parallel_config.pipeline_parallel_size = 2
-    elif feature == "v2":
-        runtime.use_v2_model_runner = True
     else:
         runtime.model_config.enforce_eager = False
     with pytest.raises(NotImplementedError):
@@ -1212,3 +1208,435 @@ def test_interleaved_request_state_isolation(config):
     actual = compressor_ratio2_reference(compressor, first[1:], 1, state, [1])
     expected = compressor_ratio2_reference(compressor, first, 0, state, [1])
     torch.testing.assert_close(actual, expected)
+
+
+class _CPCommon(SimpleNamespace):
+    def replace(self, **kwargs):
+        return type(self)(**(vars(self) | kwargs))
+
+
+def _cp_common():
+    # The second request resumes in the middle of a ratio-2 pair.
+    return _CPCommon(
+        slot_mapping=torch.tensor([0, 1, 2, 68]),
+        block_table_tensor=torch.tensor([[0, 1], [1, 2]]),
+        query_start_loc=torch.tensor([0, 3, 4], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 3, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([3, 5], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([3, 5], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=4,
+        num_input_tokens=4,
+        max_query_len=3,
+        max_seq_len=5,
+        positions=torch.tensor([0, 1, 2, 4]),
+        is_prefilling=torch.tensor([True, True]),
+        causal=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "rank,size,query_offsets,seq_lens,positions",
+    [
+        (0, 2, [0, 2, 2], [2, 0], [0, 1]),
+        (1, 2, [0, 1, 2], [3, 5], [2, 4]),
+        (5, 8, [0, 0, 0], [0, 0], []),
+    ],
+)
+def test_v41_cp_metadata_preserves_global_compression_and_local_causality(
+    runtime, monkeypatch, rank, size, query_offsets, seq_lens, positions
+):
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
+
+    monkeypatch.setattr(
+        "vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
+        lambda: SimpleNamespace(world_size=size, rank_in_group=rank),
+    )
+    spec = collect_specs(runtime)["model.layers.2.self_attn.long_kv_cache"]
+    builder = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    metadata = builder.build(
+        0, _cp_common(), common_v41_metadata={}, common_v41_batch_metadata={}
+    )
+    assert metadata.query_start_loc.tolist() == query_offsets
+    assert metadata.query_start_loc.dtype == torch.int32
+    pointer = metadata.query_start_loc.data_ptr()
+    assert builder.build(0, _cp_common()).query_start_loc.data_ptr() == pointer
+    assert metadata.seq_lens.tolist() == seq_lens
+    assert metadata.positions.tolist() == positions
+    assert metadata.global_metadata.seq_lens.tolist() == [3, 5]
+    assert metadata.global_metadata.cache_seq_lens.tolist() == [1, 2]
+    assert metadata.global_metadata.slot_mapping.tolist() == [[-1, -1], [0, 0], [-1, -1], [-1, -1]]
+    assert metadata.num_actual_tokens == len(positions)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_v41_cp_uses_device_seq_lens_when_cpu_mirror_is_upper_bound(runtime, monkeypatch, rank):
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
+
+    monkeypatch.setattr(
+        "vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
+        lambda: SimpleNamespace(world_size=2, rank_in_group=rank),
+    )
+    # A speculative rejection has corrected device lengths and positions;
+    # the host mirror still describes the optimistic upper bound.
+    common = _cp_common().replace(
+        seq_lens=torch.tensor([7, 9], dtype=torch.int32),
+        seq_lens_cpu=None,
+        _seq_lens_cpu=torch.tensor([9, 11], dtype=torch.int32),
+        positions=torch.tensor([4, 5, 6, 8]),
+        max_seq_len=11,
+    )
+    spec = collect_specs(runtime)["model.layers.2.self_attn.long_kv_cache"]
+    builder = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    metadata = builder.build(0, common)
+    expected = [6, 0] if rank == 0 else [7, 9]
+    assert metadata.global_metadata.seq_lens.tolist() == [7, 9]
+    assert metadata.seq_lens.tolist() == expected
+    assert metadata.cache_seq_lens.tolist() == [n // 2 for n in expected]
+    assert metadata.cmp_residual.tolist() == [n % 2 for n in expected]
+
+
+@pytest.mark.parametrize("rank", [0, 1, 3, 7])
+@pytest.mark.parametrize("prefill", [False, True])
+def test_v41_cp_rope_preserves_global_rows_across_builds(runtime, monkeypatch, rank, prefill):
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
+    from vllm_ascend.ops import rope_dsv4 as rope
+
+    monkeypatch.setattr(
+        "vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
+        lambda: SimpleNamespace(world_size=8, rank_in_group=rank),
+    )
+    state = rope.RopeGlobalState()
+    full = torch.arange(128, dtype=torch.float32).reshape(128, 1, 1, 1)
+    state.full_rope_cache["test"] = (full, full + 1000)
+    state.runtime_buffer["test"] = {
+        "default": (torch.zeros(8, 1, 1, 1), torch.zeros(8, 1, 1, 1))
+    }
+    state.registry_summary["test"] = {"default"}
+    state.layer_info["test.layer"] = ("test", ["default"])
+    monkeypatch.setattr(rope, "_ROPE_STATE", state)
+    calls = []
+
+    def gather(positions, **kwargs):
+        calls.append(positions.clone())
+        return rope.get_cos_and_sin_dsa(positions, **kwargs)
+
+    monkeypatch.setattr("vllm_ascend.attention.dsa_v41.get_cos_and_sin_dsa", gather)
+    spec = collect_specs(runtime)["model.layers.0.self_attn.swa_cache"]
+    builder = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    pointer = None
+    for step in (0, 3):
+        positions = torch.tensor([10, 20, 30, 40]) + step
+        offsets = torch.arange(5, dtype=torch.int32)
+        common = _cp_common().replace(
+            positions=positions, num_reqs=4, query_start_loc=offsets,
+            query_start_loc_cpu=offsets, seq_lens=(positions + 1).int(),
+            seq_lens_cpu=(positions + 1).int(), max_query_len=1,
+            max_seq_len=int(positions.max()) + 1,
+            block_table_tensor=torch.zeros(4, 2, dtype=torch.int32),
+            is_prefilling=torch.full((4,), prefill),
+        )
+        metadata = builder.build(0, common)
+        global_cos = metadata.global_metadata.cos["test.layer"]
+        local_cos = metadata.cos["test.layer"]
+        local_sin = metadata.sin["test.layer"]
+        expected = positions[rank:rank + 1].float()
+        torch.testing.assert_close(global_cos.flatten(), positions.float())
+        torch.testing.assert_close(local_cos.flatten(), expected)
+        torch.testing.assert_close(local_sin.flatten(), expected + 1000)
+        if not prefill:
+            if pointer is not None:
+                assert global_cos.data_ptr() == pointer
+            pointer = global_cos.data_ptr()
+        if expected.numel():
+            assert local_cos.data_ptr() == global_cos.data_ptr() + rank * global_cos.element_size()
+    assert len(calls) == 2  # One global gather per build, including empty local ranks.
+
+
+@pytest.mark.parametrize(
+    "cache_name,field,stage",
+    [
+        ("model.layers.0.self_attn.swa_cache", "smla_metadata", DeviceMetadataStage.ATTENTION),
+        ("model.layers.2.self_attn.indexer.k_cache", "qli_metadata", DeviceMetadataStage.INDEXER),
+        ("model.layers.2.self_attn.compressor.state_cache", "c2_ring_metadata", DeviceMetadataStage.COMPRESSOR),
+    ],
+)
+def test_v41_cp_builds_device_controls_only_on_consuming_side(runtime, monkeypatch, cache_name, field, stage):
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
+
+    monkeypatch.setattr(
+        "vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
+        lambda: SimpleNamespace(world_size=2, rank_in_group=0),
+    )
+    builder = DeepseekV41CPMetadataBuilder(collect_specs(runtime)[cache_name], [], runtime, torch.device("cpu"))
+    global_builder = builder._global_builder
+    compressor = stage == DeviceMetadataStage.COMPRESSOR
+    for side in (builder, global_builder):
+        # Queue native metadata operations without invoking NPU kernels on CPU.
+        side._device_metadata_enabled = True
+        side._supports_device_ops = not compressor
+    assert global_builder._smla_metadata.numel() == 0
+    assert global_builder._qli_metadata.numel() == 0
+    assert builder._c2_ring_metadata.numel() == 0
+    assert builder._c2_complete_mask.numel() == 0
+    assert builder._c2_source_positions.numel() == 0
+    assert builder._c2_source_cos.numel() == 0
+    assert builder._c2_source_sin.numel() == 0
+    for _ in range(2):
+        metadata = builder.build(0, _cp_common(), common_v41_metadata={}, common_v41_batch_metadata={})
+        owner, unused = (metadata.global_metadata, metadata) if compressor else (metadata, metadata.global_metadata)
+        assert getattr(owner, field) is not None
+        assert getattr(unused, field) is None
+        tasks = builder.take_device_metadata_tasks()
+        assert len(tasks) == 1
+        assert tasks[0].stage == stage
+        assert builder.take_device_metadata_tasks() == ()
+
+
+@pytest.mark.parametrize("local_tokens", [0, 1, 2])
+def test_v41_cp_output_exchange_only_pads_partial_ranks(monkeypatch, local_tokens):
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
+
+    impl = DeepseekV41CPImpl("layer", SimpleNamespace(is_kv_source=False), None, None, None)
+    calls = []
+    monkeypatch.setattr("vllm_ascend.attention.context_parallel.dsa_v41_cp.get_tp_group", lambda: None)
+
+    def exchange(tensor, group):
+        calls.append(tensor)
+        return torch.ones((4, 2, 3))
+
+    monkeypatch.setattr("vllm_ascend.attention.context_parallel.dsa_v41_cp.restore_tp_heads", exchange)
+    projection = SimpleNamespace(_forward_o_proj=lambda tensor: tensor.flatten(1))
+    attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=projection)))
+    destination = torch.empty((3, 6))
+    local_output = torch.ones((local_tokens, 4, 3))
+    output = impl._project_output(
+        attn,
+        local_output,
+        torch.empty((3, 6)),
+        SimpleNamespace(swa=SimpleNamespace(cp_token_range=(0, 2, 2, 4))),
+        projected=destination,
+    )
+    assert output.data_ptr() == destination.data_ptr()
+    assert len(calls) == 1
+    assert calls[0].shape == (2, 4, 3)
+    assert (calls[0] is local_output) == (local_tokens == 2)
+    torch.testing.assert_close(calls[0][:local_tokens], local_output)
+    assert torch.count_nonzero(calls[0][local_tokens:]) == 0
+    assert output.shape == (3, 6)
+
+
+def test_v41_cp_consumers_reuse_local_topk_and_candidates():
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
+
+    impl = DeepseekV41CPImpl(
+        "layer", SimpleNamespace(is_kv_source=False, has_long_context=True, is_index_source=False), None, None, None
+    )
+    indices = torch.tensor([[0, 2], [1, 3]])
+    candidates = torch.tensor([[True, False]])
+    shared = SimpleNamespace(topk_indices=indices, candidates=candidates)
+    actual = impl._select_sparse_indices(
+        SimpleNamespace(shared_state=shared), torch.empty(2, 1), None, None, None, None, None
+    )
+    assert actual.data_ptr() == indices.data_ptr()
+    torch.testing.assert_close(actual, indices)
+    assert shared.candidates is candidates
+
+
+@pytest.mark.parametrize("pcp,cp", [(False, False), (True, False), (False, True), (True, True)])
+def test_v41_backend_routes_metadata_and_execution_together(monkeypatch, pcp, cp):
+    from vllm_ascend.attention.context_parallel import dsa_v41_cp
+    from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheBackend
+
+    monkeypatch.setattr(dsa_v41_cp, "enable_pcp", lambda: pcp)
+    monkeypatch.setattr(dsa_v41_cp, "enable_dsa_cp", lambda: cp)
+    if pcp:
+        with pytest.raises(NotImplementedError, match="PCP is not supported"):
+            DeepseekV41CacheBackend.get_builder_cls()
+        return
+    builder, impl = dsa_v41_cp.get_v41_cp_classes()
+    assert DeepseekV41CacheBackend.get_builder_cls() is builder
+    assert not DeepseekV41CacheBackend.supports_pcp()
+    if cp:
+        assert issubclass(impl, dsa_v41_cp.DeepseekV41CPImpl)
+
+
+def test_v41_cp_accepts_async_seq_lens_mirror(runtime, monkeypatch):
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
+
+    monkeypatch.setattr("vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
+                        lambda: SimpleNamespace(world_size=2, rank_in_group=1))
+    common = _cp_common()
+    common._seq_lens_cpu = common.seq_lens_cpu
+    common.seq_lens_cpu = None
+    spec = collect_specs(runtime)["model.layers.2.self_attn.long_kv_cache"]
+    metadata = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu")).build(0, common)
+    assert metadata.seq_lens.tolist() == [3, 5]
+    assert metadata.global_metadata.cache_seq_lens.tolist() == [1, 2]
+
+
+def test_v41_cp_resolves_own_planes_with_native_draft_metadata_present():
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
+
+    impl = DeepseekV41CPImpl(
+        prefix="model.layers.0.self_attn",
+        role=SimpleNamespace(is_kv_source=False, compress_ratio=0),
+        topology=None,
+        long_kv_source_prefix=None,
+        index_k_source_prefix=None,
+    )
+    global_swa = object()
+    metadata = {
+        impl.swa_prefix: SimpleNamespace(global_metadata=global_swa),
+        "mtp.0.self_attn.swa_cache": SimpleNamespace(seq_lens=torch.tensor([4])),
+    }
+    assert impl._global_layer_metadata(metadata).swa is global_swa
+
+
+@pytest.mark.parametrize("v2,pcp", [(False, 2), (True, 1)])
+def test_v41_runtime_rejects_pcp_and_mrv2(runtime, v2, pcp):
+    from vllm_ascend.core.deepseek_v41 import validate_cache_runtime
+
+    runtime.use_v2_model_runner = v2
+    runtime.parallel_config.prefill_context_parallel_size = pcp
+    with pytest.raises(NotImplementedError, match="runner V1" if v2 else "PCP=1"):
+        validate_cache_runtime(runtime)
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_v41_query_preparation_keeps_mainline_preprocess(overlap):
+    from unittest.mock import Mock
+    from vllm_ascend.attention.dsa_v41 import DeepseekV41EagerAttentionImpl
+
+    impl = DeepseekV41EagerAttentionImpl.__new__(DeepseekV41EagerAttentionImpl)
+    impl.role = SimpleNamespace(is_kv_source=True)
+    impl.preprocess = Mock(return_value=("q", "qr"))
+    impl.multistream_preprocess = Mock(return_value=("q", "qr"))
+    impl._write_compressed_source = Mock()
+    attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(
+        impl=SimpleNamespace(multistream_dsv4_dsa_overlap=overlap))))
+    metadata = SimpleNamespace(swa=SimpleNamespace(num_actual_tokens=6))
+    assert impl._prepare_queries(attn, "hidden", "positions", "cos", "sin", metadata) == ("q", "qr")
+    selected = impl.multistream_preprocess if overlap else impl.preprocess
+    other = impl.preprocess if overlap else impl.multistream_preprocess
+    selected.assert_called_once_with(attn, "hidden", "cos", "sin", metadata.swa)
+    other.assert_not_called()
+    impl._write_compressed_source.assert_called_once_with(attn, "hidden", "positions", "cos", "sin", metadata)
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_v41_cp_query_preparation_uses_full_inputs_only_for_overlap(overlap):
+    from unittest.mock import Mock
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
+
+    impl = DeepseekV41CPImpl.__new__(DeepseekV41CPImpl)
+    impl._project_q = Mock(return_value=("q", "qr"))
+    impl.multistream_preprocess = Mock(return_value=("q", "qr"))
+    impl._write_compressed_source = Mock()
+    attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(
+        impl=SimpleNamespace(multistream_dsv4_dsa_overlap=overlap))))
+    metadata = SimpleNamespace(swa=SimpleNamespace(num_actual_tokens=2, cp_token_range=(2, 4, 2, 6)))
+    assert impl._prepare_queries(
+        attn, "abcdef", "positions", "cos", "sin", metadata
+    ) == ("q", "qr")
+    if overlap:
+        impl.multistream_preprocess.assert_called_once_with(attn, "abcdef", "cos", "sin", metadata.swa)
+        impl._project_q.assert_not_called()
+    else:
+        impl._project_q.assert_called_once_with(attn, "cd", "cos", "sin")
+        impl.multistream_preprocess.assert_not_called()
+    impl._write_compressed_source.assert_not_called()
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("local_tokens", [0, 2])
+def test_v41_cp_input_preparation_updates_empty_rank_cache(overlap, local_tokens):
+    from unittest.mock import Mock
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
+
+    impl = DeepseekV41CPImpl.__new__(DeepseekV41CPImpl)
+    full = torch.arange(24).reshape(6, 4)
+    global_metadata = SimpleNamespace(swa=SimpleNamespace(num_actual_tokens=5))
+    impl._global_layer_metadata = Mock(return_value=global_metadata)
+    impl._update_caches = Mock()
+    attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(
+        impl=SimpleNamespace(multistream_dsv4_dsa_overlap=overlap))))
+    metadata = SimpleNamespace(swa=SimpleNamespace(cp_token_range=(3, 6, 3, 6), num_actual_tokens=local_tokens))
+    assert impl._prepare_inputs_and_caches(attn, full, metadata, {}) is None
+    if not overlap or local_tokens == 0:
+        impl._update_caches.assert_called_once()
+        assert torch.equal(impl._update_caches.call_args.args[1], full[:5])
+        assert impl._update_caches.call_args.args[2] is global_metadata
+    else:
+        impl._update_caches.assert_not_called()
+
+
+def test_v41_cp_inherits_forward():
+    from vllm_ascend.attention.dsa_v41 import DeepseekV41EagerAttentionImpl
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
+
+    assert DeepseekV41CPImpl.forward is DeepseekV41EagerAttentionImpl.forward
+
+
+@pytest.mark.parametrize("rank", [None, 0, 1, 7])
+@pytest.mark.parametrize("first_seq_len", [3, 260])
+def test_dspark_v41_noncausal_metadata_preserves_full_visible_block(runtime, monkeypatch, rank, first_seq_len):
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
+    from vllm_ascend.core.deepseek_v41 import DeepseekV41DraftSWASpec
+
+    runtime.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    spec = DeepseekV41DraftSWASpec(
+        block_size=128, num_kv_heads=1, head_size=8, dtype=torch.bfloat16,
+        sliding_window=128, cache_dtype_str="bfloat16", model_version="deepseek_v4",
+    )
+    common = _cp_common().replace(
+        causal=False,
+        # Deliberately non-identity pages: logical positions must not be mapped
+        # here because SparseFlashMLA performs the physical lookup itself.
+        block_table_tensor=torch.tensor([[7, 3, 9], [5, 2, 8]], dtype=torch.int32),
+        seq_lens=torch.tensor([first_seq_len, 5], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([first_seq_len, 5], dtype=torch.int32),
+        max_seq_len=max(first_seq_len, 5),
+        positions=torch.tensor([first_seq_len - 3, first_seq_len - 2, first_seq_len - 1, 4]),
+    )
+    native = Mock(return_value=torch.zeros(dsa_v41.V41_METADATA_BUFFER_SIZE, dtype=torch.int32))
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_sparse_flash_mla_metadata", native, raising=False)
+    builder = DeepseekV41MetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    builder._supports_device_ops = True
+    full = builder.build_for_drafting(common, 1)
+    torch.testing.assert_close(
+        native.call_args.kwargs["ori_topk_length"],
+        (full.ori_sparse_indices >= 0).sum(-1, dtype=torch.int32),
+    )
+    assert full.ori_topk_length is native.call_args.kwargs["ori_topk_length"]
+    assert full.ori_mask_mode == 0
+    assert full.ori_sparse_indices.shape[0] == 4
+    # Every query of the first request can see its complete draft block.
+    torch.testing.assert_close(full.ori_sparse_indices[0], full.ori_sparse_indices[2])
+    expected = list(range(max(0, first_seq_len - 3 - 128), first_seq_len))
+    assert full.ori_sparse_indices[0, 0, :len(expected)].tolist() == expected
+    assert torch.all(full.ori_sparse_indices[0, 0, len(expected):] == -1)
+    assert full.ori_sparse_indices[3, 0, :5].tolist() == list(range(5))
+    assert full.ori_topk_length[:, 0].tolist() == [len(expected)] * 3 + [5]
+    if rank is None:
+        return
+    monkeypatch.setattr(
+        "vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
+        lambda: SimpleNamespace(world_size=8, rank_in_group=rank),
+    )
+    native.reset_mock()
+    local_builder = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    local_builder._supports_device_ops = True
+    local = local_builder.build_for_drafting(common, 1)
+    if rank >= full.num_actual_tokens:
+        native.assert_not_called()
+        assert local.smla_metadata is local_builder._smla_metadata
+        assert torch.count_nonzero(local.smla_metadata) == 0
+    else:
+        torch.testing.assert_close(
+            native.call_args.kwargs["ori_topk_length"],
+            (local.ori_sparse_indices >= 0).sum(-1, dtype=torch.int32),
+        )
+    torch.testing.assert_close(local.ori_sparse_indices, full.ori_sparse_indices[rank:rank + 1])
+    assert local.seq_lens.tolist() == ([first_seq_len, 0] if rank < 3 else [0, 0])
+    assert local.ori_mask_mode == 0

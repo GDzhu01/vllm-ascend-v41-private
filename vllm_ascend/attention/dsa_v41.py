@@ -26,9 +26,10 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
 )
 
-from vllm_ascend.attention.dsa_v1 import dsv4_dsa_overlap_stream
+from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41CompressorStateSpec,
+    DeepseekV41DraftSWASpec,
     DeepseekV41FullSpec,
     DeepseekV41IndexerSpec,
     DeepseekV41SWASpec,
@@ -115,6 +116,7 @@ class DeepseekV41Metadata(AttentionMetadata):
     num_prefill_tokens: int = 0
     logical_block_size: int = 0
     query_start_loc_cpu: torch.Tensor | None = None
+    block_table_cpu: torch.Tensor | None = None
     seq_lens_cpu: torch.Tensor | None = None
     cache_seq_lens: torch.Tensor | None = None
     max_query_len: int = 0
@@ -123,6 +125,9 @@ class DeepseekV41Metadata(AttentionMetadata):
     attn_state: Any = None
     is_prefilling: torch.Tensor | None = None
     causal: bool | torch.Tensor = True
+    ori_sparse_indices: torch.Tensor | None = None
+    ori_topk_length: torch.Tensor | None = None
+    ori_mask_mode: int = 4
     ori_win_left: int = 0
     ori_win_right: int = 0
     smla_metadata: torch.Tensor | None = None
@@ -134,6 +139,8 @@ class DeepseekV41Metadata(AttentionMetadata):
     c2_source_cos: torch.Tensor | None = None
     c2_source_sin: torch.Tensor | None = None
     c2_metadata_group_id: int | None = None
+    global_metadata: "DeepseekV41Metadata | None" = None
+    cp_token_range: tuple[int, int, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -280,11 +287,9 @@ class DeepseekV41EagerAttentionImpl:
         )
 
     @staticmethod
-    def _project_q_kv(attn, hidden_states, cos, sin):
-        q_a = attn.wq_a(hidden_states)
-        qr = attn.q_norm(q_a)
-        q = attn.wq_b(qr).unflatten(-1, (attn.n_local_heads, attn.head_dim))
-        kv = attn.kv_norm(attn.wkv(hidden_states))
+    def _project_q(attn, hidden_states, cos, sin):
+        qr = attn.q_norm(attn.wq_a(hidden_states))
+        q = attn.wq_b(qr).unflatten(-1, (-1, attn.head_dim))
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             q.unsqueeze(1),
             cos,
@@ -292,7 +297,11 @@ class DeepseekV41EagerAttentionImpl:
             rotary_mode="interleave",
             partial_slice=[attn.nope_head_dim, attn.head_dim],
         )
-        kv = kv.view(-1, 1, attn.head_dim)
+        return q.to(hidden_states.dtype), qr
+
+    @staticmethod
+    def _project_kv(attn, hidden_states, cos, sin):
+        kv = attn.kv_norm(attn.wkv(hidden_states)).view(-1, 1, attn.head_dim)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             kv.unsqueeze(1),
             cos,
@@ -300,7 +309,43 @@ class DeepseekV41EagerAttentionImpl:
             rotary_mode="interleave",
             partial_slice=[attn.nope_head_dim, attn.head_dim],
         )
-        return q.to(hidden_states.dtype), qr, kv.squeeze(1)
+        return kv.squeeze(1)
+
+    @classmethod
+    def _project_q_kv(cls, attn, hidden_states, cos, sin):
+        q, qr = cls._project_q(attn, hidden_states, cos, sin)
+        return q, qr, cls._project_kv(attn, hidden_states, cos, sin)
+
+    def _update_caches(self, attn, hidden_states, metadata):
+        if hidden_states.shape[0] == 0:
+            return
+        positions = metadata.positions[: hidden_states.shape[0]]
+        cos, sin = metadata.rope(attn.rotary_emb.layername, hidden_states.shape[0])
+        kv = self._project_kv(attn, hidden_states, cos, sin)
+        scatter_cache_sk(attn.dsa_attn.swa_cache_layer.kv_cache[0], metadata.swa.slot_mapping, kv)
+        if self.role.is_kv_source:
+            self._write_compressed_source(attn, hidden_states, positions, cos, sin, metadata)
+
+    def _prepare_inputs_and_caches(self, attn, hidden_states, metadata, metadata_by_prefix):
+        """Prepare caches before query work; ordinary preprocessing writes them."""
+        pass
+
+    def _prepare_queries(self, attn, hidden_states, positions, cos, sin, metadata):
+        hidden_states = hidden_states[: metadata.swa.num_actual_tokens]
+        v1_impl = attn.dsa_attn.dsa_attn.impl
+        preprocess = self.multistream_preprocess if v1_impl.multistream_dsv4_dsa_overlap else self.preprocess
+        q, qr = preprocess(attn, hidden_states, cos, sin, metadata.swa)
+        if self.role.is_kv_source:
+            self._write_compressed_source(attn, hidden_states, positions, cos, sin, metadata)
+        return q, qr
+
+    def _project_output(self, attn, output, hidden_states, metadata, *, projected):
+        padded = output
+        if output.shape[0] != hidden_states.shape[0]:
+            padded = output.new_zeros((hidden_states.shape[0], output.shape[1], output.shape[2]))
+            padded[: output.shape[0]] = output
+        attn.dsa_attn.dsa_attn.impl._forward_o_proj(padded, projected)
+        return projected
 
     def preprocess(self, attn, hidden_states, cos, sin, swa_metadata):
         """Project Q/KV and populate this layer's SWA cache on the current stream."""
@@ -449,6 +494,7 @@ class DeepseekV41EagerAttentionImpl:
         )
 
     def _select_sparse_indices(self, attn, hidden_states, qr, positions, cos, sin, metadata):
+        hidden_states = hidden_states[: metadata.swa.num_actual_tokens]
         if not self.role.has_long_context:
             return None
         shared = attn.shared_state
@@ -506,10 +552,11 @@ class DeepseekV41EagerAttentionImpl:
             raise ValueError(f"SparseFlashMla requires head_dim 512, got {attn.head_dim}")
         if attn.window_size != 128:
             raise ValueError(f"A2/A3 SparseFlashMla requires sliding_window 128, got {attn.window_size}")
-        if not 1 <= attn.n_local_heads <= 128 or attn.n_local_heads & (attn.n_local_heads - 1):
+        num_heads = q.shape[1]
+        if not 1 <= num_heads <= 128 or num_heads & (num_heads - 1):
             raise ValueError(
                 "A2/A3 SparseFlashMla requires the local query-head count to be "
-                f"a power of two in [1, 128], got {attn.n_local_heads}"
+                f"a power of two in [1, 128], got {num_heads}"
             )
         has_compressed = self.role.compress_ratio in (1, 2)
         ratio = self.role.compress_ratio if has_compressed else 0
@@ -545,6 +592,8 @@ class DeepseekV41EagerAttentionImpl:
             q,
             ori_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0],
             cmp_kv=source_cache,
+            ori_sparse_indices=metadata.swa.ori_sparse_indices,
+            ori_topk_length=metadata.swa.ori_topk_length,
             cmp_sparse_indices=cmp_indices,
             ori_block_table=ori_block_table,
             cmp_block_table=cmp_block_table,
@@ -556,10 +605,10 @@ class DeepseekV41EagerAttentionImpl:
             metadata=op_metadata,
             softmax_scale=attn.softmax_scale,
             cmp_ratio=ratio,
-            ori_mask_mode=4,
+            ori_mask_mode=metadata.swa.ori_mask_mode,
             cmp_mask_mode=3 if has_compressed else 0,
-            ori_win_left=attn.window_size - 1,
-            ori_win_right=0,
+            ori_win_left=metadata.swa.ori_win_left,
+            ori_win_right=metadata.swa.ori_win_right,
             layout_q="TND",
             layout_kv="PA_BBND",
             topk_value_mode=1,
@@ -583,49 +632,56 @@ class DeepseekV41EagerAttentionImpl:
             output.zero_()
             return output
         metadata = self._get_layer_metadata(forward_context.attn_metadata)
-        positions = metadata.positions[: hidden_states.shape[0]]
-        cos, sin = metadata.rope(attn.rotary_emb.layername, hidden_states.shape[0])
-        v1_impl = attn.dsa_attn.dsa_attn.impl
-        preprocess = self.multistream_preprocess if v1_impl.multistream_dsv4_dsa_overlap else self.preprocess
-        q, qr = preprocess(attn, hidden_states, cos, sin, metadata.swa)
-        if self.role.is_kv_source:
-            self._write_compressed_source(
-                attn,
-                hidden_states,
-                positions,
-                cos,
-                sin,
-                metadata,
+        self._prepare_inputs_and_caches(attn, hidden_states, metadata, forward_context.attn_metadata)
+        num_tokens = metadata.swa.num_actual_tokens
+        if num_tokens:
+            positions = metadata.positions[:num_tokens]
+            cos, sin = metadata.rope(attn.rotary_emb.layername, num_tokens)
+            q, qr = self._prepare_queries(attn, hidden_states, positions, cos, sin, metadata)
+            compressed_indices = self._select_sparse_indices(
+                attn, hidden_states, qr, positions, cos, sin, metadata
             )
-        compressed_indices = self._select_sparse_indices(attn, hidden_states, qr, positions, cos, sin, metadata)
-        attention_output = self._attention(attn, q, metadata, compressed_indices)
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            attention_output.unsqueeze(1),
-            cos,
-            -sin,
-            rotary_mode="interleave",
-            partial_slice=[attn.nope_head_dim, attn.head_dim],
-        )
-        attn.dsa_attn.dsa_attn.impl._forward_o_proj(attention_output, output)
+            attention_output = self._attention(attn, q, metadata, compressed_indices)
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                attention_output.unsqueeze(1),
+                cos,
+                -sin,
+                rotary_mode="interleave",
+                partial_slice=[attn.nope_head_dim, attn.head_dim],
+            )
+        else:
+            heads = attn.n_heads if getattr(attn, "enable_dsa_cp", False) else attn.n_local_heads
+            attention_output = hidden_states.new_empty((0, heads, attn.head_dim))
+        self._project_output(attn, attention_output, hidden_states, metadata, projected=output)
         return output
 
 
 class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
-    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+    def __init__(
+        self, kv_cache_spec, layer_names, vllm_config, device, *,
+        build_query_metadata=True, build_compressor_metadata=True,
+    ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         max_tokens = getattr(vllm_config.scheduler_config, "max_num_batched_tokens", 4096)
         max_reqs = getattr(vllm_config.scheduler_config, "max_num_seqs", 256)
         self._supports_device_ops = getattr(device, "type", "cpu") != "cpu"
+        # CP uses global cache-write controls and local query controls. These
+        # roles are fixed before allocation and graph capture.
+        self._build_query_metadata = build_query_metadata
+        self._build_compressor_metadata = build_compressor_metadata
+        query_metadata_size = V41_METADATA_BUFFER_SIZE if build_query_metadata else 0
+        compressor_tokens = max_tokens if build_compressor_metadata else 0
+        compressor_reqs = max_reqs if build_compressor_metadata else 0
         self._slot_mapping = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
         self._slot_mapping_2d = torch.full((max_tokens, 2), -1, dtype=torch.int32, device=device)
         self._seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._cache_seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._cmp_residual = torch.zeros(max_reqs, dtype=torch.int32, device=device)
-        self._smla_metadata = torch.zeros(V41_METADATA_BUFFER_SIZE, dtype=torch.int32, device=device)
-        self._qli_metadata = torch.zeros(V41_METADATA_BUFFER_SIZE, dtype=torch.int32, device=device)
-        self._c2_ring_metadata = torch.zeros(5 * max_reqs, dtype=torch.int32, device=device)
-        self._c2_complete_mask = torch.zeros(max_tokens, dtype=torch.bool, device=device)
-        self._c2_source_positions = torch.zeros(max_tokens, dtype=torch.int64, device=device)
+        self._smla_metadata = torch.zeros(query_metadata_size, dtype=torch.int32, device=device)
+        self._qli_metadata = torch.zeros(query_metadata_size, dtype=torch.int32, device=device)
+        self._c2_ring_metadata = torch.zeros(5 * compressor_reqs, dtype=torch.int32, device=device)
+        self._c2_complete_mask = torch.zeros(compressor_tokens, dtype=torch.bool, device=device)
+        self._c2_source_positions = torch.zeros(compressor_tokens, dtype=torch.int64, device=device)
         text_config = vllm_config.model_config.hf_text_config
         rope_dim = int(
             _config_value(
@@ -635,7 +691,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             )
         )
         c2_rope_rows = (
-            max_tokens if self._supports_device_ops and isinstance(kv_cache_spec, DeepseekV41CompressorStateSpec) else 0
+            compressor_tokens if self._supports_device_ops and isinstance(kv_cache_spec, DeepseekV41CompressorStateSpec) else 0
         )
         self._c2_source_cos = torch.ones(
             (c2_rope_rows, 1, 1, rope_dim),
@@ -671,9 +727,16 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             **kwargs,
         )
 
+    def build_for_drafting(self, common_attn_metadata, draft_index, **kwargs):
+        if not isinstance(self.kv_cache_spec, DeepseekV41DraftSWASpec):
+            raise TypeError("V4.1 drafting requires a draft SWA cache")
+        # DSpark issues one eager block per step. Group-local tables and slots
+        # remain independent; the builder owns the operator metadata buffers.
+        return self.build(0, common_attn_metadata)
+
     def enable_device_metadata(self) -> None:
         self._device_metadata_enabled = True
-        if isinstance(self.kv_cache_spec, DeepseekV41CompressorStateSpec):
+        if self._build_compressor_metadata and isinstance(self.kv_cache_spec, DeepseekV41CompressorStateSpec):
             if not self._c2_rope_layer_names:
                 raise RuntimeError("V4.1 compressor-state builder has no source RoPE layer")
             source_rope = get_full_cos_and_sin_dsa_for_layer(self._c2_rope_layer_names[0])
@@ -750,7 +813,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         common = common_attn_metadata
         is_compressor_state = isinstance(spec, DeepseekV41CompressorStateSpec)
         ratio = getattr(spec, "compress_ratio", 1)
-        if isinstance(spec, DeepseekV41SWASpec):
+        if isinstance(spec, (DeepseekV41SWASpec, DeepseekV41DraftSWASpec)):
             cache_kind = "swa"
         elif isinstance(spec, DeepseekV41FullSpec):
             cache_kind = "long_kv"
@@ -847,7 +910,9 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         coordinates["max_cache_seq_len"] //= plane_ratio
         cos = sin = None
         if cache_kind == "swa" and positions is not None:
-            rope = batch_shared.get("rope")
+            rope = kwargs.get("rope_views")
+            if rope is None:
+                rope = batch_shared.get("rope")
             if rope is None:
                 rope = get_cos_and_sin_dsa(positions, use_cache=coordinates["num_prefills"] == 0)
                 batch_shared["rope"] = rope
@@ -858,18 +923,45 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             int(_config_value(text_config, "num_attention_heads"))
             // self.vllm_config.parallel_config.tensor_parallel_size
         )
+        n_local_heads = int(kwargs.get("num_query_heads", n_local_heads))
         head_dim = int(_config_value(text_config, "head_dim"))
         index_topk = int(_config_value(text_config, "index_topk"))
+        ori_sparse_indices = kwargs.get("ori_sparse_indices")
+        noncausal = not bool(getattr(common, "causal", True))
+        if noncausal and not isinstance(spec, DeepseekV41DraftSWASpec):
+            raise ValueError("V4.1 noncausal attention requires a DSpark draft SWA cache")
+        if noncausal and ori_sparse_indices is None:
+            ori_sparse_indices, _ = build_dspark_swa_indices(
+                common.block_table_tensor[:num_reqs],
+                self.vllm_config.speculative_config.num_speculative_tokens,
+                window_size,
+                spec.storage_block_size,
+                common.query_start_loc[:num_reqs + 1],
+                seq_lens,
+                num_actual_tokens,
+                use_logical_indices=True,
+            )
+        ori_topk_length = (
+            (ori_sparse_indices >= 0).sum(dim=-1, dtype=torch.int32)
+            if ori_sparse_indices is not None and noncausal else None
+        )
+        ori_mask_mode = 0 if noncausal else 4
+        ori_win_left = max(0, window_size - 1)
+        ori_win_right = 0
         operator_ratio = 0 if cache_kind == "swa" else ratio
         smla_metadata = None
         qli_metadata = None
 
-        if self._supports_device_ops and cache_kind in {"swa", "long_kv"}:
+        if self._build_query_metadata and self._supports_device_ops and cache_kind in {"swa", "long_kv"}:
             has_compressed = operator_ratio in (1, 2)
             cmp_seq_lens = coordinates["cache_seq_lens"] if has_compressed else None
             cmp_residual = cmp_residual_buffer
 
             def build_smla_metadata() -> None:
+                # Keep graph event frontiers stable even when this CP rank has no query.
+                if num_actual_tokens == 0:
+                    self._smla_metadata.zero_()
+                    return
                 value = torch.ops._C_ascend.npu_sparse_flash_mla_metadata(
                     n_local_heads,
                     1,
@@ -882,13 +974,14 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                     max_seqlen_q=int(getattr(common, "max_query_len", 0)),
                     max_seqlen_ori_kv=int(getattr(common, "max_seq_len", 0)),
                     max_seqlen_cmp_kv=(coordinates["max_cache_seq_len"] if has_compressed else 0),
-                    ori_topk=0,
+                    ori_topk=ori_sparse_indices.shape[-1] if ori_sparse_indices is not None else 0,
+                    ori_topk_length=ori_topk_length,
                     cmp_topk=index_topk if has_compressed else 0,
                     cmp_ratio=operator_ratio,
-                    ori_mask_mode=4,
+                    ori_mask_mode=ori_mask_mode,
                     cmp_mask_mode=3 if has_compressed else 0,
-                    ori_win_left=max(0, window_size - 1),
-                    ori_win_right=0,
+                    ori_win_left=ori_win_left,
+                    ori_win_right=ori_win_right,
                     layout_q="TND",
                     layout_kv="PA_BBND",
                     has_ori_kv=True,
@@ -904,7 +997,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                 build_smla_metadata,
             )
 
-        if self._supports_device_ops and cache_kind == "index_k":
+        if self._build_query_metadata and self._supports_device_ops and cache_kind == "index_k":
             residual = cmp_residual_buffer
 
             def build_qli_metadata() -> None:
@@ -941,7 +1034,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         c2_source_cos = None
         c2_source_sin = None
         c2_metadata_group_id = None
-        if cache_kind == "compressor_state" and positions is not None:
+        if self._build_compressor_metadata and cache_kind == "compressor_state" and positions is not None:
             ring_meta = self._c2_ring_metadata[: 5 * num_reqs].view(5, num_reqs)
             input_positions = positions
             if self._supports_device_ops:
@@ -1020,6 +1113,9 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             c2_metadata_group_id = id(self._c2_complete_mask)
         return DeepseekV41Metadata(
             block_table=common.block_table_tensor[:num_reqs],
+            block_table_cpu=(
+                common.block_table_cpu[:num_reqs] if getattr(common, "block_table_cpu", None) is not None else None
+            ),
             slot_mapping=slots,
             compress_ratio=ratio,
             storage_block_size=spec.storage_block_size,
@@ -1037,8 +1133,11 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             attn_state=getattr(common, "attn_state", None),
             is_prefilling=getattr(common, "is_prefilling", None),
             causal=getattr(common, "causal", True),
-            ori_win_left=max(0, window_size - 1),
-            ori_win_right=0,
+            ori_sparse_indices=ori_sparse_indices,
+            ori_topk_length=ori_topk_length,
+            ori_mask_mode=ori_mask_mode,
+            ori_win_left=ori_win_left,
+            ori_win_right=ori_win_right,
             smla_metadata=smla_metadata,
             qli_metadata=qli_metadata,
             cmp_residual=cmp_residual_buffer,
@@ -1065,7 +1164,13 @@ class DeepseekV41CacheBackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls():
-        return DeepseekV41MetadataBuilder
+        from vllm_ascend.attention.context_parallel.dsa_v41_cp import get_v41_cp_classes
+
+        return get_v41_cp_classes()[0]
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return False
 
     @staticmethod
     def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str="auto"):

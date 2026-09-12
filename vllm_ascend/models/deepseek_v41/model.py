@@ -18,7 +18,6 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheBackend,
     DeepseekV41CacheLayer,
-    DeepseekV41EagerAttentionImpl,
 )
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41FullSpec,
@@ -41,7 +40,7 @@ from vllm_ascend.models.common.ops.sequence_parallel import (
 
 from .compressor import DeepseekV41Compressor, _read, text_config_of
 from .engram_gate import engram_gate
-from .engram_hash import PagedNgramHistory
+from .engram_hash import PagedNgramHistory, engram_history_metadata
 from .engram_hbm import EngramQueryGroup, NodeShardedEngram
 from .indexer import DeepseekV41Indexer
 
@@ -223,7 +222,7 @@ class AscendDeepseekV41SWACache(AscendDeepseekV4SWACache):
 
 
 class DeepseekV41Attention(DeepseekV4Attention):
-    """V4 projections plus V4.1 source-owned cache and fused DSA execution."""
+    """V4.1 source-shared attention using V4 projections and CP adapters."""
 
     swa_cache_cls = AscendDeepseekV41SWACache
 
@@ -328,7 +327,9 @@ class DeepseekV41Attention(DeepseekV4Attention):
         self.long_kv_source_prefix = f"{source}.long_kv_cache" if role.has_long_context else None
         self.index_k_source_prefix = f"{source}.indexer.k_cache" if role.has_long_context else None
         self.index_source_layer = role.index_source_layer
-        self.v41_impl = DeepseekV41EagerAttentionImpl(
+        from vllm_ascend.attention.context_parallel.dsa_v41_cp import get_v41_cp_classes
+
+        self.v41_impl = get_v41_cp_classes()[1](
             prefix=prefix,
             role=role,
             topology=topology,
@@ -530,23 +531,15 @@ class DeepseekV41Model(DeepseekV4Model):
         if metadata is not None and self.engram_history is not None:
             first = self.layers[0].self_attn.dsa_attn.swa_cache_layer
             meta = metadata[first.prefix]
-            boundaries = (
-                meta.query_start_loc_cpu
-                if getattr(meta, "query_start_loc_cpu", None) is not None
-                else meta.query_start_loc.detach().cpu()
-            ).long()
+            boundaries, block_table, block_size = engram_history_metadata(meta)
             n = int(boundaries[-1])
             requests = torch.repeat_interleave(torch.arange(len(boundaries) - 1, device="cpu"), boundaries.diff())
             hashes, mask = self.engram_history.update(
                 input_ids[:n].cpu().long(),
                 positions[:n].cpu().long(),
                 requests,
-                (
-                    meta.block_table_cpu
-                    if getattr(meta, "block_table_cpu", None) is not None
-                    else meta.block_table.detach().cpu()
-                ),
-                meta.storage_block_size,
+                block_table,
+                block_size,
             )
         lookups = {}
         tables = [self.layers[layer_id].engram.embed for layer_id in config.engram_layer_ids]

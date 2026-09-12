@@ -7,6 +7,7 @@ import json
 import sys
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -29,6 +30,47 @@ hbm = load_module("engram_hbm")
 gate_mod = load_module("engram_gate")
 hash_mod = load_module("engram_hash")
 gate = gate_mod.engram_gate
+
+
+@pytest.mark.parametrize("cp", ["none", "v41", "v41_empty_rank"])
+def test_engram_history_metadata_uses_full_requests(cp):
+    boundaries = torch.tensor([0, 3, 9], dtype=torch.int32)
+    pages = torch.tensor([[7, 8, 9], [12, 13, 14]], dtype=torch.int32)
+    # Device tensors are intentionally unusable: history must use host mirrors.
+    fields = dict(
+        query_start_loc=None, block_table=None, storage_block_size=4,
+        query_start_loc_cpu=boundaries, block_table_cpu=pages,
+    )
+    request = SimpleNamespace(**fields)
+    if cp.startswith("v41"):
+        local = torch.tensor([0, 0, 0] if cp == "v41_empty_rank" else [0, 0, 2])
+        metadata = SimpleNamespace(
+            global_metadata=request,
+            query_start_loc=local,
+            query_start_loc_cpu=local,
+            block_table=None,
+            storage_block_size=4,
+        )
+    else:
+        metadata = request
+    actual_boundaries, actual_pages, block_size = hash_mod.engram_history_metadata(metadata)
+    assert torch.equal(actual_boundaries, boundaries.long())
+    assert torch.equal(actual_pages, pages)
+    assert block_size == 4
+
+
+@pytest.mark.parametrize("missing", ["query_start_loc_cpu", "block_table_cpu"])
+def test_engram_history_metadata_requires_cpu_mirrors(missing):
+    metadata = SimpleNamespace(
+        query_start_loc_cpu=torch.tensor([0, 1]),
+        block_table_cpu=torch.tensor([[7]]),
+        query_start_loc=None,
+        block_table=None,
+        storage_block_size=4,
+    )
+    setattr(metadata, missing, None)
+    with pytest.raises(ValueError, match="requires query_start_loc_cpu and block_table_cpu"):
+        hash_mod.engram_history_metadata(metadata)
 
 
 def _worker(rank, rendezvous):
@@ -230,11 +272,15 @@ def test_gate_preserves_masked_rows():
     assert torch.isfinite(out.float()).all()
 
 
-def test_hash_causal_barrier():
+@pytest.mark.parametrize("barrier_token", [98, 99])
+def test_hash_causal_barrier(barrier_token):
     h = hash_mod.PagedNgramHistory.__new__(hash_mod.PagedNgramHistory)
     h.token_map = torch.arange(100); h.pad_id = 2; h.image_token_id = 99; h.lookback = 2
+    h.image_pad_token_id = 98
     h.primes = torch.tensor([[[101, 103]]]); h.offsets = torch.tensor([[0, 101]])
     h.multipliers = torch.tensor([[3, 5]]); h.pages = {}
-    values, mask = h.update(torch.tensor([0, 5, 9, 99, 13, 17]), torch.arange(6),
+    values, mask = h.update(torch.tensor([0, 5, 9, barrier_token, 13, 17]), torch.arange(6),
                              torch.zeros(6, dtype=torch.long), torch.tensor([[5, 1]]), 4)
     assert values.shape == (6, 1, 2) and not mask[3]
+    # The first token on the next page must hash against padding, not the image.
+    assert values[4, 0, 0].item() == ((13 * 3) ^ (h.pad_id * 5)) % 101

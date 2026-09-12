@@ -132,7 +132,8 @@ def test_deepseek_v41_dspark_selects_v41_drafter_and_expert_shape():
     assert text_config.num_experts_per_tok == 3
     assert text_config.n_mtp_layers == 3
     assert draft_model_config.model_arch_config.num_experts == 128
-    assert draft_model_config.model_arch_config.num_experts_per_token == 3
+    if "num_experts_per_token" in ModelArchitectureConfig.__dataclass_fields__:
+        assert draft_model_config.model_arch_config.num_experts_per_token == 3
     registry.inspect_model_cls.assert_called_once_with(["DeepseekV41DSparkDraftModel"], draft_model_config)
 
 

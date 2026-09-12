@@ -3522,6 +3522,15 @@ class NPUModelRunner(GPUModelRunner):
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid
                 )
+            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                cm.block_table_cpu = torch.zeros((num_reqs_padded, 1), dtype=torch.int32, device="cpu")
+            else:
+                cm.block_table_cpu = self.input_batch.block_table[kv_cache_gid].get_cpu_tensor()[:num_reqs_padded]
+                if num_reqs < num_reqs_padded:
+                    # Match the device padding without modifying an H2D source
+                    # that may still be in flight.
+                    cm.block_table_cpu = cm.block_table_cpu.clone()
+                    cm.block_table_cpu[num_reqs:num_reqs_padded].zero_()
             if self.speculative_config and isinstance(self.drafter, (AscendStep3p5MTPProposer, AscendDSparkProposer)):
                 # step3p5 MTP draft layers span multiple KV cache groups; capture
                 # each group's block table / slot mapping so the proposer can
@@ -3691,7 +3700,8 @@ class NPUModelRunner(GPUModelRunner):
         if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             num_tokens_across_dp[:] = num_tokens_padded
-            num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
+            # Padded requests have zero query length.
+            num_scheduled_tokens = np.pad(num_scheduled_tokens, (0, num_reqs_padded - num_reqs))
 
         if self.dynamic_eplb:
             self.update_eplb_heat_collection_status(num_tokens_padded)
@@ -5528,25 +5538,15 @@ class NPUModelRunner(GPUModelRunner):
             tensor_parallel_size = self.parallel_config.tensor_parallel_size
             resolver_tensor_parallel_size = tensor_parallel_size
             if (
-                self.compilation_config.pass_config.enable_sp
-                and self.uniform_decode_query_len > 1
-                and tensor_parallel_size > 1
+                self.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+                and (enable_dsa_cp() or enable_sp(self.vllm_config) or self.compilation_config.pass_config.enable_sp)
             ):
-                graph_alignment = math.lcm(
-                    self.uniform_decode_query_len,
-                    tensor_parallel_size,
-                )
-                capture_sizes = self.compilation_config.cudagraph_capture_sizes
-                # vLLM 0.27 has no path for explicit capture sizes that are
-                # already aligned to both speculative steps and SP. Skip its
-                # redundant TP adjustment only for that exact case.
-                if (
-                    graph_alignment
-                    > max(self.uniform_decode_query_len, tensor_parallel_size)
-                    and capture_sizes
-                    and all(size % graph_alignment == 0 for size in capture_sizes)
-                ):
-                    resolver_tensor_parallel_size = 1
+                # CP and SP pad tokens to TP. Align capture keys to both TP
+                # and the speculative query length before the v0.27 resolver,
+                # whose max(query_len, TP) rejects non-divisible pairs (6, 8).
+                graph_alignment = math.lcm(self.uniform_decode_query_len, tensor_parallel_size)
+                self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(graph_alignment, 1)
+                resolver_tensor_parallel_size = 1
             cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
                 min_cg_support=min_cg_support,
                 min_cg_attn_backend=min_cg_attn_backend,
