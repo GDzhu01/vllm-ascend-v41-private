@@ -1524,20 +1524,60 @@ def test_v41_query_preparation_keeps_mainline_preprocess(overlap):
     impl._write_compressed_source.assert_called_once_with(attn, "hidden", "positions", "cos", "sin", metadata)
 
 
-def test_v41_cp_query_preparation_does_not_rewrite_global_caches():
+@pytest.mark.parametrize("overlap", [False, True])
+def test_v41_cp_query_preparation_uses_full_inputs_only_for_overlap(overlap):
     from unittest.mock import Mock
     from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
 
     impl = DeepseekV41CPImpl.__new__(DeepseekV41CPImpl)
     impl._project_q = Mock(return_value=("q", "qr"))
-    impl.preprocess = Mock()
-    impl.multistream_preprocess = Mock()
+    impl.multistream_preprocess = Mock(return_value=("q", "qr"))
     impl._write_compressed_source = Mock()
-    assert impl._prepare_queries("attn", "local", "positions", "cos", "sin", "metadata") == ("q", "qr")
-    impl._project_q.assert_called_once_with("attn", "local", "cos", "sin")
-    impl.preprocess.assert_not_called()
-    impl.multistream_preprocess.assert_not_called()
+    attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(
+        impl=SimpleNamespace(multistream_dsv4_dsa_overlap=overlap))))
+    metadata = SimpleNamespace(swa=object())
+    assert impl._prepare_queries(
+        attn, "local", "positions", "cos", "sin", metadata, full_hidden_states="full"
+    ) == ("q", "qr")
+    if overlap:
+        impl.multistream_preprocess.assert_called_once_with(attn, "full", "cos", "sin", metadata.swa)
+        impl._project_q.assert_not_called()
+    else:
+        impl._project_q.assert_called_once_with(attn, "local", "cos", "sin")
+        impl.multistream_preprocess.assert_not_called()
     impl._write_compressed_source.assert_not_called()
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("local_tokens", [0, 2])
+def test_v41_cp_input_preparation_updates_empty_rank_cache(overlap, local_tokens):
+    from unittest.mock import Mock
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
+
+    impl = DeepseekV41CPImpl.__new__(DeepseekV41CPImpl)
+    full = torch.arange(24).reshape(6, 4)
+    global_metadata = SimpleNamespace(swa=SimpleNamespace(num_actual_tokens=5))
+    impl._global_layer_metadata = Mock(return_value=global_metadata)
+    impl._update_caches = Mock()
+    attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(
+        impl=SimpleNamespace(multistream_dsv4_dsa_overlap=overlap))))
+    metadata = SimpleNamespace(swa=SimpleNamespace(cp_token_range=(3, 6, 3, 6), num_actual_tokens=local_tokens))
+    local = impl._prepare_inputs_and_caches(attn, full, metadata, {})
+    assert torch.equal(local, full[3:3 + local_tokens])
+    if not overlap or local_tokens == 0:
+        impl._update_caches.assert_called_once()
+        assert torch.equal(impl._update_caches.call_args.args[1], full[:5])
+        assert impl._update_caches.call_args.args[2] is global_metadata
+    else:
+        impl._update_caches.assert_not_called()
+
+
+def test_v41_cp_inherits_forward():
+    from vllm_ascend.attention.dsa_v41 import DeepseekV41EagerAttentionImpl
+    from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
+
+    assert DeepseekV41CPImpl.forward is DeepseekV41EagerAttentionImpl.forward
+
 
 
 @pytest.mark.parametrize("rank", [None, 0, 1, 7])
