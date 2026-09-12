@@ -36,7 +36,8 @@ def test_draft_cache_uses_v41_backend_and_explicit_aurora_spec():
         model_version="deepseek_v4",
     )
     with patch.object(AscendDeepseekV4SWACache, "get_kv_cache_spec", return_value=spec):
-        draft = DeepseekV41DSparkSWACache.get_kv_cache_spec(SimpleNamespace(), None)
+        cache = DeepseekV41DSparkSWACache.__new__(DeepseekV41DSparkSWACache)
+        draft = cache.get_kv_cache_spec(None)
     from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheBackend
 
     assert DeepseekV41DSparkSWACache.get_attn_backend(None) is DeepseekV41CacheBackend
@@ -68,6 +69,7 @@ def test_target_exports_residual_entering_selected_layers(monkeypatch):
     class Layer:
         def __init__(self, index):
             self.layer_idx = index
+            self.engram = None
 
         def __call__(self, positions, hidden, pre_mix, unused, input_ids):
             return hidden + self.layer_idx + 1, pre_mix
@@ -78,6 +80,8 @@ def test_target_exports_residual_entering_selected_layers(monkeypatch):
 
     model = SimpleNamespace(
         hc_mult=4,
+        needs_moe_input_ids=False,
+        prepare_engram=lambda input_ids, positions: ({}, torch.empty(0, dtype=torch.bool)),
         aux_hidden_state_layers=(1, 3),
         shared_attention_state=SimpleNamespace(reset=lambda: None),
         layers=[Layer(i) for i in range(3)],
@@ -100,6 +104,7 @@ def test_v41_draft_routes_to_v41_and_disables_post_projection_q_norm(cp):
     def initialize_base(instance, **kwargs):
         torch.nn.Module.__init__(instance)
         instance.compress_ratio = 0
+        instance.scale = 512**-0.5
         instance.dsa_attn = SimpleNamespace(dsa_attn=SimpleNamespace(impl=draft_backend))
 
     from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
@@ -114,6 +119,7 @@ def test_v41_draft_routes_to_v41_and_disables_post_projection_q_norm(cp):
         draft = DeepseekV41DSparkAttention(vllm_config=config, prefix="mtp.0.self_attn")
     assert type(draft.v41_impl) is (DeepseekV41CPImpl if cp else DeepseekV41EagerAttentionImpl)
     assert config.compilation_config.static_forward_context[draft.v41_layer_name] is draft
+    assert draft.softmax_scale == 512**-0.5
     assert draft.dsa_attn.dsa_attn.impl.apply_q_norm is False
     assert ordinary_backend.apply_q_norm is True
 

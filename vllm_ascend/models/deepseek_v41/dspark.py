@@ -58,6 +58,7 @@ class DeepseekV41DSparkAttention(DeepseekV4Attention):
             raise ValueError("Aurora DSpark supports only uncompressed draft SWA layers")
         # V4.1 applies Q LoRA RMSNorm only, without a second per-head Q norm.
         self.dsa_attn.dsa_attn.impl.apply_q_norm = False
+        self.softmax_scale = self.scale
         self.shared_state = None
         prefix = kwargs["prefix"]
         self.v41_impl = get_v41_cp_classes()[1](

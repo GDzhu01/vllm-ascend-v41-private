@@ -1578,9 +1578,9 @@ def test_v41_cp_inherits_forward():
     assert DeepseekV41CPImpl.forward is DeepseekV41EagerAttentionImpl.forward
 
 
-
 @pytest.mark.parametrize("rank", [None, 0, 1, 7])
-def test_dspark_v41_noncausal_metadata_preserves_full_visible_block(runtime, monkeypatch, rank):
+@pytest.mark.parametrize("first_seq_len", [3, 260])
+def test_dspark_v41_noncausal_metadata_preserves_full_visible_block(runtime, monkeypatch, rank, first_seq_len):
     from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
     from vllm_ascend.core.deepseek_v41 import DeepseekV41DraftSWASpec
 
@@ -1589,20 +1589,54 @@ def test_dspark_v41_noncausal_metadata_preserves_full_visible_block(runtime, mon
         block_size=128, num_kv_heads=1, head_size=8, dtype=torch.bfloat16,
         sliding_window=128, cache_dtype_str="bfloat16", model_version="deepseek_v4",
     )
-    common = _cp_common().replace(causal=False)
-    full = DeepseekV41MetadataBuilder(spec, [], runtime, torch.device("cpu")).build_for_drafting(common, 1)
+    common = _cp_common().replace(
+        causal=False,
+        # Deliberately non-identity pages: logical positions must not be mapped
+        # here because SparseFlashMLA performs the physical lookup itself.
+        block_table_tensor=torch.tensor([[7, 3, 9], [5, 2, 8]], dtype=torch.int32),
+        seq_lens=torch.tensor([first_seq_len, 5], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([first_seq_len, 5], dtype=torch.int32),
+        max_seq_len=max(first_seq_len, 5),
+        positions=torch.tensor([first_seq_len - 3, first_seq_len - 2, first_seq_len - 1, 4]),
+    )
+    native = Mock(return_value=torch.zeros(dsa_v41.V41_METADATA_BUFFER_SIZE, dtype=torch.int32))
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_sparse_flash_mla_metadata", native, raising=False)
+    builder = DeepseekV41MetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    builder._supports_device_ops = True
+    full = builder.build_for_drafting(common, 1)
+    torch.testing.assert_close(
+        native.call_args.kwargs["ori_topk_length"],
+        (full.ori_sparse_indices >= 0).sum(-1, dtype=torch.int32),
+    )
+    assert full.ori_topk_length is native.call_args.kwargs["ori_topk_length"]
     assert full.ori_mask_mode == 0
     assert full.ori_sparse_indices.shape[0] == 4
     # Every query of the first request can see its complete draft block.
     torch.testing.assert_close(full.ori_sparse_indices[0], full.ori_sparse_indices[2])
-    assert full.ori_sparse_indices[0, 0, :3].tolist() == [0, 1, 2]
+    expected = list(range(max(0, first_seq_len - 3 - 128), first_seq_len))
+    assert full.ori_sparse_indices[0, 0, :len(expected)].tolist() == expected
+    assert torch.all(full.ori_sparse_indices[0, 0, len(expected):] == -1)
+    assert full.ori_sparse_indices[3, 0, :5].tolist() == list(range(5))
+    assert full.ori_topk_length[:, 0].tolist() == [len(expected)] * 3 + [5]
     if rank is None:
         return
     monkeypatch.setattr(
         "vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
         lambda: SimpleNamespace(world_size=8, rank_in_group=rank),
     )
-    local = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu")).build_for_drafting(common, 1)
+    native.reset_mock()
+    local_builder = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    local_builder._supports_device_ops = True
+    local = local_builder.build_for_drafting(common, 1)
+    if rank >= full.num_actual_tokens:
+        native.assert_not_called()
+        assert local.smla_metadata is local_builder._smla_metadata
+        assert torch.count_nonzero(local.smla_metadata) == 0
+    else:
+        torch.testing.assert_close(
+            native.call_args.kwargs["ori_topk_length"],
+            (local.ori_sparse_indices >= 0).sum(-1, dtype=torch.int32),
+        )
     torch.testing.assert_close(local.ori_sparse_indices, full.ori_sparse_indices[rank:rank + 1])
-    assert local.seq_lens.tolist() == ([3, 0] if rank < 3 else [0, 0])
+    assert local.seq_lens.tolist() == ([first_seq_len, 0] if rank < 3 else [0, 0])
     assert local.ori_mask_mode == 0

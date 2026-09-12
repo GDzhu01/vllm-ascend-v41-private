@@ -126,6 +126,7 @@ class DeepseekV41Metadata(AttentionMetadata):
     is_prefilling: torch.Tensor | None = None
     causal: bool | torch.Tensor = True
     ori_sparse_indices: torch.Tensor | None = None
+    ori_topk_length: torch.Tensor | None = None
     ori_mask_mode: int = 4
     ori_win_left: int = 0
     ori_win_right: int = 0
@@ -592,6 +593,7 @@ class DeepseekV41EagerAttentionImpl:
             ori_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0],
             cmp_kv=source_cache,
             ori_sparse_indices=metadata.swa.ori_sparse_indices,
+            ori_topk_length=metadata.swa.ori_topk_length,
             cmp_sparse_indices=cmp_indices,
             ori_block_table=ori_block_table,
             cmp_block_table=cmp_block_table,
@@ -937,7 +939,12 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                 common.query_start_loc[:num_reqs + 1],
                 seq_lens,
                 num_actual_tokens,
+                use_logical_indices=True,
             )
+        ori_topk_length = (
+            (ori_sparse_indices >= 0).sum(dim=-1, dtype=torch.int32)
+            if ori_sparse_indices is not None and noncausal else None
+        )
         ori_mask_mode = 0 if noncausal else 4
         ori_win_left = max(0, window_size - 1)
         ori_win_right = 0
@@ -951,6 +958,10 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             cmp_residual = cmp_residual_buffer
 
             def build_smla_metadata() -> None:
+                # Keep graph event frontiers stable even when this CP rank has no query.
+                if num_actual_tokens == 0:
+                    self._smla_metadata.zero_()
+                    return
                 value = torch.ops._C_ascend.npu_sparse_flash_mla_metadata(
                     n_local_heads,
                     1,
@@ -964,6 +975,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                     max_seqlen_ori_kv=int(getattr(common, "max_seq_len", 0)),
                     max_seqlen_cmp_kv=(coordinates["max_cache_seq_len"] if has_compressed else 0),
                     ori_topk=ori_sparse_indices.shape[-1] if ori_sparse_indices is not None else 0,
+                    ori_topk_length=ori_topk_length,
                     cmp_topk=index_topk if has_compressed else 0,
                     cmp_ratio=operator_ratio,
                     ori_mask_mode=ori_mask_mode,
@@ -1122,6 +1134,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             is_prefilling=getattr(common, "is_prefilling", None),
             causal=getattr(common, "causal", True),
             ori_sparse_indices=ori_sparse_indices,
+            ori_topk_length=ori_topk_length,
             ori_mask_mode=ori_mask_mode,
             ori_win_left=ori_win_left,
             ori_win_right=ori_win_right,
