@@ -326,10 +326,11 @@ class DeepseekV41EagerAttentionImpl:
             self._write_compressed_source(attn, hidden_states, positions, cos, sin, metadata)
 
     def _prepare_inputs_and_caches(self, attn, hidden_states, metadata, metadata_by_prefix):
-        local_hidden_states = hidden_states[: metadata.swa.num_actual_tokens]
-        return local_hidden_states
+        """Prepare caches before query work; ordinary preprocessing writes them."""
+        pass
 
-    def _prepare_queries(self, attn, hidden_states, positions, cos, sin, metadata, *, full_hidden_states=None):
+    def _prepare_queries(self, attn, hidden_states, positions, cos, sin, metadata):
+        hidden_states = hidden_states[: metadata.swa.num_actual_tokens]
         v1_impl = attn.dsa_attn.dsa_attn.impl
         preprocess = self.multistream_preprocess if v1_impl.multistream_dsv4_dsa_overlap else self.preprocess
         q, qr = preprocess(attn, hidden_states, cos, sin, metadata.swa)
@@ -492,6 +493,7 @@ class DeepseekV41EagerAttentionImpl:
         )
 
     def _select_sparse_indices(self, attn, hidden_states, qr, positions, cos, sin, metadata):
+        hidden_states = hidden_states[: metadata.swa.num_actual_tokens]
         if not self.role.has_long_context:
             return None
         shared = attn.shared_state
@@ -628,18 +630,14 @@ class DeepseekV41EagerAttentionImpl:
             output.zero_()
             return output
         metadata = self._get_layer_metadata(forward_context.attn_metadata)
-        local_hidden_states = self._prepare_inputs_and_caches(
-            attn, hidden_states, metadata, forward_context.attn_metadata
-        )
-        num_tokens = local_hidden_states.shape[0]
+        self._prepare_inputs_and_caches(attn, hidden_states, metadata, forward_context.attn_metadata)
+        num_tokens = metadata.swa.num_actual_tokens
         if num_tokens:
             positions = metadata.positions[:num_tokens]
             cos, sin = metadata.rope(attn.rotary_emb.layername, num_tokens)
-            q, qr = self._prepare_queries(
-                attn, local_hidden_states, positions, cos, sin, metadata, full_hidden_states=hidden_states
-            )
+            q, qr = self._prepare_queries(attn, hidden_states, positions, cos, sin, metadata)
             compressed_indices = self._select_sparse_indices(
-                attn, local_hidden_states, qr, positions, cos, sin, metadata
+                attn, hidden_states, qr, positions, cos, sin, metadata
             )
             attention_output = self._attention(attn, q, metadata, compressed_indices)
             torch.ops._C_ascend.inplace_partial_rotary_mul(

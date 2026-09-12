@@ -209,21 +209,23 @@ class DeepseekV41CPImpl(DeepseekV41EagerAttentionImpl):
         return self._get_layer_metadata(global_by_prefix)
 
     def _prepare_inputs_and_caches(self, attn, hidden_states, metadata, metadata_by_prefix):
-        start, _, _, _ = metadata.swa.cp_token_range
-        local_hidden_states = hidden_states[start : start + metadata.swa.num_actual_tokens]
-        if not attn.dsa_attn.dsa_attn.impl.multistream_dsv4_dsa_overlap or local_hidden_states.shape[0] == 0:
+        if not attn.dsa_attn.dsa_attn.impl.multistream_dsv4_dsa_overlap or metadata.swa.num_actual_tokens == 0:
             # Empty query ranks still update replicated caches before exchange.
             global_metadata = self._global_layer_metadata(metadata_by_prefix)
             self._update_caches(attn, hidden_states[: global_metadata.swa.num_actual_tokens], global_metadata)
-        return local_hidden_states
 
-    def _prepare_queries(self, attn, hidden_states, positions, cos, sin, metadata, *, full_hidden_states=None):
+    def _prepare_queries(self, attn, hidden_states, positions, cos, sin, metadata):
         if attn.dsa_attn.dsa_attn.impl.multistream_dsv4_dsa_overlap:
-            if full_hidden_states is None:
-                raise ValueError("CP multistream preprocessing requires full hidden states")
-            return self.multistream_preprocess(attn, full_hidden_states, cos, sin, metadata.swa)
+            return self.multistream_preprocess(attn, hidden_states, cos, sin, metadata.swa)
         # Replicated caches were updated before the TP token slice.
+        start, _, _, _ = metadata.swa.cp_token_range
+        hidden_states = hidden_states[start : start + metadata.swa.num_actual_tokens]
         return self._project_q(attn, hidden_states, cos, sin)
+
+    def _select_sparse_indices(self, attn, hidden_states, qr, positions, cos, sin, metadata):
+        start, _, _, _ = metadata.swa.cp_token_range
+        hidden_states = hidden_states[start : start + metadata.swa.num_actual_tokens]
+        return super()._select_sparse_indices(attn, hidden_states, qr, positions, cos, sin, metadata)
 
     def _project_output(self, attn, output, hidden_states, metadata, *, projected):
         _, _, per_rank, _ = metadata.swa.cp_token_range
