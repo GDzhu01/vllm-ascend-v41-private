@@ -157,9 +157,6 @@ pytest --confcutdir=tests/ut/models \
   tests/ut/models/test_engram_hbm.py tests/ut/models/test_engram_inputs.py
 ```
 
-Component accuracy and timing do not replace real-weight, 16-card HCCL, and full
-graph replay serving validation, or establish end-to-end performance gains.
-
 ### Earlier design comparisons
 
 The original block-outermost implementation reserved 393216 bytes per ID
