@@ -131,7 +131,10 @@ the V1 DSpark proposer runs eagerly. Draft graph capture is not enabled.
 fused gather/dequant，直接写入可复用 pinned BF16 staging。FP8/MXFP8 保留原始
 E4M3 权重与 UE8M0 group32 scale，不把完整表展开为 BF16。仅开启 offload 而未
 指定存储格式时使用 FP8；可用 `engram_model_path` 指定独立的 Engram checkpoint。
-loader 支持两种 safetensors index 文件名，并校验权重和 scale 的形状、类型。
+显式 `engram_storage=bf16` 保持 BF16 CPU 存储，直接 gather 到同一套 pinned
+双缓冲，不量化，也不展开额外的完整表。
+loader 按源 dtype 与所需 scale 选择兼容的 safetensors index，并校验形状、类型。
+BF16/INT8 优先使用 quant index，FP8/MXFP8 优先使用 model index。
 
 运行范围为单机、model runner V1、EP 且 PP=PCP=DCP=1；所有 rank（包括 idle DP）
 按相同顺序参与路由。沿用合并 metadata、合并 TP broadcast、CPU history/hash

@@ -387,7 +387,7 @@ class AscendConfig:
     enable_cpu_binding: bool = True
     # Enable the V4.1 node-sharded Engram path.
     enable_engram: bool = True
-    # Keep compressed Engram tables on CPU and decode only requested rows.
+    # Keep Engram tables on CPU and transfer only requested BF16 rows.
     enable_engram_ple_offload: bool = False
     # Optional checkpoint root containing the source Engram tensors.
     engram_model_path: str | None = None
@@ -492,7 +492,7 @@ class AscendConfig:
         if self.enable_engram_ple_offload:
             if not self.enable_engram:
                 raise ValueError("PLE_OFFLOAD requires enable_engram=True")
-            if self.engram_storage == "bf16":
+            if "engram_storage" not in (vc.additional_config or {}):
                 self.engram_storage = "fp8"
         elif self.engram_model_path is not None:
             raise ValueError("engram_model_path requires enable_engram_ple_offload=True")
