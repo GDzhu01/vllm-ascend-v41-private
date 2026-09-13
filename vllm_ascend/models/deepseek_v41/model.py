@@ -24,18 +24,18 @@ from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41SWASpec,
     validate_cache_runtime,
 )
+from vllm_ascend.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_reduce_scatter,
+    sp_shard,
+)
 from vllm_ascend.models.deepseek_v4.model import (
     AscendDeepseekV4ForCausalLM,
     AscendDeepseekV4SWACache,
     DeepseekV2DecoderLayer,
     DeepseekV4Attention,
     DeepseekV4Model,
-)
-from vllm_ascend.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_padding_mask,
-    sp_reduce_scatter,
-    sp_shard,
 )
 
 from .compressor import DeepseekV41Compressor, _read, text_config_of
@@ -491,6 +491,7 @@ class DeepseekV41Model(DeepseekV4Model):
         # used only by load_checkpoint to validate the source representation.
         # Read the storage choice after AscendConfig validation.
         ascend_config = get_ascend_config()
+        self.engram_weight_root = ascend_config.engram_model_path or self.engram_root
         storage_format = ascend_config.engram_storage
         if ascend_config.enable_engram:
             query_group = EngramQueryGroup.from_vllm(vllm_config.parallel_config)
@@ -500,6 +501,7 @@ class DeepseekV41Model(DeepseekV4Model):
                     config.engram_head_dim,
                     query_group,
                     storage_format=storage_format,
+                    cpu_offload=ascend_config.enable_engram_ple_offload,
                 )
         self.engram_history = None
         self._engram_input_buffers = None
@@ -553,33 +555,46 @@ class DeepseekV41Model(DeepseekV4Model):
         return lookups, mask.to(positions.device)
 
     def prepare_engram_inputs(self, input_ids, positions, padded_tokens=None):
-        """Refresh persistent inputs before main-model capture or replay."""
-        lookups, mask = self.prepare_engram(input_ids, positions)
+        """Synchronously refresh the rows read by this forward, before replay."""
+        graph_inputs = self.prepare_engram_graph_inputs(padded_tokens)
+        if not graph_inputs["engram_lookups"]:
+            return graph_inputs
         num_tokens = positions.shape[0]
-        # The compiled V4.1 backbone uses the scheduler's static token
-        # capacity for decode graphs (typically max_num_batched_tokens), even
-        # when the current request has one token.  Keep lookup tensors at that
-        # capacity so every captured graph sees the same Engram shape.
-        output_tokens = max(self._engram_max_tokens, padded_tokens or 0)
-        if output_tokens < num_tokens:
-            raise ValueError("Engram padded token count is smaller than the input")
+        output_tokens = num_tokens if padded_tokens is None else padded_tokens
+        if not num_tokens <= output_tokens <= self._engram_max_tokens:
+            raise ValueError("Engram padded token count must cover the input and fit buffer capacity")
+        lookups, mask = self.prepare_engram(input_ids, positions)
+        if mask.numel() > num_tokens:
+            raise ValueError("Engram query count exceeds the input token count")
+        buffers, mask_buffer = self._engram_input_buffers
+        mask_buffer[: mask.numel()].copy_(mask)
+        mask_buffer[mask.numel() : output_tokens].zero_()
+        for layer, values in lookups.items():
+            buffers[layer][: values.shape[0]].copy_(values)
+            buffers[layer][values.shape[0] : output_tokens].zero_()
+        return graph_inputs
+
+    def prepare_engram_graph_inputs(self, padded_tokens=None):
+        """Capture fixed-address buffers without CPU history or routing work."""
+        if not get_ascend_config().enable_engram:
+            return {"engram_lookups": {}, "engram_mask": self.engram_rotation.new_empty(0, dtype=torch.bool)}
+        if padded_tokens is not None and not 0 <= padded_tokens <= self._engram_max_tokens:
+            raise ValueError("Engram padded token count exceeds buffer capacity")
         if self._engram_input_buffers is None:
             capacity = self._engram_max_tokens
+            columns = (self.config.engram_max_ngram_size - 1) * self.config.engram_n_heads
+            device = self.engram_rotation.device
             self._engram_input_buffers = (
-                {layer: values.new_zeros((capacity, values.shape[1])) for layer, values in lookups.items()},
-                mask.new_zeros(capacity),
+                {
+                    layer: torch.zeros(
+                        (capacity, columns * self.layers[layer].engram.embed.width), dtype=torch.bfloat16, device=device
+                    )
+                    for layer in self.config.engram_layer_ids
+                },
+                torch.zeros(capacity, dtype=torch.bool, device=device),
             )
         buffers, mask_buffer = self._engram_input_buffers
-        padded_mask = mask_buffer[:output_tokens]
-        padded_mask.zero_()
-        padded_mask[: mask.numel()].copy_(mask)
-        padded_lookups = {}
-        for layer, values in lookups.items():
-            padded = buffers[layer][:output_tokens]
-            padded.zero_()
-            padded[: values.shape[0]].copy_(values)
-            padded_lookups[layer] = padded
-        return {"engram_lookups": padded_lookups, "engram_mask": padded_mask}
+        return {"engram_lookups": buffers, "engram_mask": mask_buffer}
 
     def forward(
         self,
@@ -600,6 +615,9 @@ class DeepseekV41Model(DeepseekV4Model):
             lookups, token_mask = engram_lookups, engram_mask
         self.shared_attention_state.reset()
         full_num_tokens = positions.shape[0]
+        # Slice capacity-sized graph buffers before SP splits the token axis.
+        token_mask = token_mask[:full_num_tokens]
+        lookups = {layer_idx: lookup[:full_num_tokens] for layer_idx, lookup in lookups.items()}
         if use_sequence_parallel:
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 forward_context = get_forward_context()
@@ -668,6 +686,9 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
     def prepare_engram_inputs(self, input_ids, positions, padded_tokens=None):
         return self.model.prepare_engram_inputs(input_ids, positions, padded_tokens)
 
+    def prepare_engram_graph_inputs(self, padded_tokens=None):
+        return self.model.prepare_engram_graph_inputs(padded_tokens)
+
     def forward(
         self,
         input_ids,
@@ -702,13 +723,15 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
                 if ".engram." in name:
                     # Bypass V4's generic embed -> embed_tokens remapping and TP loader.
                     local_name = name.removeprefix("model.")
-                    # FP8/MXFP8 Engram scales are consumed by the CPU loader.
+                    # Compressed Engram scales are consumed by the shard loader.
                     if local_name.endswith(".engram.embed.scale"):
                         continue
                     parameter_name = "model." + local_name
                     if local_name.endswith(".engram.embed.weight"):
                         layer_id = int(local_name.split(".")[1])
-                        self.model.layers[layer_id].engram.embed.load_checkpoint(self.model.engram_root, local_name)
+                        self.model.layers[layer_id].engram.embed.load_checkpoint(
+                            self.model.engram_weight_root, local_name
+                        )
                     else:
                         param = self.get_parameter(parameter_name)
                         if tensor.dtype != torch.bfloat16 or tensor.shape != param.shape:

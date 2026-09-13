@@ -38,8 +38,11 @@ def test_engram_history_metadata_uses_full_requests(cp):
     pages = torch.tensor([[7, 8, 9], [12, 13, 14]], dtype=torch.int32)
     # Device tensors are intentionally unusable: history must use host mirrors.
     fields = dict(
-        query_start_loc=None, block_table=None, storage_block_size=4,
-        query_start_loc_cpu=boundaries, block_table_cpu=pages,
+        query_start_loc=None,
+        block_table=None,
+        storage_block_size=4,
+        query_start_loc_cpu=boundaries,
+        block_table_cpu=pages,
     )
     request = SimpleNamespace(**fields)
     if cp.startswith("v41"):
@@ -239,6 +242,172 @@ def test_shard_loader(tmp_path):
     assert torch.equal(torch.cat(pieces), weights)
 
 
+def _int8_offload_worker(rank, rendezvous):
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=60))
+    for ranks in ([0, 1], [2, 3]):
+        group = dist.new_group(ranks)
+        if rank in ranks:
+            tp = group
+    query = hbm.EngramQueryGroup(dist.group.WORLD, dist.group.WORLD, tp, rank // 2 * 2)
+    tables, references = [], []
+    for rows in (71, 83):
+        table = hbm.NodeShardedEngram(rows, 256, query, storage_format="int8", cpu_offload=True)
+        codes = (torch.arange(rows * 256).reshape(rows, 256) % 256 - 128).to(torch.int8)
+        scales = 2.0 ** (torch.arange(rows * 8).reshape(rows, 8) % 7 - 3)
+        table.weight.data.copy_(codes[table.start : table.end])
+        table.weight_scale.copy_(scales[table.start : table.end])
+        tables.append(table)
+        references.append((codes.float().reshape(rows, 8, 32) * scales.unsqueeze(-1)).flatten(1).bfloat16())
+    for a, b in [(0, 0), (1, 0), (0, 17), (3, 7), (31, 1), (1, 31), (1, 1)] * 3:
+        count = (a, b)[rank // 2]
+        ids = [(torch.arange(count * 24).reshape(count, 24) * 7 + rank // 2) % table.rows for table in tables]
+        outputs = tables[0].route_many(tables, ids)
+        for table, output, reference, indices in zip(tables, outputs, references, ids):
+            assert table.weight.device.type == table.weight_scale.device.type == "cpu"
+            assert torch.equal(output.view(torch.int16), reference[indices].view(torch.int16)), (rank, a, b)
+    dist.destroy_process_group()
+
+
+def test_int8_offload_two_tables_variable_and_idle(tmp_path):
+    mp.spawn(_int8_offload_worker, args=(f"file://{tmp_path / 'int8_offload'}",), nprocs=4, join=True)
+
+
+@pytest.mark.parametrize("storage", ["int8", "fp8", "mxfp8"])
+def test_offload_loader_and_pinned_reuse(tmp_path, storage):
+    from unittest.mock import Mock
+
+    key, scale_key = "layers.1.engram.embed.weight", "layers.1.engram.embed.scale"
+    codes = (torch.arange(19 * 32).reshape(19, 32) % 31 - 15).to(
+        torch.int8 if storage == "int8" else torch.float8_e4m3fn
+    )
+    scales = (2.0 ** (torch.arange(19)[:, None] % 5 - 2)).to(
+        torch.float32 if storage == "int8" else torch.float8_e8m0fnu
+    )
+    save_file({key: codes, scale_key: scales}, tmp_path / "weights.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"other": "missing"}}))
+    (tmp_path / "quant_model_weights.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "weights.safetensors", scale_key: "weights.safetensors"}})
+    )
+    query = SimpleNamespace(size=4, rank=3)
+    with torch.device("meta"):
+        table = hbm.NodeShardedEngram(19, 32, query, device="meta", storage_format=storage, cpu_offload=True)
+    assert table.weight.device.type == table.weight_scale.device.type == "cpu"
+    assert not table.weight.is_pinned()
+    table.load_checkpoint(tmp_path, key, chunk_rows=2)
+    assert torch.equal(table.weight.view(torch.uint8), codes[15:19].view(torch.uint8))
+    ids = torch.tensor([0, 3, 0])
+    reference = (codes.float() * scales.float()).bfloat16()[ids + 15]
+    first = table.lookup_local(ids)
+    assert first.is_pinned()
+    torch.testing.assert_close(first.view(torch.int16), reference.view(torch.int16), rtol=0, atol=0)
+    event = Mock()
+    table._offload_events[first.data_ptr()] = event
+    second = table.lookup_local(ids)
+    event.synchronize.assert_not_called()
+    third = table.lookup_local(ids)
+    event.synchronize.assert_called_once_with()
+    assert first.data_ptr() == third.data_ptr() != second.data_ptr()
+    # Force eviction and verify a still-used pinned source is fenced first.
+    event = Mock()
+    table._offload_events[third.data_ptr()] = event
+    table._offload_buffer_bytes_limit = 1
+    table.lookup_local(ids[:1])
+    event.synchronize.assert_called_once_with()
+    assert len(table._offload_buffers) == 1
+
+
+@pytest.mark.parametrize("storage,scale_dtype", [("fp8", torch.float32), ("int8", torch.bfloat16)])
+def test_offload_rejects_wrong_scale_dtype(tmp_path, storage, scale_dtype):
+    key, scale_key = "layers.1.engram.embed.weight", "layers.1.engram.embed.scale"
+    save_file(
+        {
+            key: torch.ones(5, 32, dtype=torch.int8 if storage == "int8" else torch.float8_e4m3fn),
+            scale_key: torch.ones(5, 1, dtype=scale_dtype),
+        },
+        tmp_path / "weights.safetensors",
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "weights.safetensors", scale_key: "weights.safetensors"}})
+    )
+    table = hbm.NodeShardedEngram(5, 32, SimpleNamespace(size=1, rank=0), storage_format=storage, cpu_offload=True)
+    with pytest.raises(ValueError, match="expected FP"):
+        table.load_checkpoint(tmp_path, key)
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_int8_loads_bf16_source_without_scale(tmp_path, cpu_offload):
+    key = "layers.1.engram.embed.weight"
+    weights = torch.linspace(-12, 12, 19 * 32).reshape(19, 32).bfloat16()
+    save_file({key: weights}, tmp_path / "weights.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {key: "weights.safetensors"}}))
+    table = hbm.NodeShardedEngram(
+        19, 32, SimpleNamespace(size=4, rank=3), device="cpu", storage_format="int8", cpu_offload=cpu_offload
+    )
+    table.load_checkpoint(tmp_path, key, chunk_rows=2)
+    codes, scales = hbm.quantize_engram_rows(weights[15:19])
+    assert torch.equal(table.weight, codes)
+    assert torch.equal(table.weight_scale, scales)
+
+
+@pytest.mark.parametrize("width", [32, 256])
+@pytest.mark.parametrize("count", [0, 1, 255, 256, 521])
+def test_fused_int8_offload_matches_torch(width, count):
+    table = hbm.NodeShardedEngram(257, width, SimpleNamespace(size=1, rank=0), storage_format="int8", cpu_offload=True)
+    generator = torch.Generator().manual_seed(20260913)
+    table.weight.data.copy_(torch.randint(-128, 128, table.weight.shape, generator=generator, dtype=torch.int8))
+    table.weight_scale.copy_(torch.rand(table.weight_scale.shape, generator=generator) * 16)
+    table.weight.data[0].copy_(torch.arange(width).to(torch.int8))
+    table.weight_scale[0].fill_(1.00390625)
+    table.weight_scale[1].fill_(-0.0)
+    ids = (torch.arange(count * 2) % 257)[::2]
+    reference = hbm.dequantize_engram_rows(table.weight[ids], table.weight_scale[ids])
+    for _ in range(3):
+        actual = table.lookup_local(ids)
+        assert torch.equal(actual.view(torch.int16), reference.view(torch.int16))
+    for invalid in (-1, 257):
+        with pytest.raises(IndexError, match="outside shard"):
+            table.lookup_local(torch.tensor([invalid]))
+
+
+def test_offload_records_h2d_use_before_response_failure(monkeypatch):
+    query = SimpleNamespace(size=1, rank=0, is_source=True, group=None)
+    table = hbm.NodeShardedEngram(5, 32, query, storage_format="int8", cpu_offload=True)
+    table.weight.data.fill_(1)
+    table.weight_scale.fill_(1)
+    events = []
+
+    def exchange(output, source, *args, **kwargs):
+        if source.dtype == torch.int64:
+            output.copy_(source)
+        else:
+            assert events == ["source_fenced"]
+            raise RuntimeError("response failed")
+
+    monkeypatch.setattr(dist, "get_backend", lambda *args: "gloo")
+    monkeypatch.setattr(dist, "all_to_all_single", exchange)
+    monkeypatch.setattr(table, "_record_offload_use", lambda *args: events.append("source_fenced"))
+    with pytest.raises(RuntimeError, match="response failed"):
+        table._forward_with_gathered(torch.tensor([[1]]), [torch.tensor([1, 0])])
+
+
+def test_fused_cpu_operator_rejects_invalid_contracts():
+    from vllm_ascend import vllm_ascend_C  # noqa: F401
+
+    weight = torch.ones(5, 32, dtype=torch.int8)
+    scale = torch.ones(5, 1)
+    ids = torch.tensor([0, 4])
+    output = torch.empty(2, 32, dtype=torch.bfloat16)
+    for args in (
+        (weight.float(), scale, ids, output),
+        (weight, scale, ids.int(), output),
+        (weight, scale, ids, output[:1]),
+        (weight[:, ::2], scale, ids, output),
+    ):
+        with pytest.raises(RuntimeError, match="Engram CPU lookup"):
+            torch.ops._C_ascend.engram_int8_lookup_cpu(*args)
+
+
 def test_cached_metadata_stays_on_cpu_with_device_context():
     q = type("QueryGroup", (), {"size": 4, "rank": 1, "is_source": False})()
     with torch.device("meta"):
@@ -266,8 +435,7 @@ def test_gate_preserves_masked_rows():
     hidden = torch.randn(3, 4, 32).bfloat16()
     key = torch.randn(3, 4, 32).bfloat16()
     value = torch.randn(3, 32).bfloat16()
-    out = gate(hidden, key, value, torch.randn(4, 32), torch.eye(32),
-               torch.tensor([True, False, True]), 1e-5)
+    out = gate(hidden, key, value, torch.randn(4, 32), torch.eye(32), torch.tensor([True, False, True]), 1e-5)
     assert torch.equal(out[1], hidden[1])
     assert torch.isfinite(out.float()).all()
 
@@ -275,12 +443,22 @@ def test_gate_preserves_masked_rows():
 @pytest.mark.parametrize("barrier_token", [98, 99])
 def test_hash_causal_barrier(barrier_token):
     h = hash_mod.PagedNgramHistory.__new__(hash_mod.PagedNgramHistory)
-    h.token_map = torch.arange(100); h.pad_id = 2; h.image_token_id = 99; h.lookback = 2
+    h.token_map = torch.arange(100)
+    h.pad_id = 2
+    h.image_token_id = 99
+    h.lookback = 2
     h.image_pad_token_id = 98
-    h.primes = torch.tensor([[[101, 103]]]); h.offsets = torch.tensor([[0, 101]])
-    h.multipliers = torch.tensor([[3, 5]]); h.pages = {}
-    values, mask = h.update(torch.tensor([0, 5, 9, barrier_token, 13, 17]), torch.arange(6),
-                             torch.zeros(6, dtype=torch.long), torch.tensor([[5, 1]]), 4)
+    h.primes = torch.tensor([[[101, 103]]])
+    h.offsets = torch.tensor([[0, 101]])
+    h.multipliers = torch.tensor([[3, 5]])
+    h.pages = {}
+    values, mask = h.update(
+        torch.tensor([0, 5, 9, barrier_token, 13, 17]),
+        torch.arange(6),
+        torch.zeros(6, dtype=torch.long),
+        torch.tensor([[5, 1]]),
+        4,
+    )
     assert values.shape == (6, 1, 2) and not mask[3]
     # The first token on the next page must hash against padding, not the image.
     assert values[4, 0, 0].item() == ((13 * 3) ^ (h.pad_id * 5)) % 101

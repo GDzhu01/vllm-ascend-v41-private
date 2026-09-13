@@ -387,6 +387,10 @@ class AscendConfig:
     enable_cpu_binding: bool = True
     # Enable the V4.1 node-sharded Engram path.
     enable_engram: bool = True
+    # Keep compressed Engram tables on CPU and decode only requested rows.
+    enable_engram_ple_offload: bool = False
+    # Optional checkpoint root containing the source Engram tensors.
+    engram_model_path: str | None = None
     # V4.1 node-sharded Engram storage; BF16 output and projections are unchanged.
     engram_storage: Literal["bf16", "int8", "fp8", "mxfp8"] = "bf16"
     multistream_dsv4_dsa_overlap: bool = True
@@ -485,6 +489,13 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        if self.enable_engram_ple_offload:
+            if not self.enable_engram:
+                raise ValueError("PLE_OFFLOAD requires enable_engram=True")
+            if self.engram_storage == "bf16":
+                self.engram_storage = "fp8"
+        elif self.engram_model_path is not None:
+            raise ValueError("engram_model_path requires enable_engram_ple_offload=True")
         if (
             self.enable_force_eplb
             and self.eplb_config.dynamic_eplb

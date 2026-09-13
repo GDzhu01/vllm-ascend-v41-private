@@ -117,6 +117,35 @@ and are overwritten when those positions are recomputed.
 Target eager and `FULL_DECODE_ONLY` modes retain their existing dispatch;
 the V1 DSpark proposer runs eagerly. Draft graph capture is not enabled.
 
+### Engram Host Offload
+
+在现有 V4.1 启动参数中增加：
+
+```bash
+--safetensors-load-strategy lazy \
+--additional-config '{"enable_engram_ple_offload":true,"engram_storage":"int8"}' \
+--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+```
+
+`engram_storage=int8` 保留 CPU INT8 权重和 FP32 group32 scale，仅对命中行做
+fused gather/dequant，直接写入可复用 pinned BF16 staging。FP8/MXFP8 保留原始
+E4M3 权重与 UE8M0 group32 scale，不把完整表展开为 BF16。仅开启 offload 而未
+指定存储格式时使用 FP8；可用 `engram_model_path` 指定独立的 Engram checkpoint。
+loader 支持两种 safetensors index 文件名，并校验权重和 scale 的形状、类型。
+
+运行范围为单机、model runner V1、EP 且 PP=PCP=DCP=1；所有 rank（包括 idle DP）
+按相同顺序参与路由。沿用合并 metadata、合并 TP broadcast、CPU history/hash
+优化与缓存上限，H2D 完成前不可覆盖或淘汰对应 pinned buffer。
+
+Prefill 和 decode 均同步准备 lookup；capture 只绑定固定地址的设备 buffer，
+每次 replay 前刷新有效行及本轮 padding。SP 在分片前裁剪到本轮 token 数。
+本实现不含 CPU/NPU 掩盖、prefetch worker、breakable graph 或 PD 状态迁移。
+
+组件测试：`pytest --confcutdir=tests/ut/models tests/ut/models/test_engram_hbm.py
+tests/ut/models/test_engram_inputs.py`。查表微基准：
+`python -m benchmarks.engram_cpu_lookup --threads 1`。组件精度和耗时不能替代
+真实权重、16 卡 HCCL、FULL replay 的服务验证，也不代表端到端性能收益。
+
 ### Earlier design comparisons
 
 The original block-outermost implementation reserved 393216 bytes per ID

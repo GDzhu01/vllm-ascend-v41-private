@@ -109,6 +109,8 @@ set(
 )
 
 pybind11_add_module(vllm_ascend_C ${VLLM_ASCEND_SRC})
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+target_link_libraries(vllm_ascend_C PRIVATE OpenMP::OpenMP_CXX)
 
 # Detect aclrtMemcpyBatchAsync availability (CANN 8.5+)
 # Can be overridden via VLLM_ASCEND_ENABLE_BATCH_MEMCPY env var (registered
