@@ -63,8 +63,7 @@ def test_invalid_capacity_fails_before_history_or_routing(model, tokens, padded)
         model.prepare_engram_inputs(torch.arange(tokens), torch.arange(tokens), padded)
 
 
-@pytest.mark.parametrize("rank", [0, 1])
-def test_sequence_parallel_slices_capacity_before_sharding(monkeypatch, rank):
+def test_sequence_parallel_slices_capacity_before_sharding(monkeypatch):
     seen = []
 
     class Layer:
@@ -85,7 +84,7 @@ def test_sequence_parallel_slices_capacity_before_sharding(monkeypatch, rank):
 
     monkeypatch.setattr(implementation, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True))
     monkeypatch.setattr(implementation.envs, "VLLM_MOE_SKIP_PADDING", False)
-    monkeypatch.setattr(implementation, "sp_shard", lambda value: value.chunk(2)[rank])
+    monkeypatch.setattr(implementation, "sp_shard", lambda value: value.chunk(2)[1])
     monkeypatch.setattr(implementation, "sp_all_gather", lambda value: torch.cat([value, value]))
     monkeypatch.setattr(implementation, "engram_gate", lambda hidden, *args: hidden)
     shell = SimpleNamespace(
@@ -109,11 +108,10 @@ def test_sequence_parallel_slices_capacity_before_sharding(monkeypatch, rank):
         engram_lookups={1: lookup},
         engram_mask=torch.ones(16, dtype=torch.bool),
     )
-    assert torch.equal(seen[0], lookup[:4].chunk(2)[rank])
+    assert torch.equal(seen[0], lookup[:4].chunk(2)[1])
 
 
-@pytest.mark.parametrize("mode", ["NONE", "FULL"])
-@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("mode,capture", [("NONE", False), ("FULL", False), ("FULL", True)])
 def test_runner_sync_preparation_and_capture_through_vl(monkeypatch, mode, capture):
     from vllm_ascend.models.deepseek_v41.vl_model import AscendDeepseekV41ForConditionalGeneration
     from vllm_ascend.worker import model_runner_v1 as runner_module

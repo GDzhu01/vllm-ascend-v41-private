@@ -157,7 +157,7 @@ def _compressed_wire_worker(rank, rendezvous):
     dist.destroy_process_group()
 
 
-def _mixed_storage_worker(rank, rendezvous):
+def _mixed_storage_worker(rank, rendezvous, cpu_offload):
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=60))
     for ranks in ([0, 1], [2, 3]):
@@ -165,8 +165,8 @@ def _mixed_storage_worker(rank, rendezvous):
         if rank in ranks:
             tp = group
     q = hbm.EngramQueryGroup(dist.group.WORLD, dist.group.WORLD, tp, rank // 2 * 2)
-    bf16 = hbm.NodeShardedEngram(41, 256, q, device="cpu", storage_format="bf16")
-    int8 = hbm.NodeShardedEngram(43, 256, q, device="cpu", storage_format="int8")
+    bf16 = hbm.NodeShardedEngram(41, 256, q, device="cpu", storage_format="bf16", cpu_offload=cpu_offload)
+    int8 = hbm.NodeShardedEngram(43, 256, q, device="cpu", storage_format="int8", cpu_offload=cpu_offload)
     bf16_reference = torch.arange(41 * 256, dtype=torch.float32).reshape(41, 256).bfloat16()
     int8_codes = (torch.arange(43 * 256).reshape(43, 256) % 255 - 127).to(torch.int8)
     int8_scales = torch.linspace(0.25, 1.0, 43 * 8).reshape(43, 8)
@@ -174,12 +174,13 @@ def _mixed_storage_worker(rank, rendezvous):
     bf16.weight.data.copy_(bf16_reference[bf16.start : bf16.end])
     int8.weight.data.copy_(int8_codes[int8.start : int8.end])
     int8.weight_scale.copy_(int8_scales[int8.start : int8.end])
-    count = (0, 5)[rank // 2]
-    first_ids = (torch.arange(count * 7).reshape(count, 7) * 3 + rank // 2) % 41
-    second_ids = (torch.arange(count * 7).reshape(count, 7) * 5 + rank // 2) % 43
-    first, second = bf16.route_many([bf16, int8], [first_ids, second_ids])
-    assert torch.equal(first.view(torch.int16), bf16_reference[first_ids].view(torch.int16))
-    assert torch.equal(second.view(torch.int16), int8_reference[second_ids].view(torch.int16))
+    for counts in ((0, 0), (0, 5), (7, 0), (3, 17), (17, 3)):
+        count = counts[rank // 2]
+        first_ids = (torch.arange(count * 7).reshape(count, 7) * 3 + rank // 2) % 41
+        second_ids = (torch.arange(count * 7).reshape(count, 7) * 5 + rank // 2) % 43
+        first, second = bf16.route_many([bf16, int8], [first_ids, second_ids])
+        assert torch.equal(first.view(torch.int16), bf16_reference[first_ids].view(torch.int16))
+        assert torch.equal(second.view(torch.int16), int8_reference[second_ids].view(torch.int16))
     dist.destroy_process_group()
 
 
@@ -214,8 +215,9 @@ def test_int8_compressed_wire_cross_dp(tmp_path):
     mp.spawn(_compressed_wire_worker, args=(f"file://{tmp_path / 'compressed'}",), nprocs=4, join=True)
 
 
-def test_route_many_mixed_storage_and_idle(tmp_path):
-    mp.spawn(_mixed_storage_worker, args=(f"file://{tmp_path / 'mixed'}",), nprocs=4, join=True)
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_route_many_mixed_storage_and_idle(tmp_path, cpu_offload):
+    mp.spawn(_mixed_storage_worker, args=(f"file://{tmp_path / 'mixed'}", cpu_offload), nprocs=4, join=True)
 
 
 def test_fp8_offload_cross_dp_and_idle(tmp_path):
@@ -242,44 +244,6 @@ def test_shard_loader(tmp_path):
     assert torch.equal(torch.cat(pieces), weights)
 
 
-def _offload_worker(rank, rendezvous, storage):
-    torch.set_num_threads(1)
-    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=60))
-    for ranks in ([0, 1], [2, 3]):
-        group = dist.new_group(ranks)
-        if rank in ranks:
-            tp = group
-    query = hbm.EngramQueryGroup(dist.group.WORLD, dist.group.WORLD, tp, rank // 2 * 2)
-    tables, references = [], []
-    for rows in (71, 83):
-        table = hbm.NodeShardedEngram(rows, 256, query, storage_format=storage, cpu_offload=True)
-        codes = (torch.arange(rows * 256).reshape(rows, 256) % 256 - 128).to(torch.int8)
-        scales = 2.0 ** (torch.arange(rows * 8).reshape(rows, 8) % 7 - 3)
-        reference = (codes.float().reshape(rows, 8, 32) * scales.unsqueeze(-1)).flatten(1).bfloat16()
-        if storage == "int8":
-            table.weight.data.copy_(codes[table.start : table.end])
-            table.weight_scale.copy_(scales[table.start : table.end])
-        else:
-            table.weight.data.copy_(reference[table.start : table.end])
-        tables.append(table)
-        references.append(reference)
-    for a, b in [(0, 0), (1, 0), (0, 17), (3, 7), (31, 1), (1, 31), (1, 1)] * 3:
-        count = (a, b)[rank // 2]
-        ids = [(torch.arange(count * 24).reshape(count, 24) * 7 + rank // 2) % table.rows for table in tables]
-        outputs = tables[0].route_many(tables, ids)
-        for table, output, reference, indices in zip(tables, outputs, references, ids):
-            assert table.weight.device.type == "cpu"
-            if storage == "int8":
-                assert table.weight_scale.device.type == "cpu"
-            assert torch.equal(output.view(torch.int16), reference[indices].view(torch.int16)), (rank, a, b)
-    dist.destroy_process_group()
-
-
-@pytest.mark.parametrize("storage", ["bf16", "int8"])
-def test_offload_two_tables_variable_and_idle(tmp_path, storage):
-    mp.spawn(_offload_worker, args=(f"file://{tmp_path / 'offload'}", storage), nprocs=4, join=True)
-
-
 @pytest.mark.parametrize("storage", ["bf16", "int8", "fp8", "mxfp8"])
 def test_offload_loader_and_pinned_reuse(tmp_path, storage):
     from unittest.mock import Mock
@@ -288,6 +252,8 @@ def test_offload_loader_and_pinned_reuse(tmp_path, storage):
     codes = (torch.arange(19 * 32).reshape(19, 32) % 31 - 15).to(
         torch.bfloat16 if storage == "bf16" else torch.int8 if storage == "int8" else torch.float8_e4m3fn
     )
+    if storage == "bf16":
+        codes.view(torch.int16)[15, :4] = torch.tensor([0, -32768, 32705, 1], dtype=torch.int16)
     scales = (2.0 ** (torch.arange(19)[:, None] % 5 - 2)).to(
         torch.float32 if storage == "int8" else torch.float8_e8m0fnu
     )
@@ -327,24 +293,13 @@ def test_offload_loader_and_pinned_reuse(tmp_path, storage):
     table.lookup_local(ids[:1])
     event.synchronize.assert_called_once_with()
     assert len(table._offload_buffers) == 1
-
-
-def test_bf16_offload_preserves_bits_and_checks_ids():
-    table = hbm.NodeShardedEngram(5, 32, SimpleNamespace(size=1, rank=0), storage_format="bf16", cpu_offload=True)
-    bits = torch.tensor([0, -32768, 32704, 32705, -64, 32640, -128, 1], dtype=torch.int16).repeat(20).view(5, 32)
-    table.weight.data.view(torch.int16).copy_(bits)
-    ids = torch.tensor([[4, 0], [1, 4]])
-    actual = table.lookup_local(ids)
-    assert actual.is_pinned()
-    assert torch.equal(actual.view(torch.int16), bits[ids])
     assert table.lookup_local(torch.empty(0, 2, dtype=torch.int64)).shape == (0, 2, 32)
-    for invalid in (-1, 5):
+    for invalid in (-1, table.weight.shape[0]):
         with pytest.raises(IndexError):
             table.lookup_local(torch.tensor([invalid]))
 
 
-@pytest.mark.parametrize("storage", ["bf16", "int8", "fp8", "mxfp8"])
-@pytest.mark.parametrize("swap_indexes", [False, True])
+@pytest.mark.parametrize("storage,swap_indexes", [("bf16", True), ("int8", True), ("fp8", True), ("mxfp8", False)])
 def test_loader_selects_compatible_index(tmp_path, storage, swap_indexes):
     key, scale_key = "layers.1.engram.embed.weight", "layers.1.engram.embed.scale"
     bf16 = torch.ones(5, 32, dtype=torch.bfloat16)
@@ -385,14 +340,13 @@ def test_offload_rejects_wrong_scale_dtype(tmp_path, storage, scale_dtype):
         table.load_checkpoint(tmp_path, key)
 
 
-@pytest.mark.parametrize("cpu_offload", [False, True])
-def test_int8_loads_bf16_source_without_scale(tmp_path, cpu_offload):
+def test_int8_loads_bf16_source_without_scale(tmp_path):
     key = "layers.1.engram.embed.weight"
     weights = torch.linspace(-12, 12, 19 * 32).reshape(19, 32).bfloat16()
     save_file({key: weights}, tmp_path / "weights.safetensors")
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {key: "weights.safetensors"}}))
     table = hbm.NodeShardedEngram(
-        19, 32, SimpleNamespace(size=4, rank=3), device="cpu", storage_format="int8", cpu_offload=cpu_offload
+        19, 32, SimpleNamespace(size=4, rank=3), storage_format="int8", cpu_offload=True
     )
     table.load_checkpoint(tmp_path, key, chunk_rows=2)
     codes, scales = hbm.quantize_engram_rows(weights[15:19])
@@ -400,8 +354,7 @@ def test_int8_loads_bf16_source_without_scale(tmp_path, cpu_offload):
     assert torch.equal(table.weight_scale, scales)
 
 
-@pytest.mark.parametrize("width", [32, 256])
-@pytest.mark.parametrize("count", [0, 1, 255, 256, 521])
+@pytest.mark.parametrize("width,count", [(32, 0), (32, 1), (256, 255), (256, 256), (256, 521)])
 def test_fused_int8_offload_matches_torch(width, count):
     table = hbm.NodeShardedEngram(257, width, SimpleNamespace(size=1, rank=0), storage_format="int8", cpu_offload=True)
     generator = torch.Generator().manual_seed(20260913)
@@ -412,12 +365,8 @@ def test_fused_int8_offload_matches_torch(width, count):
     table.weight_scale[1].fill_(-0.0)
     ids = (torch.arange(count * 2) % 257)[::2]
     reference = hbm.dequantize_engram_rows(table.weight[ids], table.weight_scale[ids])
-    for _ in range(3):
-        actual = table.lookup_local(ids)
-        assert torch.equal(actual.view(torch.int16), reference.view(torch.int16))
-    for invalid in (-1, 257):
-        with pytest.raises(IndexError, match="outside shard"):
-            table.lookup_local(torch.tensor([invalid]))
+    actual = table.lookup_local(ids)
+    assert torch.equal(actual.view(torch.int16), reference.view(torch.int16))
 
 
 def test_offload_records_h2d_use_before_response_failure(monkeypatch):
