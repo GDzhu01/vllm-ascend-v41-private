@@ -781,8 +781,10 @@ def test_compressed_metadata_exposes_original_and_cache_coordinates(config, runt
 
 
 @pytest.mark.parametrize("deferred", [False, True])
-@pytest.mark.parametrize("query_len", [1, 3])
-def test_batch_metadata_reuses_work_and_keeps_group_slots_separate(runtime, monkeypatch, deferred, query_len):
+@pytest.mark.parametrize("query_len,full_graph_mode", [(1, False), (3, False), (3, True)])
+def test_batch_metadata_reuses_work_and_keeps_group_slots_separate(
+    runtime, monkeypatch, deferred, query_len, full_graph_mode
+):
     groups = make_cache_config(17).kv_cache_groups
     builders = []
     for group in groups:
@@ -859,7 +861,7 @@ def test_batch_metadata_reuses_work_and_keeps_group_slots_separate(runtime, monk
                     common,
                     num_actual_reqs=2,
                     skip_ring_state_update=idle,
-                    full_graph_mode=query_len == 1,
+                    full_graph_mode=full_graph_mode,
                     common_v41_metadata=group_shared,
                     common_v41_batch_metadata=batch_shared,
                 )
@@ -887,6 +889,7 @@ def test_batch_metadata_reuses_work_and_keeps_group_slots_separate(runtime, monk
         all_metadata = [metadata for group_results in results for metadata in group_results]
         assert counts.call_count == iteration + 1
         assert rope.call_count == iteration + 1
+        assert rope.call_args.kwargs["use_cache"] is (query_len == 1 or full_graph_mode)
         assert compressed_slots.call_count == iteration + 1
         assert smla.call_count == 3 * (iteration + 1)
         assert qli.call_count == 2 * (iteration + 1)

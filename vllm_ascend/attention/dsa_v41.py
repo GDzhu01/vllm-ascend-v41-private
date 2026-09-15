@@ -845,7 +845,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         coordinates = dict(batch_metadata)
         seq_lens = coordinates["seq_lens"]
         positions = coordinates["positions"]
-        full_graph_mode = coordinates.get("full_graph_mode", False)
+        full_graph_mode = bool(kwargs.get("full_graph_mode", False))
 
         # SWA uses original-token coordinates; circular state has no token slots.
         # Long KV and index K are addressed in completed compression groups.
