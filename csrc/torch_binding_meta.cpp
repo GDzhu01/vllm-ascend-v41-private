@@ -1133,6 +1133,13 @@ at::Tensor npu_hc_post_meta(
     return outputs;
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_hc_post_with_mean_meta(const at::Tensor& x, const at::Tensor& residual,
+                                                              const at::Tensor& post, const at::Tensor& comb) {
+  at::Tensor outputs = construct_hc_post_output_tensor(residual);
+  at::Tensor mean = at::empty_like(x);
+  return std::make_tuple(outputs, mean);
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_hc_pre_output_tensor(const at::Tensor& x, int64_t hc_mult)
 {
     auto xDims = x.dim();
@@ -2117,6 +2124,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_sparse_attn_sharedkv", &vllm_ascend::meta::npu_sparse_attn_sharedkv_meta);
     ops.impl("npu_sparse_attn_sharedkv_metadata", &vllm_ascend::meta::npu_sparse_attn_sharedkv_metadata_meta);
     ops.impl("npu_hc_post", &vllm_ascend::meta::npu_hc_post_meta);
+    ops.impl("npu_hc_post_with_mean", &vllm_ascend::meta::npu_hc_post_with_mean_meta);
     ops.impl("npu_hc_pre_v2", &vllm_ascend::meta::npu_hc_pre_meta);
     ops.impl("inplace_partial_rotary_mul", &vllm_ascend::meta::inplace_partial_rotary_mul_meta);
     ops.impl("npu_rms_norm_dynamic_quant", &vllm_ascend::meta::npu_rms_norm_dynamic_quant_meta);

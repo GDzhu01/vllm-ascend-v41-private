@@ -14,13 +14,13 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_ascend.core.deepseek_v41 import DeepseekV41DraftSWASpec
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec, register_ascend_kv_cache_specs
 from vllm_ascend.models.deepseek_v4.model import AscendDeepseekV4SWACache
+from vllm_ascend.models.deepseek_v41 import dspark as deepseek_v41_dspark_module
 from vllm_ascend.models.deepseek_v41.dspark import (
     DeepseekV41DSparkAttention,
     DeepseekV41DSparkDecoderLayer,
     DeepseekV41DSparkModel,
     DeepseekV41DSparkSWACache,
 )
-from vllm_ascend.models.deepseek_v41 import dspark as deepseek_v41_dspark_module
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41Model
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -66,13 +66,18 @@ def test_target_exports_residual_entering_selected_layers(monkeypatch):
         lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
 
+    capture_flags = []
+
     class Layer:
         def __init__(self, index):
             self.layer_idx = index
             self.engram = None
 
-        def __call__(self, positions, hidden, pre_mix, unused, input_ids):
-            return hidden + self.layer_idx + 1, pre_mix
+        def __call__(self, positions, hidden, pre_mix, unused, input_ids, capture_aux=False):
+            capture_flags.append(capture_aux)
+            output = hidden + self.layer_idx + 1
+            aux = output.mean(dim=1) if capture_aux else None
+            return output, pre_mix, aux
 
         @staticmethod
         def hc_collapse(hidden, pre_mix):
@@ -92,6 +97,7 @@ def test_target_exports_residual_entering_selected_layers(monkeypatch):
     torch.testing.assert_close(aux[0], hidden)
     torch.testing.assert_close(aux[1], hidden + 3)
     torch.testing.assert_close(output, hidden + 6)
+    assert capture_flags == [False, True, False]
 
 
 @pytest.mark.parametrize("cp", [False, True])
@@ -131,7 +137,7 @@ def test_v41_draft_sequence_parallel_shards_inputs_and_restores_output(monkeypat
             return hidden.mean(dim=1)
 
         def __call__(self, positions, hidden, pre_mix, llama_4_scaling, input_ids):
-            return hidden, pre_mix
+            return hidden, pre_mix, None
 
     hidden = torch.arange(16, dtype=torch.float32).reshape(4, 4)
     input_ids = torch.tensor([11, 12, 13, 14])
@@ -172,9 +178,7 @@ def test_v41_draft_context_store_uses_physical_pairs_and_preserves_padding():
     from vllm_ascend.models.deepseek_v41.dspark import DeepseekV41DSparkModel
 
     cache = torch.empty(3, 128, 1, 8)
-    attn = SimpleNamespace(dsa_attn=SimpleNamespace(
-        swa_cache_layer=SimpleNamespace(block_size=128, kv_cache=[cache])
-    ))
+    attn = SimpleNamespace(dsa_attn=SimpleNamespace(swa_cache_layer=SimpleNamespace(block_size=128, kv_cache=[cache])))
     values = torch.randn(3, 1, 8)
     with patch("vllm_ascend.models.deepseek_v41.dspark.scatter_cache_sk") as store:
         DeepseekV41DSparkModel._store_standard_swa_kv(None, values, torch.tensor([129, -1, 258]), attn)
