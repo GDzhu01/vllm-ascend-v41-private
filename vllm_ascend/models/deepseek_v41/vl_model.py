@@ -229,6 +229,13 @@ class AscendDeepseekV41ForConditionalGeneration(
             padded_tokens,
         )
 
+    def prepare_engram_prefetch_inputs(self, input_ids, positions, padded_tokens=None):
+        return self.language_model.prepare_engram_prefetch_inputs(
+            input_ids,
+            positions,
+            padded_tokens,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,

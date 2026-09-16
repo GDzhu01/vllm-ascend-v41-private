@@ -389,6 +389,14 @@ class AscendConfig:
     enable_engram: bool = True
     # Keep Engram tables on CPU and transfer only requested BF16 rows.
     enable_engram_ple_offload: bool = False
+    # Overlap the offloaded CPU lookup with eager prefill/mixed execution.
+    # Captured decode graphs keep the synchronous refresh.
+    enable_engram_prefetch: bool = False
+    # Dedicated threads for the offloaded lookup; 0 keeps the process
+    # intra-op pool. Never resize the process-wide OMP pool for Engram.
+    engram_cpu_lookup_threads: int = 20
+    # Per-stage Engram timings for P/D separation experiments.
+    enable_engram_trace: bool = False
     # Optional checkpoint root containing the source Engram tensors.
     engram_model_path: str | None = None
     # V4.1 node-sharded Engram storage; BF16 output and projections are unchanged.
@@ -489,6 +497,15 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        if self.engram_cpu_lookup_threads < 0:
+            raise ValueError("engram_cpu_lookup_threads must be >= 0")
+        if self.enable_engram_prefetch and not self.enable_engram_ple_offload:
+            raise ValueError("enable_engram_prefetch requires enable_engram_ple_offload=True")
+        if self.enable_engram_prefetch:
+            mode = getattr(vc.compilation_config, "cudagraph_mode", "NONE")
+            graph_mode = getattr(mode, "name", getattr(mode, "value", str(mode)))
+            if graph_mode not in {"NONE", "FULL_DECODE_ONLY"}:
+                raise ValueError("enable_engram_prefetch supports only NONE and FULL_DECODE_ONLY graph modes")
         if self.enable_engram_ple_offload:
             if not self.enable_engram:
                 raise ValueError("PLE_OFFLOAD requires enable_engram=True")
