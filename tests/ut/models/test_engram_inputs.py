@@ -11,7 +11,9 @@ from vllm_ascend.models.deepseek_v41 import model as implementation
 
 @pytest.fixture
 def model(monkeypatch):
-    monkeypatch.setattr(implementation, "get_ascend_config", lambda: SimpleNamespace(enable_engram=True))
+    monkeypatch.setattr(
+        implementation, "get_ascend_config", lambda: SimpleNamespace(enable_engram=True, enable_engram_trace=False)
+    )
     cls = implementation.DeepseekV41Model
     shell = SimpleNamespace(
         config=SimpleNamespace(engram_layer_ids=[1, 14], engram_max_ngram_size=4, engram_n_heads=8),
@@ -46,7 +48,9 @@ def test_capture_first_reuses_storage_and_refreshes_only_runtime_rows(model):
 
 
 def test_disabled_engram_capture_and_replay_do_not_access_layers(model, monkeypatch):
-    monkeypatch.setattr(implementation, "get_ascend_config", lambda: SimpleNamespace(enable_engram=False))
+    monkeypatch.setattr(
+        implementation, "get_ascend_config", lambda: SimpleNamespace(enable_engram=False, enable_engram_trace=False)
+    )
     model.layers = [SimpleNamespace(engram=None) for _ in range(15)]
     for result in (model.prepare_engram_graph_inputs(4), model.prepare_engram_inputs(None, torch.arange(4), 4)):
         assert result["engram_lookups"] == {}
@@ -90,6 +94,7 @@ def test_sequence_parallel_slices_capacity_before_sharding(monkeypatch):
     shell = SimpleNamespace(
         use_sequence_parallel=True,
         hc_mult=1,
+        _engram_compiled_prefetch=False,
         config=SimpleNamespace(hidden_size=32, rms_norm_eps=1e-6),
         shared_attention_state=SimpleNamespace(reset=lambda: None),
         aux_hidden_state_layers=[],
@@ -135,6 +140,11 @@ def test_runner_sync_preparation_and_capture_through_vl(monkeypatch, mode, captu
     wrapper.language_model = LanguageModel()
     context = SimpleNamespace(cudagraph_runtime_mode=getattr(runner_module.CUDAGraphMode, mode))
     monkeypatch.setattr(runner_module, "get_forward_context", lambda: context)
+    monkeypatch.setattr(
+        runner_module,
+        "get_ascend_config",
+        lambda: SimpleNamespace(enable_engram=True, enable_engram_trace=False, enable_engram_prefetch=False),
+    )
     monkeypatch.setattr(torch.npu, "is_current_stream_capturing", lambda: False)
     runner = SimpleNamespace(
         model=wrapper,

@@ -22,7 +22,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-from vllm.config import KVTransferConfig
+from vllm.config import CUDAGraphMode, KVTransferConfig
 from vllm.config import VllmConfig as _VllmConfig
 
 from tests.ut.base import TestBase
@@ -1017,6 +1017,58 @@ class TestTopLevelSwitchTypeValidation(TestBase):
             vc.additional_config = settings
             with self.assertRaises(ValueError):
                 init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_engram_prefetch_graph_modes(self, mock_fix):
+        # Overlap needs an eager boundary: NONE keeps every batch on the
+        # eager path, FULL_DECODE_ONLY leaves prefill/mixed eager.
+        for mode in CUDAGraphMode:
+            with self.subTest(mode=mode):
+                clear_ascend_config()
+                vc = VllmConfig()
+                vc.compilation_config.cudagraph_mode = mode
+                vc.additional_config = {"enable_engram_ple_offload": True, "enable_engram_prefetch": True}
+                if mode in (CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY):
+                    self.assertTrue(init_ascend_config(vc).enable_engram_prefetch)
+                else:
+                    with self.assertRaisesRegex(ValueError, "supports only NONE and FULL_DECODE_ONLY"):
+                        init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_engram_prefetch_requires_cpu_offload(self, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"enable_engram_prefetch": True}
+        with self.assertRaisesRegex(ValueError, "requires enable_engram_ple_offload=True"):
+            init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_engram_cpu_lookup_threads(self, mock_fix):
+        clear_ascend_config()
+        vc = VllmConfig()
+        vc.additional_config = {"enable_engram_ple_offload": True, "engram_storage": "int8"}
+        self.assertEqual(init_ascend_config(vc).engram_cpu_lookup_threads, 20)
+
+        clear_ascend_config()
+        vc = VllmConfig()
+        vc.additional_config = {
+            "enable_engram_ple_offload": True,
+            "engram_storage": "int8",
+            "engram_cpu_lookup_threads": 8,
+        }
+        self.assertEqual(init_ascend_config(vc).engram_cpu_lookup_threads, 8)
+
+        clear_ascend_config()
+        vc = VllmConfig()
+        vc.additional_config = {
+            "enable_engram_ple_offload": True,
+            "engram_storage": "int8",
+            "engram_cpu_lookup_threads": -1,
+        }
+        with self.assertRaisesRegex(ValueError, "engram_cpu_lookup_threads must be >= 0"):
+            init_ascend_config(vc)
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
