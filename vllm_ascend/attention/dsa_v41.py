@@ -1214,7 +1214,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         if noncausal and not is_v41_draft_swa_spec(spec):
             raise ValueError("V4.1 noncausal attention requires a DSpark draft SWA cache")
         if noncausal and ori_sparse_indices is None:
-            ori_sparse_indices, _ = build_dspark_swa_indices(
+            ori_sparse_indices, ori_topk_length = build_dspark_swa_indices(
                 common.block_table_tensor[:num_reqs],
                 self.vllm_config.speculative_config.num_speculative_tokens,
                 window_size,
