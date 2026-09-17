@@ -52,6 +52,7 @@ _EXPECTED_CAPABILITIES = {
         HardwareCapability.MC2_FULLMESH_V2_COMM,
         HardwareCapability.MOE_DISPATCH_EXTRA_ARGS,
         HardwareCapability.NPU_TOP_K_TOP_P,
+        HardwareCapability.RMS_NORM_CAST,
     },
     AscendDeviceType._310P: frozenset(
         {

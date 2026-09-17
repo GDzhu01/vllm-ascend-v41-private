@@ -78,6 +78,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_attn_kv_plan import get_dsv4_attn_kv_dtype
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.deepseek_v4.compressor import Compressor
 from vllm_ascend.models.deepseek_v4.indexer import DeepseekV4Indexer
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
@@ -732,16 +733,16 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     def rms_norm_cast(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Normalize once and provide the exact FP32 routing input."""
-        op = getattr(torch.ops._C_ascend, "npu_rms_norm_cast", None)
-        if op is not None:
-            return op(
-                hidden_states,
-                self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.variance_epsilon,
-            )
-        # The fused operator is an A3/CANN 9.1 extension and is not present in
-        # every 950DT/CANN 9.2 image.  Preserve the pre-fusion equation and the
-        # exact rounded FP32 router input when the capability is absent.
+        if get_current_hardware_profile().supports(HardwareCapability.RMS_NORM_CAST):
+            op = getattr(torch.ops._C_ascend, "npu_rms_norm_cast", None)
+            if op is not None:
+                return op(
+                    hidden_states,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
+        # This fused operator is A3-specific. Preserve the pre-fusion equation
+        # and exact rounded FP32 router input on A5 or when the op is absent.
         normalized = self.post_attention_layernorm(hidden_states)
         return normalized, normalized.float()
 
