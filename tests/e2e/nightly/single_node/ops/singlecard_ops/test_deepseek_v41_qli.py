@@ -285,6 +285,9 @@ def test_model_indexer_mixed_batch(ratio, zero_first):
     )
     obj = _indexer(ratio)
     options = dict(candidate_topk_blocks=64, candidate_block_size=8)
+    candidate_lengths = torch.empty(
+        (sum(qlens), 1), dtype=torch.int32, device="npu"
+    )
     out, candidates = obj.select_projected(
         query.npu(),
         weights.npu(),
@@ -294,10 +297,15 @@ def test_model_indexer_mixed_batch(ratio, zero_first):
         is_candidate_source=True,
         uses_candidate_filter=False,
         candidates=None,
+        candidate_lengths=candidate_lengths,
         **options,
     )
     assert out.shape == (sum(qlens), 128)
     assert candidates.shape == (sum(qlens), 1, 64)
+    torch.testing.assert_close(
+        candidate_lengths,
+        (candidates >= 0).sum(-1).to(torch.int32),
+    )
     for i, (start, end) in enumerate(zip(starts[:-1], starts[1:])):
         q, qs = _quant_query_reference(query[start:end])
         k = parts[i][1][: lengths[i]]
@@ -319,6 +327,7 @@ def test_model_indexer_mixed_batch(ratio, zero_first):
         is_candidate_source=False,
         uses_candidate_filter=True,
         candidates=candidates,
+        candidate_lengths=candidate_lengths,
         **options,
     )
     assert retained is candidates
