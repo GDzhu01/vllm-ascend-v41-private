@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import torch
-from vllm.config import CUDAGraphMode, CompilationConfig
+from vllm.config import CompilationConfig, CUDAGraphMode
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.sampling_params import SamplingParams
@@ -26,10 +26,26 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from tests.deepseek_v41_cache_utils import make_cache_config
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
+from vllm_ascend.core.deepseek_v41 import DeepseekV41SWASpec
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.utils import AscendDeviceType
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import (
+    NPUModelRunner,
+    _needs_engram_block_table_cpu,
+)
+
+
+def test_only_v41_swa_groups_need_engram_cpu_block_tables():
+    swa = object.__new__(DeepseekV41SWASpec)
+    uniform_swa = UniformTypeKVCacheSpecs(
+        block_size=128,
+        kv_cache_specs={"model.layers.0.self_attn.swa_cache": swa},
+    )
+
+    assert _needs_engram_block_table_cpu(swa)
+    assert _needs_engram_block_table_cpu(uniform_swa)
+    assert not _needs_engram_block_table_cpu(object())
 
 
 class TestAttentionMetadataViewCache(unittest.TestCase):
@@ -46,6 +62,7 @@ class TestAttentionMetadataViewCache(unittest.TestCase):
         runner._offload_req_ids_tensor = None
         runner._offload_token_to_req = None
         runner.device = torch.device("cpu")
+        runner.ascend_config = SimpleNamespace(enable_engram=True)
         runner.model_config = SimpleNamespace(enable_return_routed_experts=False)
         runner.query_start_loc = SimpleNamespace(
             gpu=torch.arange(9, dtype=torch.int32),
@@ -72,7 +89,13 @@ class TestAttentionMetadataViewCache(unittest.TestCase):
             num_computed_tokens_cpu_tensor=torch.zeros(8, dtype=torch.int32),
             num_prompt_tokens_cpu_tensor=torch.ones(8, dtype=torch.int32),
         )
-        runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())])
+        runner.kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    kv_cache_spec=object.__new__(DeepseekV41SWASpec)
+                )
+            ]
+        )
         return runner, block_table
 
     def _build_until_metadata(self, runner, mode):

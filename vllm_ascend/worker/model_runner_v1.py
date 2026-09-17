@@ -140,6 +140,7 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.core.circular_buffer import is_circular_spec
 from vllm_ascend.core.deepseek_v41 import (
+    DeepseekV41SWASpec,
     is_v41_spec,
     plan_cache_slots,
     reshape_cache,
@@ -329,6 +330,18 @@ class _A5SlotMappingBatch:
     group_ids: torch.Tensor
 
 
+def _needs_engram_block_table_cpu(kv_cache_spec: KVCacheSpec) -> bool:
+    """Return whether this group owns the target model's SWA history pages."""
+    specs = tuple(
+        kv_cache_spec.kv_cache_specs.values()
+        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs)
+        else (kv_cache_spec,)
+    )
+    return bool(specs) and all(
+        isinstance(spec, DeepseekV41SWASpec) for spec in specs
+    )
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Must be set before super().__init__() because parent init may call
@@ -353,7 +366,7 @@ class NPUModelRunner(GPUModelRunner):
         ] = {}
         self._attention_group_view_cache: dict[
             tuple[int, int, int, int],
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
         ] = {}
         self._a5_slot_mapping_layouts: tuple[_A5SlotMappingLayout, ...] = ()
         self._a5_slot_mapping_batches: tuple[_A5SlotMappingBatch, ...] = ()
@@ -3350,6 +3363,10 @@ class NPUModelRunner(GPUModelRunner):
                 else None
             )
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
+            needs_block_table_cpu = (
+                self.ascend_config.enable_engram
+                and _needs_engram_block_table_cpu(kv_cache_spec)
+            )
             if cached_views is None:
                 if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
                     blk_table_tensor = torch.zeros(
@@ -3362,16 +3379,16 @@ class NPUModelRunner(GPUModelRunner):
                         dtype=torch.int64,
                         device=self.device,
                     )
-                    block_table_cpu = torch.zeros(
-                        (num_reqs_padded, 1),
-                        dtype=torch.int32,
-                        device="cpu",
-                    )
+                    block_table_cpu = None
                 else:
                     blk_table = self.input_batch.block_table[kv_cache_gid]
                     slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
                     blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]
-                    block_table_cpu = blk_table.get_cpu_tensor()[:num_reqs_padded]
+                    block_table_cpu = (
+                        blk_table.get_cpu_tensor()[:num_reqs_padded]
+                        if needs_block_table_cpu
+                        else None
+                    )
                 cached_views = (blk_table_tensor, slot_mapping, block_table_cpu)
                 if reuse_metadata_views:
                     self._attention_group_view_cache[cache_key] = cached_views
@@ -3654,7 +3671,7 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 block_table_cpu = block_table_cpu_gid_0
             cm.block_table_cpu = block_table_cpu
-            if not isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+            if block_table_cpu is not None:
                 if num_reqs < num_reqs_padded:
                     # Match the device padding without modifying an H2D source
                     # that may still be in flight.
