@@ -62,12 +62,18 @@ def test_source_roles_and_engram_slots(text_config: dict):
 def test_shared_state_resets_sparse_attention_metadata():
     topk_indices = torch.zeros((4, 1, 512), dtype=torch.int32)
     candidates = torch.zeros((4, 1, 16), dtype=torch.int32)
-    state = DeepseekV41SharedAttentionState(topk_indices, candidates)
+    topk_lengths = torch.zeros((4, 1), dtype=torch.int32)
+    state = DeepseekV41SharedAttentionState(
+        topk_indices,
+        candidates,
+        topk_lengths=topk_lengths,
+    )
 
     state.reset()
 
     assert state.topk_indices is topk_indices
     assert state.candidates is candidates
+    assert state.topk_lengths is topk_lengths
 
 
 def test_rejects_ratio_mismatch(text_config: dict):

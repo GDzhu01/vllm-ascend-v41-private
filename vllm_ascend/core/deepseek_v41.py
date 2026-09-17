@@ -14,6 +14,25 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSl
 
 STATE_RING_ROWS = 32
 
+A5_CMP_LOGICAL_DIM = 512
+A5_CMP_QUANT_GROUP_SIZE = 16
+A5_CMP_DATA_BYTES = A5_CMP_LOGICAL_DIM // 2
+A5_CMP_SCALE_COUNT = A5_CMP_LOGICAL_DIM // A5_CMP_QUANT_GROUP_SIZE
+A5_CMP_SCALE_OFFSET_BYTES = A5_CMP_DATA_BYTES
+A5_CMP_ROW_BYTES = A5_CMP_DATA_BYTES + A5_CMP_SCALE_COUNT * torch.bfloat16.itemsize
+
+A5_WIN_LOGICAL_DIM = 512
+A5_WIN_QUANT_GROUP_SIZE = 32
+A5_WIN_DATA_BYTES = A5_WIN_LOGICAL_DIM
+A5_WIN_SCALE_COUNT = A5_WIN_LOGICAL_DIM // A5_WIN_QUANT_GROUP_SIZE
+A5_WIN_SCALE_OFFSET_BYTES = A5_WIN_DATA_BYTES
+A5_WIN_ROW_BYTES = A5_WIN_DATA_BYTES + A5_WIN_SCALE_COUNT * torch.bfloat16.itemsize
+
+A5_INDEX_LOGICAL_DIM = 128
+A5_INDEX_QUANT_GROUP_SIZE = 32
+A5_INDEX_DATA_BYTES = A5_INDEX_LOGICAL_DIM // 2
+A5_INDEX_SCALE_COUNT = A5_INDEX_LOGICAL_DIM // A5_INDEX_QUANT_GROUP_SIZE
+
 
 @dataclass(frozen=True, kw_only=True)
 class DeepseekV41FullSpec(AscendMLAAttentionSpec):
@@ -40,11 +59,88 @@ class DeepseekV41IndexerSpec(AscendMLAAttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class DeepseekV41A5CompressedSpec(DeepseekV41FullSpec):
+    """A5 compressed KV row: MXFP4 payload followed by BF16 scales."""
+
+    logical_head_size: int = A5_CMP_LOGICAL_DIM
+    quant_group_size: int = A5_CMP_QUANT_GROUP_SIZE
+    scale_offset_bytes: int = A5_CMP_SCALE_OFFSET_BYTES
+
+    @property
+    def storage_block_size(self) -> int:
+        # The packaged QLI/QSMLA ABI now accepts the cache's actual PA page
+        # size.  A ratio-2 source therefore stores the 64 completed rows from
+        # each 128-token scheduler block in that block's own physical page.
+        return self.block_size // self.compress_ratio
+
+    def __post_init__(self):
+        if (
+            self.dtype != torch.uint8
+            or self.block_size != 128
+            or self.num_kv_heads != 1
+            or self.head_size != A5_CMP_ROW_BYTES
+            or self.logical_head_size != A5_CMP_LOGICAL_DIM
+            or self.quant_group_size != A5_CMP_QUANT_GROUP_SIZE
+            or self.scale_dim != 0
+            or self.scale_dtype != torch.bfloat16
+            or self.scale_offset_bytes != A5_CMP_SCALE_OFFSET_BYTES
+        ):
+            raise ValueError("A5 cmp_kv requires one U8[320] row: FP4/16 payload plus 32 embedded BF16 scales")
+
+
+@dataclass(frozen=True, kw_only=True)
+class DeepseekV41A5IndexerSpec(DeepseekV41IndexerSpec):
+    """A5 index K: MXFP4 data and E8M0 scales in separate U8 planes."""
+
+    logical_head_size: int = A5_INDEX_LOGICAL_DIM
+    quant_group_size: int = A5_INDEX_QUANT_GROUP_SIZE
+
+    @property
+    def storage_block_size(self) -> int:
+        return self.block_size // self.compress_ratio
+
+    def __post_init__(self):
+        if (
+            self.dtype != torch.uint8
+            or self.block_size != 128
+            or self.num_kv_heads != 1
+            or self.head_size != A5_INDEX_DATA_BYTES
+            or self.logical_head_size != A5_INDEX_LOGICAL_DIM
+            or self.quant_group_size != A5_INDEX_QUANT_GROUP_SIZE
+            or self.scale_dim != A5_INDEX_SCALE_COUNT
+            or self.scale_dtype != torch.uint8
+        ):
+            raise ValueError("A5 index K requires MXFP4 U8[64] data plus E8M0 U8[4] scales")
+
+
+@dataclass(frozen=True, kw_only=True)
 class DeepseekV41SWASpec(AscendSlidingWindowMLASpec):
     def is_uniform_with_collection(self, specs):
         return all(
             isinstance(s, DeepseekV41SWASpec) and s.sliding_window == self.sliding_window for s in specs.values()
         )
+
+
+@dataclass(frozen=True, kw_only=True)
+class DeepseekV41A5SWASpec(DeepseekV41SWASpec):
+    """A5 window KV row: FP8 payload followed by BF16 group scales."""
+
+    logical_head_size: int = A5_WIN_LOGICAL_DIM
+    quant_group_size: int = A5_WIN_QUANT_GROUP_SIZE
+    scale_dtype: torch.dtype = torch.bfloat16
+    scale_offset_bytes: int = A5_WIN_SCALE_OFFSET_BYTES
+
+    def __post_init__(self):
+        if (
+            self.dtype != torch.uint8
+            or self.num_kv_heads != 1
+            or self.head_size != A5_WIN_ROW_BYTES
+            or self.logical_head_size != A5_WIN_LOGICAL_DIM
+            or self.quant_group_size != A5_WIN_QUANT_GROUP_SIZE
+            or self.scale_dtype != torch.bfloat16
+            or self.scale_offset_bytes != A5_WIN_SCALE_OFFSET_BYTES
+        ):
+            raise ValueError("A5 win_kv requires one U8[544] row: FP8/32 payload plus 16 embedded BF16 scales")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -62,6 +158,41 @@ class DeepseekV41DraftSWASpec(AscendSlidingWindowMLASpec):
             and s.sliding_window == self.sliding_window
             for s in specs.values()
         )
+
+
+@dataclass(frozen=True, kw_only=True)
+class DeepseekV41A5DraftSWASpec(AscendSlidingWindowMLASpec):
+    """DSpark SWA in the A5 MQSMLA FP8/32 plus BF16-scale row format."""
+
+    logical_head_size: int = A5_WIN_LOGICAL_DIM
+    quant_group_size: int = A5_WIN_QUANT_GROUP_SIZE
+    scale_dtype: torch.dtype = torch.bfloat16
+    scale_offset_bytes: int = A5_WIN_SCALE_OFFSET_BYTES
+
+    def __post_init__(self):
+        if (
+            self.dtype != torch.uint8
+            or self.num_kv_heads != 1
+            or self.head_size != A5_WIN_ROW_BYTES
+            or self.logical_head_size != A5_WIN_LOGICAL_DIM
+            or self.quant_group_size != A5_WIN_QUANT_GROUP_SIZE
+            or self.scale_dtype != torch.bfloat16
+            or self.scale_offset_bytes != A5_WIN_SCALE_OFFSET_BYTES
+            or self.compress_ratio != 1
+        ):
+            raise ValueError("A5 DSpark win_kv requires one U8[544] row: FP8/32 payload plus 16 embedded BF16 scales")
+
+    def is_uniform_with_collection(self, specs):
+        return all(
+            isinstance(s, DeepseekV41A5DraftSWASpec)
+            and s.block_size == self.block_size
+            and s.sliding_window == self.sliding_window
+            for s in specs.values()
+        )
+
+
+def is_v41_draft_swa_spec(spec):
+    return isinstance(spec, (DeepseekV41DraftSWASpec, DeepseekV41A5DraftSWASpec))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -85,9 +216,33 @@ def is_v41_spec(spec):
             DeepseekV41IndexerSpec,
             DeepseekV41SWASpec,
             DeepseekV41DraftSWASpec,
+            DeepseekV41A5DraftSWASpec,
             DeepseekV41CompressorStateSpec,
         ),
     )
+
+
+def get_dsv41_config(vllm_config):
+    """Read the two V4.1 choices needed before Ascend config initialization."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    raw = additional.get("dsv41_config", {}) if isinstance(additional, dict) else {}
+    if isinstance(raw, dict):
+        return {
+            "cache_format": raw.get("cache_format", "a3_bf16"),
+            "compressor": raw.get("compressor", "triton"),
+        }
+    return {
+        "cache_format": getattr(raw, "cache_format", "a3_bf16"),
+        "compressor": getattr(raw, "compressor", "triton"),
+    }
+
+
+def uses_a5_packed_cache(vllm_config):
+    return get_dsv41_config(vllm_config)["cache_format"] == "a5_packed"
+
+
+def uses_a5_mqsmla_draft(vllm_config):
+    return uses_a5_packed_cache(vllm_config)
 
 
 def _uniform(members, label):
@@ -148,7 +303,7 @@ def plan_cache_slots(specs):
     full = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41FullSpec)), key=_layer_number)
     state = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41CompressorStateSpec)), key=_layer_number)
     swa = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41SWASpec)), key=_layer_number)
-    draft = sorted((n for n, s in specs.items() if isinstance(s, DeepseekV41DraftSWASpec)), key=_draft_layer_number)
+    draft = sorted((n for n, s in specs.items() if is_v41_draft_swa_spec(s)), key=_draft_layer_number)
     if draft and list(map(_draft_layer_number, draft)) != [0, 1, 2]:
         raise ValueError("Aurora DSpark requires exactly three ordered draft layers: mtp.0, mtp.1, mtp.2")
     if list(map(_layer_number, full)) != [2, 8, 14, 20]:
@@ -183,9 +338,13 @@ def plan_cache_slots(specs):
             swa_spec = specs[swa[slot_idx]]
             if (
                 draft_spec.block_size != swa_spec.block_size
-                or draft_spec.head_size != swa_spec.head_size
+                or getattr(draft_spec, "logical_head_size", draft_spec.head_size)
+                != getattr(swa_spec, "logical_head_size", swa_spec.head_size)
                 or draft_spec.sliding_window != swa_spec.sliding_window
                 or sum(_cache_plane_sizes(draft_spec)) > capacity
+                or (
+                    isinstance(draft_spec, DeepseekV41A5DraftSWASpec) and not isinstance(swa_spec, DeepseekV41A5SWASpec)
+                )
             ):
                 raise ValueError("Aurora DSpark geometry must match target SWA and fit its existing slot")
             aliases.append(draft_name)
@@ -217,7 +376,7 @@ def group_cache_specs(specs):
         _uniform({n: padded[n] for n in swa[start : start + len(slots)]}, f"swa{start}")
         for start in range(0, len(swa), len(slots))
     )
-    draft = sorted((n for n, s in padded.items() if isinstance(s, DeepseekV41DraftSWASpec)), key=_draft_layer_number)
+    draft = sorted((n for n, s in padded.items() if is_v41_draft_swa_spec(s)), key=_draft_layer_number)
     if draft:
         groups.append(_uniform({n: padded[n] for n in draft}, "dspark"))
     return groups
@@ -349,8 +508,4 @@ def validate_cache_runtime(vllm_config):
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         raise ValueError("V4.1 requires the hybrid KV cache manager")
     if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16"):
-        raise NotImplementedError("V4.1 initial cache layout requires BF16")
-    if speculative is not None:
-        # Aurora's planes are always BF16. Pin the inherited DSV4 draft
-        # backend to the same layout, including on hardware where auto is FP8.
-        vllm_config.cache_config.cache_dtype = "bfloat16"
+        raise NotImplementedError("V4.1 cache setup accepts only auto or bfloat16 requests")

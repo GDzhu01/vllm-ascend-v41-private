@@ -30,6 +30,7 @@ from vllm_ascend.ascend_config import (
     AscendCompilationConfig,
     AscendConfig,
     AscendFusionConfig,
+    DeepseekV41Config,
     DynamicSpecConfig,
     DyntraLBConfig,
     EplbConfig,
@@ -105,6 +106,26 @@ class TestRlConfig(TestBase):
         self.assertFalse(config.sleep_mode_extra_cleanup)
         with self.assertRaises(ValueError):
             RlConfig(refresh=False)  # type: ignore[call-arg]
+
+
+class TestDeepseekV41Config(TestBase):
+    def test_minimal_production_configuration(self):
+        defaults = DeepseekV41Config()
+        a5 = DeepseekV41Config(
+            cache_format="a5_packed",
+            compressor="compressor_v2",
+        )
+
+        self.assertEqual(defaults.cache_format, "a3_bf16")
+        self.assertEqual(defaults.compressor, "triton")
+        self.assertEqual(a5.cache_format, "a5_packed")
+        self.assertEqual(a5.compressor, "compressor_v2")
+
+    def test_invalid_rollout_mode_fails_schema_validation(self):
+        with self.assertRaises(ValueError):
+            DeepseekV41Config(cache_format="a5_int8")  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            DeepseekV41Config(compressor="reference")  # type: ignore[arg-type]
 
 
 class TestAscendConfig(TestBase):

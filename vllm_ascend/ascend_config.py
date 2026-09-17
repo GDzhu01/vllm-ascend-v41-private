@@ -223,6 +223,20 @@ class RlConfig:
 
 
 @config
+class DeepseekV41Config:
+    """DeepSeek V4.1 cache layout and the one intentional A5 kernel choice.
+
+    A3 keeps its existing path.  A5 uses the qualified production operators
+    directly; only the ring compressor remains selectable because
+    CompressorV2 and the Triton implementation have different speculative
+    rollback semantics.
+    """
+
+    cache_format: Literal["a3_bf16", "a5_packed"] = "a3_bf16"
+    compressor: Literal["compressor_v2", "triton"] = "triton"
+
+
+@config
 class AscendConfig:
     """Configuration Object for additional_config from vllm.configs.
 
@@ -306,6 +320,10 @@ class AscendConfig:
                 "enable_training_consistency": false,
                 "enable_batch_invariant": false
             },
+            "dsv41_config": {
+                "cache_format": "a3_bf16",
+                "compressor": "triton"
+            },
             "xlite_graph_config": {
                 "enabled": false,
                 "full_mode": false
@@ -388,7 +406,7 @@ class AscendConfig:
     # Enable the V4.1 node-sharded Engram path.
     enable_engram: bool = True
     # V4.1 node-sharded Engram storage; BF16 output and projections are unchanged.
-    engram_storage: Literal["bf16", "int8", "fp8", "mxfp8"] = "bf16"
+    engram_storage: Literal["bf16", "int8", "fp8", "mxfp8", "mxfp8_hbm"] = "bf16"
     multistream_dsv4_dsa_overlap: bool = True
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
@@ -434,6 +452,7 @@ class AscendConfig:
     eplb_config: EplbConfig = dataclasses.field(default_factory=EplbConfig)
     rejection_sampler_config: RejectionSamplerConfig = dataclasses.field(default_factory=RejectionSamplerConfig)
     rl_config: RlConfig = dataclasses.field(default_factory=RlConfig)
+    dsv41_config: DeepseekV41Config = dataclasses.field(default_factory=DeepseekV41Config)
 
     # ---- sub-configs declared later in this module ----
     # Lambdas defer class lookup until construction, after module initialization.
