@@ -32,6 +32,90 @@ from vllm_ascend.utils import AscendDeviceType
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
+class TestAttentionMetadataViewCache(unittest.TestCase):
+    class _MetadataConstructed(Exception):
+        pass
+
+    def _build_runner(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.dcp_size = 1
+        runner.sparse_kv_offload_enabled = False
+        runner.device_metadata_executor = None
+        runner._attention_common_view_cache = {}
+        runner._attention_group_view_cache = {}
+        runner._offload_req_ids_tensor = None
+        runner._offload_token_to_req = None
+        runner.device = torch.device("cpu")
+        runner.model_config = SimpleNamespace(enable_return_routed_experts=False)
+        runner.query_start_loc = SimpleNamespace(
+            gpu=torch.arange(9, dtype=torch.int32),
+            cpu=torch.arange(9, dtype=torch.int32),
+        )
+        runner.seq_lens = torch.arange(8, dtype=torch.int32)
+        runner.optimistic_seq_lens_cpu = torch.arange(1, 9, dtype=torch.int32)
+        runner.positions = torch.arange(32, dtype=torch.int64)
+        runner.group_len = SimpleNamespace(gpu=torch.arange(8, dtype=torch.int32))
+        runner.group_key_idx = SimpleNamespace(gpu=torch.arange(8, dtype=torch.int32))
+        runner.group_key_cache_idx = SimpleNamespace(gpu=torch.arange(8, dtype=torch.int32))
+        runner.actual_seq_lengths_q = None
+        runner.attn_state = None
+        runner.decode_token_per_req = 1
+        runner.use_async_spec_decode = False
+        runner.is_mm_prefix_lm = False
+
+        block_table = MagicMock()
+        block_table.slot_mapping.gpu = torch.arange(32, dtype=torch.int64)
+        block_table.get_device_tensor.return_value = torch.arange(32, dtype=torch.int32).view(8, 4)
+        block_table.get_cpu_tensor.return_value = torch.arange(32, dtype=torch.int32).view(8, 4)
+        runner.input_batch = SimpleNamespace(
+            block_table=[block_table],
+            num_computed_tokens_cpu_tensor=torch.zeros(8, dtype=torch.int32),
+            num_prompt_tokens_cpu_tensor=torch.ones(8, dtype=torch.int32),
+        )
+        runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())])
+        return runner, block_table
+
+    def _build_until_metadata(self, runner, mode):
+        with patch(
+            "vllm_ascend.worker.model_runner_v1.AscendCommonAttentionMetadata",
+            side_effect=self._MetadataConstructed,
+        ) as metadata_cls, self.assertRaises(self._MetadataConstructed):
+            runner._build_attention_metadata(
+                num_tokens=2,
+                num_reqs=2,
+                max_query_len=1,
+                num_tokens_padded=4,
+                num_reqs_padded=4,
+                cudagraph_runtime_mode=mode,
+            )
+        return metadata_cls.call_args.kwargs
+
+    def test_full_graph_reuses_stable_tensor_views(self):
+        runner, block_table = self._build_runner()
+
+        first = self._build_until_metadata(runner, CUDAGraphMode.FULL)
+        second = self._build_until_metadata(runner, CUDAGraphMode.FULL)
+
+        self.assertIs(first["query_start_loc"], second["query_start_loc"])
+        self.assertIs(first["seq_lens"], second["seq_lens"])
+        self.assertIs(first["block_table_tensor"], second["block_table_tensor"])
+        self.assertIs(first["slot_mapping"], second["slot_mapping"])
+        self.assertIs(first["positions"], runner.positions)
+        block_table.get_device_tensor.assert_called_once_with()
+        block_table.get_cpu_tensor.assert_called_once_with()
+
+    def test_eager_mode_rebuilds_tensor_views(self):
+        runner, block_table = self._build_runner()
+
+        first = self._build_until_metadata(runner, CUDAGraphMode.NONE)
+        second = self._build_until_metadata(runner, CUDAGraphMode.NONE)
+
+        self.assertIsNot(first["query_start_loc"], second["query_start_loc"])
+        self.assertIsNot(first["block_table_tensor"], second["block_table_tensor"])
+        self.assertEqual(block_table.get_device_tensor.call_count, 2)
+        self.assertEqual(block_table.get_cpu_tensor.call_count, 2)
+
+
 class TestDummyRunSlotInvalidation(unittest.TestCase):
     def test_padded_speculative_dummy_preserves_logical_query_lengths(self):
         # DSA CP rounds 186 tokens to 192 without adding a logical request.
