@@ -13,7 +13,10 @@ import torch
 def _get_sparse_flash_mla_ops() -> tuple[Callable, Callable]:
     """Load SparseFlashMla operators without importing vllm_ascend.ops."""
     try:
-        import_module("cann_ops_transformer")
+        # cann_ops_transformer exposes attention operators lazily. Import the
+        # concrete module so its OpBuilder registers both torch schemas before
+        # looking them up in the namespace.
+        import_module("cann_ops_transformer.ops.attention.sparse_flash_mla")
         namespace = torch.ops.cann_ops_transformer
         return namespace.sparse_flash_mla, namespace.sparse_flash_mla_metadata
     except (ImportError, AttributeError) as exc:

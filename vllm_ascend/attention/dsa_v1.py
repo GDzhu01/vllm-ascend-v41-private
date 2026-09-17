@@ -21,6 +21,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_attn_kv_plan import (
+    copy_vllm_config_with_kv_cache_dtype,
     get_dsa_attn_kv_plan,
     is_a5_bf16_kv_enabled,
 )
@@ -134,9 +135,13 @@ def _dsa_layout_kv(vllm_config: VllmConfig) -> str:
 
 
 def _dsa_swa_only_cmp_ratio(compress_ratio: int, vllm_config: VllmConfig) -> int:
-    """BF16 SWA-only attention takes no compressed stream; otherwise keep main's value."""
-    if is_a5_bf16_kv_enabled(vllm_config) and compress_ratio <= 1:
-        return 0
+    """Return a valid ratio even when the BF16 draft has no compressed KV.
+
+    SparseFlashMla uses ``has_cmp_kv`` to disable the compressed stream, while
+    its ``cmp_ratio`` attribute must remain in [1, 128].  Zero was accepted by
+    the old draft adapter during graph capture but is rejected by the packaged
+    operator when real decode metadata is consumed.
+    """
     return max(compress_ratio, 1)
 
 
@@ -284,6 +289,7 @@ class AscendDSAReqMetadata:
     ori_win_left: int | None = None
     ori_win_right: int | None = None
     dspark_swa_indices: torch.Tensor | None = None
+    dspark_swa_lengths: torch.Tensor | None = None
     vision_swa_indices: torch.Tensor | None = None
 
 
@@ -350,17 +356,22 @@ def build_dspark_swa_indices(
     num_decode_tokens: int | None = None,
     index_width: int | None = None,
     indices_output: torch.Tensor | None = None,
+    lengths_output: torch.Tensor | None = None,
     buffer: torch.Tensor | None = None,
     *,
     use_logical_indices: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build DSpark non-causal visible slot ids for a paged SWA cache.
+    """Build DSpark non-causal visible indices for a paged SWA cache.
 
     Each token in a draft block sees the trailing context window plus the
     whole current draft block. Invalid/padded rows get lens=0 and -1 slots.
     ``use_logical_indices`` returns positions within each sequence for
     SparseFlashMLA, which applies its own block-table lookup. The default
     preserves physical slots for existing DSA callers.
+
+    ``PA_BBND`` SparseFlashMla expects request-local token positions and maps
+    them through ``ori_block_table`` inside the kernel. Other DSA backends keep
+    the historical physical-slot representation.
 
     When ``buffer`` is given, the per-token slots are copied into its leading
     rows and the returned tensor is a slice view of ``buffer``. This keeps the
@@ -392,7 +403,8 @@ def build_dspark_swa_indices(
         slot_ids = pos.to(torch.int32)
     else:
         block_nums = pos // block_size
-        # Clamp out-of-range columns before gathering; col_mask discards them.
+        # Clamp to valid block-table columns so gather never goes OOB on the
+        # out-of-range columns (their results are discarded by col_mask anyway).
         safe_nums = block_nums.clamp(min=0, max=int(block_table.shape[1]) - 1)
         block_offsets = pos % block_size
         block_ids = torch.gather(block_table, 1, safe_nums)
@@ -400,7 +412,12 @@ def build_dspark_swa_indices(
     slot_ids = slot_ids.where(col_mask, torch.full_like(slot_ids, -1))
 
     per_token_slots = torch.repeat_interleave(slot_ids, query_lens, dim=0, output_size=num_decode_tokens).unsqueeze(1)
-    per_token_lens = torch.repeat_interleave(visible_lens, query_lens, dim=0, output_size=num_decode_tokens)
+    per_token_lens = torch.repeat_interleave(
+        visible_lens,
+        query_lens,
+        dim=0,
+        output_size=num_decode_tokens,
+    ).unsqueeze(1)
 
     if indices_output is not None:
         if indices_output.shape != per_token_slots.shape:
@@ -410,6 +427,15 @@ def build_dspark_swa_indices(
             )
         indices_output.copy_(per_token_slots)
         per_token_slots = indices_output
+
+    if lengths_output is not None:
+        if lengths_output.shape != per_token_lens.shape:
+            raise ValueError(
+                "DSpark SWA lengths output shape does not match active metadata: "
+                f"output={tuple(lengths_output.shape)}, active={tuple(per_token_lens.shape)}"
+            )
+        lengths_output.copy_(per_token_lens)
+        per_token_lens = lengths_output
 
     if buffer is not None:
         # Copy the freshly built indices into the caller-provided buffer and hand
@@ -526,6 +552,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         metadata_cls: type[AscendDSAMetadata] | None = None,
         supports_dcp_with_varlen: bool = False,
     ):
+        # Attention builders are created from the engine's target VllmConfig,
+        # even for a separately registered DSpark cache group.  Select the
+        # operator plan from this group's concrete cache spec without changing
+        # the target model's packed-cache configuration.
+        if kv_cache_spec.dtype == torch.bfloat16:
+            vllm_config = copy_vllm_config_with_kv_cache_dtype(vllm_config, "bfloat16")
         self.kv_cache_spec = kv_cache_spec
         self.metadata_cls = metadata_cls if metadata_cls is not None else AscendDSAMetadata
         self.vllm_config = vllm_config
@@ -538,6 +570,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.decode_threshold = 1
         self.spec_slot_mapping = None
         self.dspark_swa_indices_buffer: torch.Tensor | None = None
+        self.dspark_swa_lengths_buffer: torch.Tensor | None = None
         if get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION) and not is_a5_bf16_kv_enabled(
             vllm_config
         ):
@@ -569,6 +602,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             )
             self.dspark_swa_indices_buffer = torch.zeros(
                 (max_dspark_rows, 1, _dspark_index_width),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.dspark_swa_lengths_buffer = torch.zeros(
+                (max_dspark_rows, 1),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -912,6 +950,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             dtype=torch.int32,
             device=self.device,
         )
+        self.dspark_swa_lengths_buffer = torch.empty(
+            (max_num_tokens, 1),
+            dtype=torch.int32,
+            device=self.device,
+        )
 
     def take_device_metadata_tasks(self) -> tuple[DeviceMetadataTask, ...]:
         tasks = self._device_metadata_tasks
@@ -952,6 +995,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         cu_seqlens_ori_kv = None
         cu_seqlens_cmp_kv = None
         dspark_swa_indices = None
+        dspark_swa_lengths = None
         vision_swa_indices = None
         ori_win_left, ori_win_right = self.model_config.hf_config.sliding_window - 1, 0
         if not has_prefill and not common_attn_metadata.causal:
@@ -961,7 +1005,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             # current step's block table / sequence lengths, so they must be
             # rebuilt whenever a DSpark draft step runs.
             assert self.speculative_config is not None
-            dspark_swa_indices, _ = build_dspark_swa_indices(
+            dspark_swa_indices, dspark_swa_lengths = build_dspark_swa_indices(
                 self.block_table[: self.num_decodes],
                 self.speculative_config.num_speculative_tokens,
                 self.model_config.hf_config.sliding_window,
@@ -969,7 +1013,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 query_start_loc[: self.num_decodes + 1],
                 self.seq_lens[: self.num_decodes],
                 self.num_decode_tokens,
+                lengths_output=(
+                    self.dspark_swa_lengths_buffer[: self.num_decode_tokens]
+                    if self.dspark_swa_lengths_buffer is not None
+                    else None
+                ),
                 buffer=self.dspark_swa_indices_buffer,
+                use_logical_indices=_dsa_layout_kv(self.vllm_config) == "PA_BBND",
             )
             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
         # Text-only requests and lightweight metadata fixtures do not carry
@@ -1102,6 +1152,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             ori_win_left=ori_win_left,
             ori_win_right=ori_win_right,
             dspark_swa_indices=dspark_swa_indices,
+            dspark_swa_lengths=dspark_swa_lengths,
             vision_swa_indices=vision_swa_indices,
         )
         if self._device_metadata_enabled and self.compressor_metadata_buffers is not None:
@@ -1198,6 +1249,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         has_prefill = self.num_prefills > 0
 
         dspark_swa_indices = None
+        dspark_swa_lengths = None
         build_dspark_swa = None
         ori_win_left = self.model_config.hf_config.sliding_window - 1
         ori_win_right = 0
@@ -1223,12 +1275,24 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                         f"active={self.num_actual_tokens}, capacity={self.dspark_swa_indices_buffer.shape[0]}"
                     )
                 dspark_swa_indices = self.dspark_swa_indices_buffer[: self.num_actual_tokens]
+                if self.dspark_swa_lengths_buffer is None:
+                    raise RuntimeError(
+                        "DSpark device metadata lengths buffer must be initialized before draft attention"
+                    )
+                dspark_swa_lengths = self.dspark_swa_lengths_buffer[: self.num_actual_tokens]
+                use_logical_indices = _dsa_layout_kv(self.vllm_config) == "PA_BBND"
                 build_dspark_swa = lambda: build_dspark_swa_indices(
                     *dspark_swa_args,
                     indices_output=dspark_swa_indices,
+                    lengths_output=dspark_swa_lengths,
+                    use_logical_indices=use_logical_indices,
                 )
             else:
-                dspark_swa_indices, _ = build_dspark_swa_indices(*dspark_swa_args)
+                use_logical_indices = _dsa_layout_kv(self.vllm_config) == "PA_BBND"
+                dspark_swa_indices, dspark_swa_lengths = build_dspark_swa_indices(
+                    *dspark_swa_args,
+                    use_logical_indices=use_logical_indices,
+                )
                 dspark_swa_indices = dspark_swa_indices[: self.num_actual_tokens]
             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
 
@@ -1269,7 +1333,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
                 batch_size=num_reqs,
-                cmp_ratio=1,
+                ori_topk=(dspark_swa_indices.shape[-1] if dspark_swa_indices is not None else 0),
+                ori_topk_length=dspark_swa_lengths,
+                cmp_ratio=_dsa_swa_only_cmp_ratio(0, self.vllm_config),
                 ori_mask_mode=4,
                 cmp_mask_mode=3,
                 ori_win_left=ori_win_left,
@@ -1320,6 +1386,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             ori_win_left=ori_win_left,
             ori_win_right=ori_win_right,
             dspark_swa_indices=dspark_swa_indices,
+            dspark_swa_lengths=dspark_swa_lengths,
         )
 
     def build_for_graph_capture(
@@ -2095,6 +2162,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         if self.compress_ratio <= 1:
             if swa_req_metadata.dspark_swa_indices is not None:
                 attn_kwargs["ori_sparse_indices"] = swa_req_metadata.dspark_swa_indices
+                attn_kwargs["ori_topk_length"] = swa_req_metadata.dspark_swa_lengths
         else:
             assert compressor_metadata is not None
             attn_kwargs.update(

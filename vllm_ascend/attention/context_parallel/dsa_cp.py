@@ -604,6 +604,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 query_start_loc[: num_reqs + 1],
                 self.seq_lens[:num_reqs],
                 self.num_actual_tokens,
+                use_logical_indices=_dsa_layout_kv(self.vllm_config) == "PA_BBND",
             )
             pad_rows = num_tokens_pad - global_dspark_indices.shape[0]
             if pad_rows < 0:

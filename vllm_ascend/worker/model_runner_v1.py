@@ -3079,9 +3079,21 @@ class NPUModelRunner(GPUModelRunner):
         num_encoder_reqs: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
-        # A stateful P/D handoff can use a uniform decode graph even at
-        # prompt_len - 1 computed tokens. Keep first-token prefills out.
-        has_initial_state = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
+        # An active request is still in prefill until all of its prompt tokens
+        # are computed.  Checking only ``computed > 0`` misclassifies chunked
+        # prefills, and ``np.all`` over an idle DP rank is vacuously true.  The
+        # prompt boundary is the authoritative host-side discriminator.
+        computed_tokens = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        prompt_tokens = getattr(self.input_batch, "num_prompt_tokens", None)
+        has_initial_state = num_reqs > 0 and np.all(computed_tokens > 0)
+        has_uncomputed_prompt = (
+            num_reqs > 0
+            and prompt_tokens is not None
+            and np.any(computed_tokens < prompt_tokens[:num_reqs])
+        )
+        prefill_batch = force_uniform_decode is None and (
+            has_uncomputed_prompt or (num_reqs > 0 and not has_initial_state)
+        )
         uniform_decode = (
             (
                 has_initial_state
@@ -3103,7 +3115,11 @@ class NPUModelRunner(GPUModelRunner):
 
         # ruff: noqa: E731
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
-            if force_eager:
+            # FULL_DECODE_ONLY keys are valid only after every request owns
+            # target-model state.  Relying on ``uniform_decode=False`` alone
+            # is insufficient because padding can make an initial prefill's
+            # descriptor collide with a captured decode size.
+            if force_eager or prefill_batch:
                 return (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
 
             return self.cudagraph_dispatcher.dispatch(

@@ -236,6 +236,78 @@ class TestDummyRunSlotInvalidation(unittest.TestCase):
             runner._dummy_run(2, cudagraph_runtime_mode=CUDAGraphMode.FULL, is_graph_capturing=True)
 
 
+def test_first_token_prefill_never_dispatches_a_decode_graph(monkeypatch):
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.dp_size = 1
+    runner.parallel_config = SimpleNamespace(
+        data_parallel_size=1,
+        data_parallel_rank=0,
+        tensor_parallel_size=1,
+    )
+    runner.vllm_config = SimpleNamespace(
+        parallel_config=runner.parallel_config,
+        observability_config=SimpleNamespace(cudagraph_metrics=False),
+    )
+    runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+    runner.uniform_decode_query_len = 6
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.array([0], dtype=np.int32),
+        num_prompt_tokens=np.array([17], dtype=np.int32),
+        lora_id_to_lora_request={},
+    )
+    runner.cudagraph_dispatcher = MagicMock()
+    monkeypatch.setattr(runner, "_pad_for_sequence_parallelism", lambda tokens: tokens)
+    monkeypatch.setattr("vllm_ascend.worker.model_runner_v1.enable_sp", lambda *_: False)
+
+    mode, descriptor, _, _, _ = runner._determine_batch_execution_and_padding(
+        num_tokens=17,
+        num_reqs=1,
+        num_scheduled_tokens_np=np.array([17], dtype=np.int32),
+        max_num_scheduled_tokens=17,
+        use_cascade_attn=False,
+    )
+
+    assert mode == CUDAGraphMode.NONE
+    assert descriptor.num_tokens == 17
+    runner.cudagraph_dispatcher.dispatch.assert_not_called()
+
+
+def test_partial_prefill_never_dispatches_a_decode_graph(monkeypatch):
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.dp_size = 1
+    runner.parallel_config = SimpleNamespace(
+        data_parallel_size=1,
+        data_parallel_rank=0,
+        tensor_parallel_size=1,
+    )
+    runner.vllm_config = SimpleNamespace(
+        parallel_config=runner.parallel_config,
+        observability_config=SimpleNamespace(cudagraph_metrics=False),
+    )
+    runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+    runner.uniform_decode_query_len = 6
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.array([12], dtype=np.int32),
+        num_prompt_tokens=np.array([17], dtype=np.int32),
+        lora_id_to_lora_request={},
+    )
+    runner.cudagraph_dispatcher = MagicMock()
+    monkeypatch.setattr(runner, "_pad_for_sequence_parallelism", lambda tokens: tokens)
+    monkeypatch.setattr("vllm_ascend.worker.model_runner_v1.enable_sp", lambda *_: False)
+
+    mode, descriptor, _, _, _ = runner._determine_batch_execution_and_padding(
+        num_tokens=5,
+        num_reqs=1,
+        num_scheduled_tokens_np=np.array([5], dtype=np.int32),
+        max_num_scheduled_tokens=5,
+        use_cascade_attn=False,
+    )
+
+    assert mode == CUDAGraphMode.NONE
+    assert descriptor.num_tokens == 5
+    runner.cudagraph_dispatcher.dispatch.assert_not_called()
+
+
 class TestDeviceMetadataFullGraphEvents(unittest.TestCase):
     def test_full_mode_requires_external_events(self):
         for mode, uses_external_events, should_raise in (

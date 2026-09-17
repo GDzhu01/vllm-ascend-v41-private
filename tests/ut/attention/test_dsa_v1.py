@@ -42,6 +42,7 @@ from vllm_ascend.attention.dsa_v1 import (
     AscendDSAMetadata,
     AscendDSAMetadataBuilder,
     AscendDSAReqMetadata,
+    _dsa_swa_only_cmp_ratio,
     build_compressor_metadata_out,
     build_vision_bidirectional_swa_indices,
 )
@@ -60,6 +61,14 @@ from vllm_ascend.worker.v2.pcp_manager import (
     AscendPCPAttentionContext,
     AscendPCPManager,
 )
+
+
+def test_swa_only_cmp_ratio_stays_valid_without_compressed_kv():
+    config = cast(Any, SimpleNamespace())
+
+    assert _dsa_swa_only_cmp_ratio(0, config) == 1
+    assert _dsa_swa_only_cmp_ratio(1, config) == 1
+    assert _dsa_swa_only_cmp_ratio(4, config) == 4
 
 
 def test_build_vision_bidirectional_swa_indices():
@@ -126,6 +135,7 @@ def _make_vllm_config(num_speculative_tokens: int | None = None) -> SimpleNamesp
     )
     return SimpleNamespace(
         model_config=model_config,
+        cache_config=SimpleNamespace(cache_dtype="auto"),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=16,
             max_num_seqs=4,
@@ -145,6 +155,7 @@ def _make_kv_cache_spec(compressor_ratio: int) -> SimpleNamespace:
         compress_ratio=compressor_ratio,
         block_size=physical_block_size * logical_compress_ratio,
         storage_block_size=physical_block_size,
+        dtype=torch.bfloat16 if compressor_ratio <= 1 else torch.float8_e4m3fn,
     )
 
 
@@ -243,6 +254,10 @@ def test_draft_swa_and_sas_share_attention_task():
         task[0].run()
 
         first_indices = metadata.dspark_swa_indices.clone()
+        assert torch.equal(first_indices[0, 0, :10], torch.arange(10, dtype=torch.int32))
+        assert torch.equal(first_indices[3, 0, :14], torch.arange(14, dtype=torch.int32))
+        assert metadata.dspark_swa_lengths.shape == (6, 1)
+        assert torch.equal(metadata.dspark_swa_lengths[:, 0], torch.tensor([10, 10, 10, 14, 14, 14]))
         next_metadata = _build_draft_req_metadata(
             builder,
             torch.tensor([12], dtype=torch.int32),
