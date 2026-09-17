@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
@@ -159,3 +160,45 @@ class TestAscendW4A8MXFP4MoEMethod(TestBase):
             shared_experts_input=None,
         )
         mock_comm.fused_experts.assert_called_once()
+
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4.dispose_tensor")
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4.torch_npu")
+    def test_apply_gmm1_act_quant_defaults_to_two_stage(self, mock_npu, _mock_dispose):
+        layer = SimpleNamespace(w13_weight=Mock(), w13_weight_scale=Mock())
+        mlp_input = SimpleNamespace(
+            hidden_states=torch.randn(4, self.hidden_size, dtype=torch.bfloat16),
+            dynamic_scale=None,
+            layer=layer,
+            activation="silu",
+            group_list=torch.tensor([4], dtype=torch.int64),
+            group_list_type=0,
+            swiglu_limit=7.0,
+            swiglu_alpha=1.25,
+            swiglu_beta=0.5,
+        )
+        quantized_input = torch.randn(4, self.hidden_size)
+        input_scale = torch.randn(4, 2)
+        gmm_output = torch.randn(4, self.intermediate_size * 2, dtype=torch.bfloat16)
+        activated = torch.randn(4, self.intermediate_size, dtype=torch.bfloat16)
+        expected_output = torch.randn(4, self.intermediate_size)
+        expected_scale = torch.randn(4, 4)
+        mock_npu.npu_grouped_matmul.return_value = [gmm_output]
+        mock_npu.npu_clipped_swiglu.return_value = activated
+        mock_npu.npu_dynamic_mx_quant.return_value = (expected_output, expected_scale)
+
+        with patch.object(self.scheme, "_quant_hidden_states", return_value=(quantized_input, input_scale)):
+            output, scale = self.scheme.apply_gmm1_act_quant(mlp_input)
+
+        self.assertIs(output, expected_output)
+        self.assertEqual(scale.shape, (4, 2, 2))
+        mock_npu.npu_clipped_swiglu.assert_called_once_with(
+            gmm_output,
+            interleaved=False,
+            alpha=1.25,
+            limit=7.0,
+            bias=0.5,
+        )
+        mock_npu.npu_dynamic_mx_quant.assert_called_once_with(
+            activated,
+            dst_type=torch.float8_e4m3fn,
+        )

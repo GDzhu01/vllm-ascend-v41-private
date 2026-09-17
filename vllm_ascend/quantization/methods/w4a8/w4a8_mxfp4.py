@@ -29,6 +29,7 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import build_fused_expert
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 from vllm_ascend.ops.fused_moe.moe_utils import cumsum_group_list, maybe_normalize_mxfp_scale_layout
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
+from vllm_ascend.ops.project_ops import get_project_op
 from vllm_ascend.utils import FP8_METHOD, dispose_tensor
 
 from ..base import (
@@ -233,6 +234,7 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             dispose_tensor(mlp_compute_input.hidden_states)
             return hidden_states, maybe_normalize_mxfp_scale_layout(swiglu_out_scale)
 
+        group_list = cumsum_group_list(mlp_compute_input.group_list, mlp_compute_input.group_list_type, 0)
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w13_weight],
@@ -243,20 +245,37 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             per_token_scale_dtype=torch_npu.float8_e8m0fnu,
             split_item=2,
             group_type=0,
-            group_list=cumsum_group_list(mlp_compute_input.group_list, mlp_compute_input.group_list_type, 0),
+            group_list=group_list,
             x_dtype=torch.float8_e4m3fn,
             weight_dtype=torch_npu.float4_e2m1fn_x2,
             output_dtype=torch.bfloat16,
         )[0]
         dispose_tensor(mlp_compute_input.hidden_states)
-        hidden_states, out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
-            hidden_states,
-            topk_weight=None,
-            group_index=None,
-            dst_type=torch.float8_e4m3fn,
-            quant_mode=2,
-            clamp_value=mlp_compute_input.swiglu_limit,
-        )
+        if mlp_compute_input.swiglu_alpha != 1.0 or mlp_compute_input.swiglu_beta != 0.0:
+            # SwigluGroupQuant's public ABI exposes the clamp but not the OAI
+            # alpha/bias tuning knobs. Preserve uncommon non-DS configurations.
+            hidden_states = torch_npu.npu_clipped_swiglu(
+                hidden_states,
+                interleaved=False,
+                alpha=mlp_compute_input.swiglu_alpha,
+                limit=mlp_compute_input.swiglu_limit,
+                bias=mlp_compute_input.swiglu_beta,
+            )
+            hidden_states, out_scale = torch_npu.npu_dynamic_mx_quant(
+                hidden_states,
+                dst_type=torch.float8_e4m3fn,
+            )
+        else:
+            hidden_states, out_scale, _ = get_project_op("npu_swiglu_group_quant")(
+                hidden_states,
+                topk_weight=None,
+                # The A3 operator accepts only count-style group_index here;
+                # the final cumulative value is the number of valid GMM rows.
+                group_index=group_list[-1:],
+                dst_type=torch.float8_e4m3fn,
+                quant_mode=2,
+                clamp_value=mlp_compute_input.swiglu_limit,
+            )
         return hidden_states, maybe_normalize_mxfp_scale_layout(out_scale)
 
     def apply_gmm1(self, mlp_compute_input: MoEMlpComputeInput):

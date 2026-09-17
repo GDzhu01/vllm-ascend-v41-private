@@ -628,12 +628,11 @@ def test_routing_replay_disabled_keeps_ascend_routing_unchanged(monkeypatch):
 
 @pytest.mark.parametrize("hidden_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("input_dtype", [torch.int32, torch.int64])
-def test_hash_router_preserves_fp32_weights_and_explicit_input_ids(monkeypatch, hidden_dtype, input_dtype):
+def test_hash_router_reference_is_pure_torch(monkeypatch, hidden_dtype, input_dtype):
     input_ids = torch.tensor([0, 22], dtype=input_dtype)
     hidden_states = torch.randn(2, 4, dtype=hidden_dtype)
     router_logits = torch.randn(2, 4)
-    topk_weights = torch.randn(2, 2)
-    topk_ids = torch.zeros(2, 2, dtype=torch.int32)
+    tid2eid = torch.tensor([[0, 1]] * 32, dtype=torch.int32)
     prepare_finalize = SimpleNamespace(all_gather_input_id_with_dp_group=MagicMock(side_effect=lambda value: value))
     monkeypatch.setattr(
         fused_topk_router_module,
@@ -643,11 +642,11 @@ def test_hash_router_preserves_fp32_weights_and_explicit_input_ids(monkeypatch, 
             moe_comm_method=SimpleNamespace(prepare_finalize=prepare_finalize),
         ),
     )
-    hash_op = MagicMock(return_value=(topk_weights, topk_ids, None))
+    legacy_op = MagicMock()
     monkeypatch.setattr(
         fused_topk_router_module.torch.ops._C_ascend,
         "moe_gating_top_k_hash",
-        hash_op,
+        legacy_op,
         raising=False,
     )
     router = AscendFusedTopKRouter(
@@ -656,7 +655,7 @@ def test_hash_router_preserves_fp32_weights_and_explicit_input_ids(monkeypatch, 
         num_expert_group=1,
         topk_group=1,
         scoring_func="sqrtsoftplus",
-        tid2eid=torch.ones(32, 4, dtype=torch.int32),
+        tid2eid=tid2eid,
     )
 
     routed_experts = _build_routing_replay_experts(router, None)
@@ -670,16 +669,76 @@ def test_hash_router_preserves_fp32_weights_and_explicit_input_ids(monkeypatch, 
         input_ids=input_ids,
     )
 
-    assert weights is topk_weights
+    expected_weights, expected_ids = fused_topk_router_module.select_deepseek_v4_vision_experts(
+        router_logits=router_logits,
+        input_ids=input_ids.to(torch.int64),
+        tid2eid=tid2eid,
+        bias_vl=None,
+        text_bias=None,
+        top_k=2,
+        renormalize=True,
+    )
     assert weights.dtype == torch.float32
-    assert ids is topk_ids
-    torch.testing.assert_close(hash_op.call_args.kwargs["input_ids"], input_ids.to(torch.int64))
-    if input_dtype == torch.int64:
-        assert hash_op.call_args.kwargs["input_ids"] is input_ids
+    torch.testing.assert_close(weights, expected_weights)
+    torch.testing.assert_close(ids, expected_ids.to(torch.int32))
+    legacy_op.assert_not_called()
     prepare_finalize.all_gather_input_id_with_dp_group.assert_called_once()
 
     with pytest.raises(ValueError, match="hash MoE routing requires input_ids"):
         router._compute_routing(hidden_states, router_logits, torch.int32)
+
+
+def test_hash_router_native_uses_packaged_a5_operator(monkeypatch):
+    input_ids = torch.tensor([11, 22], dtype=torch.int32)
+    hidden_states = torch.randn(2, 4)
+    router_logits = torch.randn(2, 4)
+    tid2eid = torch.ones(32, 2, dtype=torch.int32)
+    topk_weights = torch.randn(2, 2)
+    topk_ids = torch.zeros(2, 2, dtype=torch.int32)
+    prepare_finalize = SimpleNamespace(all_gather_input_id_with_dp_group=MagicMock(side_effect=lambda value: value))
+    monkeypatch.setattr(
+        fused_topk_router_module,
+        "_EXTRA_CTX",
+        SimpleNamespace(
+            moe_comm_type=MoECommType.ALLGATHER,
+            moe_comm_method=SimpleNamespace(prepare_finalize=prepare_finalize),
+        ),
+    )
+    packaged_op = MagicMock(return_value=(topk_weights, topk_ids))
+    a3_op = MagicMock()
+    monkeypatch.setattr(
+        fused_topk_router_module,
+        "select_deepseek_v4_hash_experts_native",
+        packaged_op,
+    )
+    monkeypatch.setattr(
+        fused_topk_router_module.torch.ops._C_ascend,
+        "moe_gating_top_k_hash",
+        a3_op,
+        raising=False,
+    )
+    router = AscendFusedTopKRouter(
+        top_k=2,
+        global_num_experts=4,
+        num_expert_group=1,
+        topk_group=1,
+        scoring_func="sqrtsoftplus",
+        tid2eid=tid2eid,
+    )
+
+    weights, ids = router._compute_routing(
+        hidden_states,
+        router_logits,
+        torch.int32,
+        input_ids=input_ids,
+    )
+
+    assert weights is topk_weights
+    assert ids is topk_ids
+    kwargs = packaged_op.call_args.kwargs
+    torch.testing.assert_close(kwargs["input_ids"], input_ids.to(torch.int64))
+    assert kwargs["tid2eid"] is tid2eid
+    a3_op.assert_not_called()
 
 
 def test_vision_router_fuses_bias_and_image_sentinel(monkeypatch):
@@ -699,12 +758,11 @@ def test_vision_router_fuses_bias_and_image_sentinel(monkeypatch):
             moe_comm_method=SimpleNamespace(prepare_finalize=prepare_finalize),
         ),
     )
-    hash_op = MagicMock(return_value=(topk_weights, topk_ids, None))
+    native_op = MagicMock(return_value=(topk_weights, topk_ids))
     monkeypatch.setattr(
-        fused_topk_router_module.torch.ops._C_ascend,
-        "moe_gating_top_k_hash",
-        hash_op,
-        raising=False,
+        fused_topk_router_module,
+        "select_deepseek_v4_vision_experts_native",
+        native_op,
     )
     router = AscendFusedTopKRouter(
         top_k=2,
@@ -724,14 +782,17 @@ def test_vision_router_fuses_bias_and_image_sentinel(monkeypatch):
         input_ids=input_ids,
     )
 
-    kwargs = hash_op.call_args.kwargs
+    kwargs = native_op.call_args.kwargs
     assert weights is topk_weights
     assert ids.dtype == torch.int64
-    assert kwargs["bias"] is text_bias
+    assert kwargs["text_bias"] is text_bias
     assert kwargs["bias_vl"].dtype == router_logits.dtype
-    torch.testing.assert_close(kwargs["input_ids"], input_ids.to(torch.int64))
+    # bias_vl-only V4.1 routing uses IDs solely for the sentinel mask, so the
+    # optimized path keeps the model's INT32 IDs and avoids a Copy launch.
+    torch.testing.assert_close(kwargs["input_ids"], input_ids)
     assert kwargs["image_sentinel_lo"] == 129257
-    assert kwargs["image_sentinel_count"] == 5
+    assert kwargs["k_group"] == 1
+    assert kwargs["group_count"] == 1
 
 
 def test_hash_router_chunks_unaligned_input_ids_for_sequence_parallel(monkeypatch):
@@ -751,12 +812,11 @@ def test_hash_router_chunks_unaligned_input_ids_for_sequence_parallel(monkeypatc
     )
     sequence_parallel_chunk = MagicMock(side_effect=lambda value: value[:2].clone())
     monkeypatch.setattr(fused_topk_router_module, "sequence_parallel_chunk", sequence_parallel_chunk)
-    hash_op = MagicMock(return_value=(topk_weights, topk_ids, None))
+    reference = MagicMock(return_value=(topk_weights, topk_ids))
     monkeypatch.setattr(
-        fused_topk_router_module.torch.ops._C_ascend,
-        "moe_gating_top_k_hash",
-        hash_op,
-        raising=False,
+        fused_topk_router_module,
+        "select_deepseek_v4_vision_experts",
+        reference,
     )
     router = AscendFusedTopKRouter(
         top_k=2,
@@ -777,7 +837,7 @@ def test_hash_router_chunks_unaligned_input_ids_for_sequence_parallel(monkeypatc
     assert weights is topk_weights
     assert ids is topk_ids
     torch.testing.assert_close(
-        hash_op.call_args.kwargs["input_ids"],
+        reference.call_args.kwargs["input_ids"],
         input_ids[:2].to(torch.int64),
     )
     pad_and_split_input_ids.assert_called_once()

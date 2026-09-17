@@ -30,6 +30,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.lora.fused_moe import has_lora
+from vllm_ascend.ops.project_ops import get_project_op
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
     npu_stream_switch,
@@ -376,14 +377,28 @@ class AscendSharedExperts:
                         activate_left=True,
                         dst_type=SITU_MX_DST_TYPE_E4M3FN,
                     )
-                else:
-                    quantized_x, swiglu_out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
+                elif self.swiglu_alpha == 1.0 and self.swiglu_beta == 0.0:
+                    quantized_x, swiglu_out_scale, _ = get_project_op("npu_swiglu_group_quant")(
                         hidden_states,
                         topk_weight=None,
                         group_index=None,
                         dst_type=torch.float8_e4m3fn,
                         quant_mode=2,
                         clamp_value=self.swiglu_limit,
+                    )
+                else:
+                    # The fused ABI has no alpha/bias attributes. Keep the
+                    # exact two-stage equation for non-DS configurations.
+                    activated = torch_npu.npu_clipped_swiglu(
+                        hidden_states,
+                        interleaved=False,
+                        alpha=self.swiglu_alpha,
+                        limit=self.swiglu_limit,
+                        bias=self.swiglu_beta,
+                    )
+                    quantized_x, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(
+                        activated,
+                        dst_type=torch.float8_e4m3fn,
                     )
                 maybe_wait_event(down_projection_ready)
                 shared_out = self.layer.down_proj((quantized_x, swiglu_out_scale))[0]
