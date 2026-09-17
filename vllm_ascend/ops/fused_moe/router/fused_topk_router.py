@@ -28,7 +28,7 @@ DEEPSEEK_V4_IMAGE_SENTINEL_BASE_ID = 129257
 DEEPSEEK_V4_IMAGE_SENTINEL_COUNT = 5
 
 
-def select_deepseek_v4_vision_experts(
+def select_deepseek_v4_vision_experts_native(
     router_logits: torch.Tensor,
     input_ids: torch.Tensor,
     tid2eid: torch.Tensor | None,
@@ -38,41 +38,87 @@ def select_deepseek_v4_vision_experts(
     renormalize: bool,
     routed_scaling_factor: float = 1.0,
     image_sentinel_lo: int = DEEPSEEK_V4_IMAGE_SENTINEL_BASE_ID,
+    k_group: int = 1,
+    group_count: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select text experts and apply the vision route to image rows.
+    """Run the CANN 9.2 packaged hash/VL operator with checkpoint semantics.
 
-    DeepSeek-V4 vision checkpoints borrow five consecutive in-vocabulary
-    sentinel ids for IMAGE_START..IMAGE_END. Text rows retain the deterministic
-    ``tid2eid`` lookup used by the text-only model, while image rows use the
-    checkpoint's ``bias_vl`` with the sqrt-softplus router scores.
+    The packaged ``additional_token_mask`` selects the per-row correction
+    bias, but it does not override a supplied ``tid2eid`` hash table.  Image
+    sentinel rows therefore need a separate dynamic route.  Match
+    The vision route needs one dynamic call and, for hash layers, one hash
+    call, then merge the image rows without a host synchronization.
     """
-    scores = torch.nn.functional.softplus(router_logits).sqrt()
+    if not renormalize:
+        raise ValueError("custom npu_moe_gating_top_k always normalizes sqrt-softplus weights")
+    import custom_ops  # noqa: F401, PLC0415  # Registers torch.ops.custom.*.
+
     image_hi = image_sentinel_lo + DEEPSEEK_V4_IMAGE_SENTINEL_COUNT
     image_mask = (input_ids >= image_sentinel_lo) & (input_ids < image_hi)
-    row_bias = torch.where(
-        image_mask.unsqueeze(-1),
-        bias_vl.to(scores.dtype).unsqueeze(0),
-        (text_bias.to(scores.dtype).unsqueeze(0) if text_bias is not None else torch.zeros_like(scores)),
+    common = dict(
+        k_group=k_group,
+        group_count=group_count,
+        routed_scaling_factor=routed_scaling_factor,
+        eps=1e-20,
+        group_select_mode=1,
+        renorm=0,
+        norm_type=2,
+        out_flag=False,
     )
-    dynamic_ids = torch.topk(
-        scores + row_bias,
-        k=top_k,
-        dim=-1,
-        sorted=True,
-    ).indices
+    dynamic_weights, dynamic_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
+        router_logits,
+        top_k,
+        bias=text_bias,
+        additional_bias=bias_vl,
+        additional_token_mask=image_mask,
+        **common,
+    )
     if tid2eid is None:
-        topk_ids = dynamic_ids
+        topk_weights, topk_ids = dynamic_weights, dynamic_ids
     else:
-        lookup_ids = torch.where(image_mask, 0, input_ids)
-        text_ids = tid2eid[lookup_ids].to(torch.int64)
-        topk_ids = torch.where(image_mask.unsqueeze(-1), dynamic_ids, text_ids)
-    topk_weights = scores.gather(1, topk_ids)
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
-            torch.finfo(topk_weights.dtype).tiny
+        hash_weights, hash_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
+            router_logits,
+            top_k,
+            bias=text_bias,
+            input_ids=input_ids,
+            tid2eid=tid2eid,
+            additional_bias=bias_vl,
+            additional_token_mask=image_mask,
+            **common,
         )
-    if routed_scaling_factor != 1.0:
-        topk_weights = topk_weights * routed_scaling_factor
+        topk_weights = torch.where(image_mask.unsqueeze(-1), dynamic_weights, hash_weights)
+        topk_ids = torch.where(image_mask.unsqueeze(-1), dynamic_ids, hash_ids)
+    return topk_weights, topk_ids
+
+
+def select_deepseek_v4_hash_experts_native(
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None,
+    tid2eid: torch.Tensor | None,
+    text_bias: torch.Tensor | None,
+    top_k: int,
+    routed_scaling_factor: float = 1.0,
+    k_group: int = 1,
+    group_count: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the packaged A5 TopK operator for text-only/hash routing."""
+    import custom_ops  # noqa: F401, PLC0415  # Registers torch.ops.custom.*.
+
+    topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
+        router_logits,
+        top_k,
+        bias=text_bias,
+        input_ids=input_ids,
+        tid2eid=tid2eid,
+        k_group=k_group,
+        group_count=group_count,
+        routed_scaling_factor=routed_scaling_factor,
+        eps=1e-20,
+        group_select_mode=1,
+        renorm=0,
+        norm_type=2,
+        out_flag=False,
+    )
     return topk_weights, topk_ids
 
 
@@ -161,7 +207,11 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                     raise ValueError("DeepSeek V4 vision/hash MoE routing requires input_ids.")
                 # The model sanitizes placeholder IDs once before layer-local
                 # communication, which only pads with zeros or shards IDs.
-                input_ids = input_ids.to(torch.int64)
+                # tid2eid lookup requires the packaged hash ABI's INT64 IDs.
+                # A V4.1 bias_vl-only route consumes IDs only in the external
+                # sentinel mask, so preserve INT32 and avoid a Copy launch.
+                if self.tid2eid is not None:
+                    input_ids = input_ids.to(torch.int64)
                 tid2eid_ones = self.tid2eid.to(torch.int32) if self.tid2eid is not None else None
                 if _EXTRA_CTX.moe_comm_type == MoECommType.ALLGATHER:
                     prepare_finalize = _EXTRA_CTX.moe_comm_method.prepare_finalize
@@ -183,26 +233,31 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
             text_bias = self.e_score_correction_bias
             if text_bias is not None and text_bias.dtype != router_logits.dtype:
                 text_bias = text_bias.to(router_logits.dtype)
-            topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
-                x=router_logits,
-                k=self.top_k,
-                bias=text_bias,
-                input_ids=input_ids,
-                tid2eid=tid2eid_ones,
-                bias_vl=bias_vl,
-                k_group=topk_group,
-                group_count=num_expert_group,
-                routed_scaling_factor=self.routed_scaling_factor,
-                eps=1e-20,
-                group_select_mode=1,
-                # The hash custom op currently rejects renorm != 0. Apply
-                # norm_topk_prob in Python below before returning to MoE compute.
-                renorm=0,
-                norm_type=2,
-                out_flag=False,
-                image_sentinel_lo=self.image_sentinel_lo,
-                image_sentinel_count=DEEPSEEK_V4_IMAGE_SENTINEL_COUNT,
-            )
+            if bias_vl is None:
+                topk_weights, topk_ids = select_deepseek_v4_hash_experts_native(
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                    tid2eid=tid2eid_ones,
+                    text_bias=text_bias,
+                    top_k=self.top_k,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                    k_group=topk_group,
+                    group_count=num_expert_group,
+                )
+            else:
+                topk_weights, topk_ids = select_deepseek_v4_vision_experts_native(
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                    tid2eid=tid2eid_ones,
+                    bias_vl=bias_vl,
+                    text_bias=text_bias,
+                    top_k=self.top_k,
+                    renormalize=self.renormalize,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                    image_sentinel_lo=self.image_sentinel_lo,
+                    k_group=topk_group,
+                    group_count=num_expert_group,
+                )
             return topk_weights.to(torch.float32), topk_ids.to(torch.int32 if indices_type is None else indices_type)
         norm_type = 0 if self.scoring_func == "softmax" else 1
         if self.e_score_correction_bias is not None and self.e_score_correction_bias.dtype != router_logits.dtype:
