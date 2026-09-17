@@ -55,6 +55,7 @@ from vllm_ascend.ops.rope_dsv4 import (
     get_full_cos_and_sin_dsa_for_layer,
 )
 from vllm_ascend.ops.triton.a5_slot_mapping import build_a5_slot_mapping
+from vllm_ascend.ops.triton.c2_ring_metadata import build_c2_ring_metadata
 from vllm_ascend.utils import npu_stream_switch
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
@@ -1397,15 +1398,44 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                 full_source_cos, full_source_sin = self._c2_full_source_rope
             else:
                 full_source_cos = full_source_sin = None
+            skip_ring_update = bool(kwargs.get("skip_ring_state_update", False))
 
             def build_c2_metadata() -> None:
+                if (
+                    self._uses_a5_packed_cache
+                    and full_source_cos is not None
+                    and full_source_sin is not None
+                ):
+                    build_c2_ring_metadata(
+                        common.query_start_loc,
+                        seq_lens,
+                        input_positions,
+                        common.block_table_tensor,
+                        full_source_cos,
+                        full_source_sin,
+                        num_reqs,
+                        num_input_tokens,
+                        num_actual_reqs,
+                        num_actual_tokens,
+                        skip_update=skip_ring_update,
+                        ring_metadata_output=ring_meta,
+                        complete_mask_output=self._c2_complete_mask[
+                            :num_input_tokens
+                        ],
+                        source_positions_output=self._c2_source_positions[
+                            :num_input_tokens
+                        ],
+                        cos_output=self._c2_source_cos[:num_input_tokens],
+                        sin_output=self._c2_source_sin[:num_input_tokens],
+                    )
+                    return
                 starts = common.query_start_loc[:num_reqs].int()
                 ends = common.query_start_loc[1 : num_reqs + 1].int()
                 query_lens = ends - starts
                 live = torch.arange(num_reqs, device=starts.device) < num_actual_reqs
                 used = (ends.clamp_max(num_actual_tokens) - starts).clamp_min(0)
                 used = torch.where(live, used, 0)
-                if kwargs.get("skip_ring_state_update", False):
+                if skip_ring_update:
                     used = torch.zeros_like(used)
                 ring_meta[0].copy_((seq_lens - query_lens).clamp_min(0))
                 ring_meta[1].copy_(used)
@@ -1415,7 +1445,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                 valid_end = common.query_start_loc[num_actual_reqs].clamp_max(num_actual_tokens)
                 valid = torch.arange(num_input_tokens, device=input_positions.device) < valid_end
                 complete = (input_positions.remainder(2) == 1) & valid
-                if kwargs.get("skip_ring_state_update", False):
+                if skip_ring_update:
                     complete = torch.zeros_like(complete)
                 self._c2_complete_mask[:num_input_tokens].copy_(complete)
                 self._c2_source_positions[:num_input_tokens].copy_(
