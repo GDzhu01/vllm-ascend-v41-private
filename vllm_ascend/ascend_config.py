@@ -406,7 +406,9 @@ class AscendConfig:
     # Enable the V4.1 node-sharded Engram path.
     enable_engram: bool = True
     # V4.1 node-sharded Engram storage; BF16 output and projections are unchanged.
-    engram_storage: Literal["bf16", "int8", "fp8", "mxfp8", "mxfp8_hbm"] = "bf16"
+    engram_storage: Literal[
+        "bf16", "int8", "fp8", "mxfp8", "mxfp8_hbm", "mxfp8_elastic"
+    ] = "bf16"
     multistream_dsv4_dsa_overlap: bool = True
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False

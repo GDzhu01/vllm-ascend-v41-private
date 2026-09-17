@@ -3,6 +3,7 @@
 """Node-local Engram storage, independent of model TP."""
 
 import json
+import logging
 import socket
 from collections import OrderedDict
 from pathlib import Path
@@ -17,6 +18,23 @@ from vllm_ascend.ops.triton.engram_int8 import gather_dequantize_engram_int8
 _OFFLOAD_BUFFER_CACHE_SIZE = 8
 _OFFLOAD_BUFFER_BYTES_LIMIT = 512 * 1024 * 1024
 _BF16_BYTES = 2
+_MX_GROUP_SIZE = 32
+_E8M0_ONE_BITS = 127
+
+logger = logging.getLogger(__name__)
+
+
+def _get_elastic_buffer_cls():
+    # Keep the optional ops-transformer dependency lazy: legacy Engram modes
+    # and CPU-only unit tests must not JIT-load its torch extension.  The
+    # package's root initializer discovers every bundled operator, so use the
+    # targeted loader to avoid compiling unrelated C++ glue at model startup.
+    from vllm_ascend.ops.dsv41_a5.package_loader import import_packaged_a5_module
+
+    module = import_packaged_a5_module(
+        "cann_ops_transformer.ops.mc2.common.elastic_buffer"
+    )
+    return module.ElasticBuffer
 
 
 def quantize_engram_rows(rows):
@@ -117,15 +135,28 @@ class NodeShardedEngram(nn.Module):
 
     def __init__(self, rows, width, query_group, device=None, storage_format="bf16"):
         super().__init__()
-        if storage_format not in ("bf16", "int8", "fp8", "mxfp8", "mxfp8_hbm"):
+        if storage_format not in (
+            "bf16",
+            "int8",
+            "fp8",
+            "mxfp8",
+            "mxfp8_hbm",
+            "mxfp8_elastic",
+        ):
             raise ValueError(
                 "Engram storage_format must be bf16, int8, fp8, mxfp8, "
-                "or mxfp8_hbm"
+                "mxfp8_hbm, or mxfp8_elastic"
             )
-        if storage_format in ("int8", "fp8", "mxfp8", "mxfp8_hbm") and width % 32:
+        if storage_format in (
+            "int8",
+            "fp8",
+            "mxfp8",
+            "mxfp8_hbm",
+            "mxfp8_elastic",
+        ) and width % 32:
             raise ValueError("INT8 Engram requires a width divisible by 32")
-        if storage_format == "mxfp8_hbm" and (width // 32) % 2:
-            raise ValueError("MXFP8 HBM Engram requires an even number of group32 scales")
+        if storage_format in ("mxfp8_hbm", "mxfp8_elastic") and (width // 32) % 2:
+            raise ValueError("MXFP8 Engram requires an even number of group32 scales")
         self.storage_format = storage_format
         self.rows, self.width = rows, width
         self.query_group = query_group
@@ -143,6 +174,7 @@ class NodeShardedEngram(nn.Module):
         self._offload_events = {}
         # Ceil partition leaves at most size-1 unused rows, never a replica.
         self.shard_rows = (rows + query_group.size - 1) // query_group.size
+        self.padded_rows = self.shard_rows * query_group.size
         self.start = query_group.rank * self.shard_rows
         self.end = min(self.start + self.shard_rows, rows)
         if self.start >= rows:
@@ -153,7 +185,9 @@ class NodeShardedEngram(nn.Module):
         self._empty_metadata = torch.zeros(query_group.size + 1, dtype=torch.int64, device="cpu")
         self.weight = nn.Parameter(
             torch.empty(
-                self.end - self.start,
+                self.shard_rows
+                if storage_format == "mxfp8_elastic"
+                else self.end - self.start,
                 width,
                 dtype=(
                     torch.int8
@@ -163,12 +197,16 @@ class NodeShardedEngram(nn.Module):
                         if storage_format == "mxfp8_hbm"
                         else (
                             torch.float8_e4m3fn
-                            if storage_format in ("fp8", "mxfp8")
+                            if storage_format in ("fp8", "mxfp8", "mxfp8_elastic")
                             else torch.bfloat16
                         )
                     )
                 ),
-                device=(torch.device("cpu") if storage_format in ("fp8", "mxfp8") else device),
+                device=(
+                    torch.device("cpu")
+                    if storage_format in ("fp8", "mxfp8", "mxfp8_elastic")
+                    else device
+                ),
                 pin_memory=False,
             ),
             requires_grad=False,
@@ -200,6 +238,27 @@ class NodeShardedEngram(nn.Module):
                     dtype=torch.uint8,
                     device=device,
                 ),
+            )
+        elif storage_format == "mxfp8_elastic":
+            # ElasticBuffer shards the large FP8 payload in CPU memory, while
+            # deliberately keeping the much smaller E8M0 table replicated on
+            # every NPU. One E8M0 byte covers 32 FP8 values, so this spends
+            # only 1/32 of the full payload size in HBM and lets EngramFetch
+            # transfer payload bytes only. The fetch kernel gathers scales by
+            # global row ID from this table without another remote transfer.
+            self.register_buffer(
+                "weight_scale",
+                torch.empty(
+                    self.padded_rows,
+                    width // _MX_GROUP_SIZE,
+                    dtype=torch.float8_e8m0fnu,
+                    device=device,
+                ),
+            )
+            self.elastic_buffer = None
+            self.elastic_cpu_payload_bytes = self.shard_rows * width
+            self.elastic_hbm_scale_bytes = self.padded_rows * (
+                width // _MX_GROUP_SIZE
             )
 
     def set_rows(self, start, rows):
@@ -329,6 +388,64 @@ class NodeShardedEngram(nn.Module):
             if tensor.get_shape() != [self.rows, self.width]:
                 raise ValueError(f"{key}: expected BF16/FP8 [{self.rows}, {self.width}]")
             source_dtype = tensor.get_dtype()
+            if self.storage_format == "mxfp8_elastic":
+                if source_dtype not in ("F8_E4M3", "F8_E4M3FN") or scale_key not in index:
+                    raise ValueError(f"{key}: mxfp8_elastic requires FP8 weight and .scale")
+                with safe_open(root / index[scale_key], framework="pt", device="cpu") as sf:
+                    scale = sf.get_slice(scale_key)
+                    if (
+                        scale.get_shape() != [self.rows, self.width // 32]
+                        or scale.get_dtype() != "F8_E8M0"
+                    ):
+                        raise ValueError(
+                            f"{scale_key}: expected E8M0 [{self.rows}, {self.width // 32}]"
+                        )
+
+                    # ElasticBuffer maps global row r to
+                    # owner=r//shard_rows, local=r%shard_rows. All ranks must
+                    # expose the same shard_rows, so pad only the final rank.
+                    self.weight.data.view(torch.uint8).zero_()
+                    scale_bits = self.weight_scale.view(torch.uint8)
+                    scale_bits.fill_(_E8M0_ONE_BITS)
+                    for start in range(self.start, self.end, chunk_rows):
+                        stop = min(start + chunk_rows, self.end)
+                        self.weight.data[
+                            start - self.start : stop - self.start
+                        ].view(torch.uint8).copy_(tensor[start:stop].view(torch.uint8))
+                    # The current ElasticBuffer ABI accepts a replicated scale
+                    # table on NPU. Preserve the checkpoint's E8M0 bits.
+                    for start in range(0, self.rows, chunk_rows):
+                        stop = min(start + chunk_rows, self.rows)
+                        scale_bits[start:stop].copy_(scale[start:stop].view(torch.uint8))
+
+                ElasticBuffer = _get_elastic_buffer_cls()
+                num_cpu_bytes = ElasticBuffer.get_engram_storage_size_hint(
+                    self.shard_rows,
+                    self.width,
+                    torch.float8_e4m3fn,
+                )
+                buffer = ElasticBuffer(
+                    self.query_group.group,
+                    num_cpu_bytes=num_cpu_bytes,
+                )
+                try:
+                    buffer.engram_write(self.weight, self.weight_scale)
+                except Exception:
+                    buffer.destroy()
+                    raise
+                self.elastic_buffer = buffer
+                logger.info(
+                    "Loaded MXFP8 Elastic Engram %s: CPU payload shard %.2f GiB, "
+                    "replicated HBM E8M0 %.2f GiB (%.3f%% of full FP8 payload)",
+                    key,
+                    self.elastic_cpu_payload_bytes / (1024**3),
+                    self.elastic_hbm_scale_bytes / (1024**3),
+                    100 / _MX_GROUP_SIZE,
+                )
+                # In inference mode engram_write copies the local shard into
+                # ElasticBuffer's pinned allocation, so release the source.
+                del self.weight
+                return
             if self.storage_format == "int8" and source_dtype in ("I8", "INT8"):
                 if scale_key not in index:
                     raise ValueError(f"{key}: INT8 source requires .scale")
@@ -379,6 +496,47 @@ class NodeShardedEngram(nn.Module):
             for start in range(self.start, self.end, chunk_rows):
                 stop = min(start + chunk_rows, self.end)
                 self.set_rows(start - self.start, tensor[start:stop])
+
+    def _begin_elastic_lookup(self, ids):
+        """Launch one TP-wide RDMA fetch and return its completion callback."""
+        if self.elastic_buffer is None:
+            raise RuntimeError("mxfp8_elastic Engram was used before load_checkpoint")
+        if ids.device.type != "cpu" or ids.dtype != torch.int64:
+            raise ValueError("Elastic Engram routing expects CPU int64 IDs")
+        if ids.numel() and bool(ids.min() < 0 or ids.max() >= self.rows):
+            raise IndexError("Engram hash ID outside table")
+        flat = ids.reshape(-1) if self.query_group.is_source else ids.new_empty(0)
+        indices = flat.to(device=self.weight_scale.device, dtype=torch.int32)
+        return ids.shape, self.elastic_buffer.engram_fetch(indices)
+
+    def _finish_elastic_lookup(self, ids_shape, wait):
+        """Wait for FP8+E8M0 fetch, dequantize on NPU, then share within model TP."""
+        import torch_npu
+
+        fetched, fetched_scale = wait()
+        q = self.query_group
+        num_rows = 1
+        for size in ids_shape:
+            num_rows *= size
+        if q.is_source and num_rows:
+            result = torch_npu.npu_anti_mx_quant(
+                fetched,
+                fetched_scale.unflatten(-1, (-1, 2)),
+                axis=-1,
+                dst_type=torch.bfloat16,
+                src_type=torch.float8_e4m3fn,
+            ).reshape(num_rows, self.width)
+        else:
+            # Every rank in the ElasticBuffer group must issue the collective,
+            # including an idle DP rank or a non-leader model-TP rank.
+            result = torch.empty(
+                (num_rows, self.width),
+                dtype=torch.bfloat16,
+                device=self.weight_scale.device,
+            )
+        if result.numel():
+            dist.broadcast(result, src=q.tp_source, group=q.tp_group)
+        return result.view(*ids_shape, self.width)
 
     def _metadata(self, ids):
         q = self.query_group
@@ -487,6 +645,9 @@ class NodeShardedEngram(nn.Module):
 
     @torch.inference_mode()
     def forward(self, ids):
+        if self.storage_format == "mxfp8_elastic":
+            shape, wait = self._begin_elastic_lookup(ids)
+            return self._finish_elastic_lookup(shape, wait)
         q = self.query_group
         if ids.device.type != "cpu" or ids.dtype != torch.int64:
             raise ValueError("Engram routing expects CPU int64 IDs")
@@ -512,6 +673,20 @@ class NodeShardedEngram(nn.Module):
         q = self.query_group
         if len(tables) != len(ids_list):
             raise ValueError("tables and ids_list must have the same length")
+        elastic = [table.storage_format == "mxfp8_elastic" for table in tables]
+        if any(elastic):
+            if not all(elastic):
+                raise ValueError("Cannot batch ElasticBuffer and legacy Engram tables")
+            # Each table owns an independent ElasticBuffer, so launch both
+            # asynchronous RDMA fetches before consuming either completion.
+            pending = [
+                table._begin_elastic_lookup(ids)
+                for table, ids in zip(tables, ids_list)
+            ]
+            return [
+                table._finish_elastic_lookup(shape, wait)
+                for table, (shape, wait) in zip(tables, pending)
+            ]
         routing = [table._metadata(ids) for table, ids in zip(tables, ids_list)]
         metadata = [item[2] for item in routing]
         packed = torch.cat(metadata)

@@ -279,6 +279,65 @@ def test_mxfp8_hbm_loader_uses_release_index_and_preserves_bits(tmp_path):
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
+def test_mxfp8_elastic_loader_pads_payload_and_replicates_scale(tmp_path, monkeypatch):
+    rows, width = 17, 64
+    key = "layers.1.engram.embed.weight"
+    scale_key = "layers.1.engram.embed.scale"
+    weight = torch.linspace(-4, 4, rows * width).reshape(rows, width).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[1.0, 2.0]] * rows, dtype=torch.float8_e8m0fnu)
+    save_file({key: weight, scale_key: scale}, tmp_path / "weights.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "weights.safetensors", scale_key: "weights.safetensors"}})
+    )
+
+    class FakeElasticBuffer:
+        instance = None
+
+        @staticmethod
+        def get_engram_storage_size_hint(num_entries, hidden, dtype):
+            assert (num_entries, hidden, dtype) == (9, width, torch.float8_e4m3fn)
+            return 2 * 1024 * 1024
+
+        def __init__(self, group, **kwargs):
+            self.group, self.kwargs = group, kwargs
+            FakeElasticBuffer.instance = self
+
+        def engram_write(self, storage, sf):
+            self.storage = storage.clone()
+            self.sf = sf.clone()
+
+        def destroy(self):
+            self.destroyed = True
+
+    monkeypatch.setattr(hbm, "_get_elastic_buffer_cls", lambda: FakeElasticBuffer)
+    group = object()
+    q = type(
+        "QueryGroup",
+        (),
+        {"size": 2, "rank": 1, "group": group, "is_source": True},
+    )()
+    table = hbm.NodeShardedEngram(
+        rows, width, q, device="cpu", storage_format="mxfp8_elastic"
+    )
+    table.load_checkpoint(tmp_path, key, chunk_rows=3)
+
+    buffer = FakeElasticBuffer.instance
+    assert buffer.group is group
+    assert buffer.kwargs == {"num_cpu_bytes": 2 * 1024 * 1024}
+    assert buffer.storage.shape == (9, width)
+    assert torch.equal(buffer.storage[:8].view(torch.uint8), weight[9:17].view(torch.uint8))
+    assert torch.count_nonzero(buffer.storage[8].float()) == 0
+    assert buffer.sf.shape == (18, width // 32)
+    assert torch.equal(buffer.sf[:rows].view(torch.uint8), scale.view(torch.uint8))
+    assert torch.equal(
+        buffer.sf[rows:].view(torch.uint8),
+        torch.full((1, width // 32), 127, dtype=torch.uint8),
+    )
+    assert table.elastic_cpu_payload_bytes == 9 * width
+    assert table.elastic_hbm_scale_bytes == 18 * (width // 32)
+    assert not hasattr(table, "weight")
+
+
 def test_cached_metadata_stays_on_cpu_with_device_context():
     q = type("QueryGroup", (), {"size": 4, "rank": 1, "is_source": False})()
     with torch.device("meta"):

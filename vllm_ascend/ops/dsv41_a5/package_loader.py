@@ -19,6 +19,7 @@ import os
 import sys
 import threading
 import types
+from importlib import metadata
 
 _import_lock = threading.Lock()
 _opapi_handle = None
@@ -76,6 +77,21 @@ def _namespace_package(name: str, path: str, origin: str | None = None):
 def _load_payload_package(package_path: str):
     payload_path = os.path.join(os.path.dirname(package_path), "ops")
     payload_init = os.path.join(payload_path, "__init__.py")
+    if not os.path.isfile(payload_init):
+        # The transformer wheel can live in CANN's Python directory while the
+        # DSL payload is provided by a regular site-packages distribution.
+        # Resolve the distribution that owns ``ops`` instead of accepting an
+        # unrelated module with the same generic top-level name.
+        for distribution_name in metadata.packages_distributions().get("ops", ()):
+            candidate = metadata.distribution(distribution_name).locate_file("ops")
+            candidate_path = os.fspath(candidate)
+            candidate_init = os.path.join(candidate_path, "__init__.py")
+            if os.path.isfile(candidate_init):
+                payload_path = candidate_path
+                payload_init = candidate_init
+                break
+    if not os.path.isfile(payload_init):
+        raise ModuleNotFoundError(f"A5 operator payload package is absent: {payload_init}")
     current = sys.modules.get("ops")
     if current is not None and payload_path in tuple(getattr(current, "__path__", ())):
         return current

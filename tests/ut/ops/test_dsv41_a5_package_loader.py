@@ -3,7 +3,9 @@
 
 import importlib
 import sys
+from types import SimpleNamespace
 
+from vllm_ascend.ops.dsv41_a5 import package_loader
 from vllm_ascend.ops.dsv41_a5.package_loader import import_packaged_a5_module
 
 
@@ -29,3 +31,28 @@ def test_targeted_loader_skips_eager_package_initializers(tmp_path, monkeypatch)
     assert loaded.loaded is True
     assert not hasattr(sys.modules["cann_ops_transformer"], "__file__")
     assert not hasattr(sys.modules["cann_ops_transformer.ops"], "__file__")
+
+
+def test_payload_loader_resolves_owning_distribution(tmp_path, monkeypatch):
+    package = tmp_path / "cann" / "cann_ops_transformer"
+    package.mkdir(parents=True)
+    payload = tmp_path / "python" / "ops"
+    payload.mkdir(parents=True)
+    (payload / "__init__.py").write_text("registered_from_distribution = True\n")
+
+    monkeypatch.setattr(
+        package_loader.metadata,
+        "packages_distributions",
+        lambda: {"ops": ["payload-dist"]},
+    )
+    monkeypatch.setattr(
+        package_loader.metadata,
+        "distribution",
+        lambda _name: SimpleNamespace(locate_file=lambda _path: payload),
+    )
+    monkeypatch.delitem(sys.modules, "ops", raising=False)
+
+    loaded = package_loader._load_payload_package(str(package))
+
+    assert loaded.registered_from_distribution is True
+    sys.modules.pop("ops", None)
