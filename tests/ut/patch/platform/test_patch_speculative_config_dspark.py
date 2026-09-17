@@ -6,7 +6,11 @@ from vllm.config.model_arch import ModelArchitectureConfig
 from vllm.config.speculative import SpeculativeConfig
 
 import vllm_ascend.patch.platform.patch_speculative_config  # noqa: F401
+from vllm_ascend.patch.platform import (
+    patch_speculative_config as speculative_config_patch,
+)
 from vllm_ascend.patch.platform.patch_speculative_config import (
+    _dspark_post_init,
     _normalize_deepseek_v4_dspark_draft,
 )
 
@@ -188,3 +192,22 @@ def test_released_deepseek_v41_dspark_names_select_v41_drafter():
     assert text_config.n_routed_experts == 128
     assert text_config.num_experts_per_tok == 3
     assert draft_model_config.model_arch_config.num_experts_per_token == 3
+
+
+def test_deepseek_v41_dspark_uses_draft_only_bf16_kv(monkeypatch):
+    draft_hf_config = SimpleNamespace(ptd_token_id=1)
+    speculative_config = SimpleNamespace(
+        use_dspark=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=draft_hf_config),
+        kv_cache_dtype=None,
+    )
+    monkeypatch.setattr(speculative_config_patch, "_orig_post_init", lambda self: None)
+    monkeypatch.setattr(
+        speculative_config_patch,
+        "_normalize_deepseek_v4_dspark_draft",
+        lambda draft_model_config: True,
+    )
+
+    _dspark_post_init(speculative_config)
+
+    assert speculative_config.kv_cache_dtype == "bfloat16"

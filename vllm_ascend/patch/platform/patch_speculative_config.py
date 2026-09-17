@@ -39,7 +39,7 @@ def _normalize_legacy_qwen3_dspark_config(hf_config: PretrainedConfig) -> Pretra
     return hf_config
 
 
-def _normalize_deepseek_v4_dspark_draft(draft_model_config) -> None:
+def _normalize_deepseek_v4_dspark_draft(draft_model_config) -> bool:
     """Restore the DSpark draft architecture after VL config conversion.
 
     DeepSeek-V4-Vision uses the same checkpoint for the target and DSpark
@@ -64,7 +64,7 @@ def _normalize_deepseek_v4_dspark_draft(draft_model_config) -> None:
         or (root_model_type != "deepseek_v4" and not is_v41)
         or getattr(draft_hf_config, "dspark_target_layer_ids", None) is None
     ):
-        return
+        return False
 
     architecture = "DeepseekV41DSparkDraftModel" if is_v41 else "DSparkDraftModel"
     if is_v41:
@@ -118,6 +118,7 @@ def _normalize_deepseek_v4_dspark_draft(draft_model_config) -> None:
     )
     draft_model_config._model_info = model_info
     draft_model_config._architecture = architecture
+    return is_v41
 
 
 def _dspark_post_init(self):
@@ -125,7 +126,13 @@ def _dspark_post_init(self):
     if self.use_dspark():
         draft_model_config = getattr(self, "draft_model_config", None)
         draft_hf_config = getattr(draft_model_config, "hf_config", None)
-        _normalize_deepseek_v4_dspark_draft(draft_model_config)
+        is_v41 = _normalize_deepseek_v4_dspark_draft(draft_model_config)
+        if is_v41:
+            # Aurora's three draft attention layers own uncompressed BF16 SWA
+            # caches.  Keep this override on SpeculativeConfig so vLLM copies
+            # it only into the draft vllm_config; the A5 target retains its
+            # packed quantized KV-cache plan.
+            self.kv_cache_dtype = "bfloat16"
         # deepseek v4 dspark
         if getattr(draft_hf_config, "ptd_token_id", None) is None:  # type: ignore
             draft_hf_config.ptd_token_id = getattr(draft_hf_config, "dspark_noise_token_id", None)  # type: ignore

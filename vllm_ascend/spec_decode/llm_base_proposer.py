@@ -10,7 +10,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.config import (
+    CompilationMode,
+    CUDAGraphMode,
+    VllmConfig,
+    get_layers_from_vllm_config,
+)
 from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
@@ -128,6 +133,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         draft_vllm_config = copy.copy(draft_vllm_config)
         draft_vllm_config.model_config = copy.copy(draft_vllm_config.model_config)
         draft_vllm_config.model_config.runner_type = self.speculative_config.draft_model_config.runner_type
+        if self.speculative_config.enforce_eager:
+            # ``use_cuda_graph=False`` only skips the proposer's outer graph
+            # wrapper.  The draft model can still carry
+            # ``@support_torch_compile`` and otherwise inherits the target's
+            # VLLM_COMPILE mode.  Isolate both controls so draft eager does not
+            # disable FULL_DECODE_ONLY on the target model.
+            draft_vllm_config.model_config.enforce_eager = True
+            draft_vllm_config.compilation_config = copy.copy(
+                draft_vllm_config.compilation_config
+            )
+            draft_vllm_config.compilation_config.mode = CompilationMode.NONE
+            draft_vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         return draft_vllm_config
 
     @staticmethod

@@ -491,6 +491,42 @@ class TestPadDraftBuffersBeforeBuild(_DSparkProposerTestBase):
         proposer._pad_draft_buffers(num_actual, num_actual)
         assert torch.equal(proposer.positions, snapshot)
 
+    @pytest.mark.parametrize("is_profile", [False, True])
+    def test_dummy_run_publishes_context_length_before_padding(self, monkeypatch, is_profile):
+        """DP dummy/profile paths initialize the context-tail boundary before padding."""
+        proposer = AscendDSparkProposer.__new__(AscendDSparkProposer)
+        proposer.num_speculative_tokens = 5
+        proposer.num_query_per_req = 5
+        proposer.max_query_tokens = 10
+        proposer.use_cuda_graph = False
+        proposer.runner = SimpleNamespace(
+            _sync_metadata_across_dp=lambda *_args, **_kwargs: (8, torch.tensor([8]), None)
+        )
+        proposer._context_positions_buffer = torch.zeros(8, dtype=torch.int32)
+        proposer.hidden_states = torch.zeros((8, 4))
+        proposer.token_indices_to_sample = torch.zeros(10, dtype=torch.int32)
+        proposer.input_ids = torch.zeros(10, dtype=torch.int64)
+        proposer.vllm_config = SimpleNamespace()
+        proposer._get_positions = lambda length: torch.zeros(length, dtype=torch.int32)
+
+        seen = []
+        proposer._pad_draft_buffers = lambda *_args: seen.append(proposer._dflash_num_context)
+        proposer._runnable = MagicMock()
+        proposer.model = MagicMock()
+
+        @contextmanager
+        def forward_context(*_args, **_kwargs):
+            yield
+
+        monkeypatch.setattr(
+            "vllm_ascend.spec_decode.dspark_proposer.set_ascend_forward_context",
+            forward_context,
+        )
+        proposer.dummy_run(num_tokens=8, num_reqs=2, is_profile=is_profile)
+
+        assert seen == [8]
+        assert proposer._dflash_num_context == 8
+
 
 class TestDSparkInitialization(_DSparkProposerTestBase):
     """Tests for DSpark initialization configuration."""

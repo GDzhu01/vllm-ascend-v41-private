@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Centralized DeepSeek-V4 attention-KV execution choices."""
 
+import copy
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +14,14 @@ from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flas
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
 _BF16_KV_CACHE_DTYPES = frozenset({"bfloat16", "bf16"})
+
+
+def copy_vllm_config_with_kv_cache_dtype(vllm_config, cache_dtype):
+    """Return a shallow config view with an isolated attention-KV dtype."""
+    result = copy.copy(vllm_config)
+    result.cache_config = copy.copy(vllm_config.cache_config)
+    result.cache_config.cache_dtype = cache_dtype
+    return result
 
 
 def _supports_dsv4_compressed_cache() -> bool:

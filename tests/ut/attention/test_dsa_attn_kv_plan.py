@@ -11,6 +11,7 @@ import torch
 from vllm_ascend.attention.dsa_attn_kv_plan import (
     DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET,
     DSA_COMPRESSOR_SLOT_MAPPING_FLAT,
+    copy_vllm_config_with_kv_cache_dtype,
     get_dsa_attn_kv_plan,
     get_dsv4_attn_kv_dtype,
     is_a5_bf16_kv_enabled,
@@ -57,6 +58,15 @@ def _on(device_type):
 def test_get_dsa_attn_kv_plan_requires_vllm_config():
     with pytest.raises(TypeError):
         get_dsa_attn_kv_plan()
+
+
+def test_cache_dtype_config_copy_does_not_mutate_target():
+    target = _cache_config("auto")
+    draft = copy_vllm_config_with_kv_cache_dtype(target, "bfloat16")
+    assert draft is not target
+    assert draft.cache_config is not target.cache_config
+    assert draft.cache_config.cache_dtype == "bfloat16"
+    assert target.cache_config.cache_dtype == "auto"
 
 
 def test_a5_fp8_plan_uses_flat_shared_kv():

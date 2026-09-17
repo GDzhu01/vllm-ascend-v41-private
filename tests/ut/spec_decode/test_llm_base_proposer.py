@@ -24,7 +24,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from vllm.config import CUDAGraphMode
+from vllm.config import CompilationMode, CUDAGraphMode
 
 from vllm_ascend.spec_decode.llm_base_proposer import (
     AscendSpecDecodeBaseProposer,
@@ -218,11 +218,20 @@ def test_draft_vllm_config_only_propagates_draft_runner_type():
         runner_type="generate",
         architecture="target-architecture",
         num_experts=256,
+        enforce_eager=False,
     )
-    base_vllm_config = SimpleNamespace(model_config=base_model_config)
+    base_compilation_config = SimpleNamespace(
+        mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+    )
+    base_vllm_config = SimpleNamespace(
+        model_config=base_model_config,
+        compilation_config=base_compilation_config,
+    )
     proposer = AscendSpecDecodeBaseProposer.__new__(AscendSpecDecodeBaseProposer)
     proposer.speculative_config = SimpleNamespace(
         draft_model_config=draft_model_config,
+        enforce_eager=True,
     )
 
     with (
@@ -239,7 +248,14 @@ def test_draft_vllm_config_only_propagates_draft_runner_type():
     assert draft_vllm_config.model_config.runner_type == "draft"
     assert draft_vllm_config.model_config.architecture == "target-architecture"
     assert draft_vllm_config.model_config.num_experts == 256
+    assert draft_vllm_config.model_config.enforce_eager
+    assert draft_vllm_config.compilation_config is not base_compilation_config
+    assert draft_vllm_config.compilation_config.mode == CompilationMode.NONE
+    assert draft_vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
     assert base_model_config.runner_type == "generate"
+    assert not base_model_config.enforce_eager
+    assert base_compilation_config.mode == CompilationMode.VLLM_COMPILE
+    assert base_compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
 
 
 class TestDisablePaddedDrafterBatchWithFullGraph:
