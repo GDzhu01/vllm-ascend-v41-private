@@ -9,7 +9,12 @@ import torch_npu
 from torch import nn
 
 from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheLayer
-from vllm_ascend.core.deepseek_v41 import STATE_RING_ROWS, DeepseekV41CompressorStateSpec
+from vllm_ascend.core.deepseek_v41 import (
+    STATE_RING_ROWS,
+    DeepseekV41CompressorStateSpec,
+    get_dsv41_config,
+)
+from vllm_ascend.ops.dsv41_a5 import compressor_v2
 
 
 def _read(config: Any, name: str) -> Any:
@@ -63,12 +68,24 @@ class DeepseekV41Compressor(nn.Module):
         if ratio not in (1, 2):
             raise ValueError("V4.1 compressor requires ratio 1 or 2")
         self.ratio = ratio
+        dsv41_config = (
+            get_dsv41_config(vllm_config)
+            if vllm_config is not None
+            else {"cache_format": "a3_bf16", "compressor": "triton"}
+        )
+        self.uses_a5_packed_cache = dsv41_config["cache_format"] == "a5_packed"
+        self.compressor_backend = dsv41_config["compressor"]
         self.width = _read(config, "head_dim")
         dim = _read(config, "hidden_size")
-        self.wkv = nn.Linear(dim, self.width, bias=False, dtype=torch.float32 if ratio == 2 else torch.bfloat16)
+        # A3's projected Triton compressor owns FP32 weights.  The packaged A5
+        # ABI instead requires hidden states and both projection weights to use
+        # one BF16/FP16 dtype. Triton keeps A3's FP32 projection contract.
+        uses_a5_native_projection = self.uses_a5_packed_cache and self.compressor_backend == "compressor_v2"
+        projection_dtype = torch.bfloat16 if ratio == 1 or uses_a5_native_projection else torch.float32
+        self.wkv = nn.Linear(dim, self.width, bias=False, dtype=projection_dtype)
         self.norm = DeepseekV41RMSNorm(self.width, _read(config, "rms_norm_eps"))
         if ratio == 2:
-            self.wgate = nn.Linear(dim, self.width, bias=False, dtype=torch.float32)
+            self.wgate = nn.Linear(dim, self.width, bias=False, dtype=projection_dtype)
             # Allocate persistent output before memory profiling, so its footprint
             # is included in the cache budget rather than added after allocation.
             if vllm_config is not None:
@@ -78,7 +95,6 @@ class DeepseekV41Compressor(nn.Module):
                     torch.empty(capacity, self.width, dtype=torch.bfloat16, device=self.wkv.weight.device),
                     persistent=False,
                 )
-            # Standalone unfused-reference tests may supply pages explicitly.
             if vllm_config is not None:
                 self.state_cache = DeepseekV41CompressorStateCache(
                     vllm_config,
@@ -93,23 +109,26 @@ class DeepseekV41Compressor(nn.Module):
 
     def prepare_ring_compressor(self, max_tokens, device):
         """Check the profiled per-source buffer and resolve hardware before capture."""
-        from vllm_ascend.ops.triton.compressor.compressor_triton import _cube_core_num
-
         actual_device = self._ring_pooled.device
         compatible_device = actual_device.type == device.type and (
             device.index is None or actual_device.index == device.index
         )
         if self._ring_pooled.shape[0] < max_tokens or not compatible_device:
             raise ValueError("Ring output capacity/device must be established before memory profiling")
+        if self.uses_a5_packed_cache and self.compressor_backend == "compressor_v2":
+            self._ring_num_cores = 1
+            return
+        from vllm_ascend.ops.triton.compressor.compressor_triton import _cube_core_num
+
         self._ring_num_cores = _cube_core_num()
 
     def pool_projected(self, kv, scores, metadata):
-        from vllm_ascend.ops.triton.compressor.compressor_triton import compressor_from_projected
-
         if not hasattr(self, "_ring_pooled") or not hasattr(self, "_ring_num_cores"):
             raise RuntimeError("Ring compressor must be initialized before graph capture")
         if kv.shape[0] > self._ring_pooled.shape[0]:
             raise ValueError("Compressor batch exceeds its prepared output capacity")
+        from vllm_ascend.ops.triton.compressor.compressor_triton import compressor_from_projected
+
         pooled = compressor_from_projected(
             kv,
             scores,
@@ -118,6 +137,37 @@ class DeepseekV41Compressor(nn.Module):
             self._ring_pooled[: kv.shape[0]],
             max_query_len=metadata.max_query_len,
             num_cores=self._ring_num_cores,
+        )
+        return self.norm(pooled)
+
+    def pool_hidden(self, hidden_states, metadata):
+        """Run the A5 ratio-2 adapter before projection and normalize output."""
+        if not self.uses_a5_packed_cache:
+            raise RuntimeError("pool_hidden is reserved for the A5 packed-cache path")
+        if not hasattr(self, "_ring_pooled") or not hasattr(self, "_ring_num_cores"):
+            raise RuntimeError("Ring compressor must be initialized before graph capture")
+        if hidden_states.shape[0] > self._ring_pooled.shape[0]:
+            raise ValueError("Compressor batch exceeds its prepared output capacity")
+        if self.compressor_backend == "triton":
+            # CompressorV2's circular state retains only the current
+            # incomplete compression group.  That is valid for monotonically
+            # advancing chunks, but target speculative decoding may roll the
+            # next start position back into the previous six-token proposal.
+            # The A3 Triton path stores every proposed token in the 32-row ring,
+            # so the next call can read the predecessor of any accepted prefix.
+            hidden_states_fp32 = hidden_states.float()
+            return self.pool_projected(
+                self.wkv(hidden_states_fp32),
+                self.wgate(hidden_states_fp32),
+                metadata,
+            )
+        pooled = compressor_v2(
+            hidden_states,
+            self.wkv.weight,
+            self.wgate.weight,
+            self.state_cache.kv_cache[0].squeeze(-2),
+            metadata,
+            self._ring_pooled[: hidden_states.shape[0]],
         )
         return self.norm(pooled)
 

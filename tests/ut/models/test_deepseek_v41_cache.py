@@ -31,6 +31,15 @@ from vllm_ascend.attention.dsa_v41 import (
     scatter_cache_sk,
 )
 from vllm_ascend.core.deepseek_v41 import (
+    A5_CMP_ROW_BYTES,
+    A5_INDEX_DATA_BYTES,
+    A5_INDEX_SCALE_COUNT,
+    A5_WIN_ROW_BYTES,
+    DeepseekV41A5CompressedSpec,
+    DeepseekV41A5DraftSWASpec,
+    DeepseekV41A5IndexerSpec,
+    DeepseekV41A5SWASpec,
+    DeepseekV41CompressorStateSpec,
     DeepseekV41DraftSWASpec,
     DeepseekV41FullSpec,
     DeepseekV41IndexerSpec,
@@ -196,6 +205,84 @@ def test_production_layout_matches_design(config, runtime):
     assert sum(caches[n].is_contiguous() for n, s in padded.items() if isinstance(s, DeepseekV41SWASpec)) == 30
 
 
+def test_a5_packed_layout_preserves_a3_groups_slots_and_fp32_ring(config, runtime):
+    runtime.cache_config.block_size = 128
+    production = dict(config, head_dim=512, index_head_dim=128)
+    a3_specs = build_v41_cache_specs(production, runtime)
+    runtime.additional_config = {"dsv41_config": {"cache_format": "a5_packed"}}
+    a5_specs = build_v41_cache_specs(production, runtime)
+
+    a3_groups = make_cache_groups(group_cache_specs(a3_specs))
+    a5_groups = make_cache_groups(group_cache_specs(a5_specs))
+    assert len(a3_groups) == len(a5_groups) == 12
+    assert [group.layer_names for group in a5_groups] == [group.layer_names for group in a3_groups]
+    assert [group.kv_cache_spec.page_size_bytes for group in a5_groups] == [
+        462848,
+        393216,
+        *([462848] * 10),
+    ]
+    assert pool_bytes_per_block(a5_groups) == 462848
+
+    slots = cache_slots_from_groups(a5_groups)
+    assert [slot.page_size_bytes for slot in slots] == [131072] * 3 + [69632]
+    assert [slot.placements[1].offset for slot in slots] == [40960] * 4
+    assert [slot.placements[1].page_size_bytes for slot in slots] == [90112] * 3 + [28672]
+
+    state_names = [name for name, spec in a5_specs.items() if isinstance(spec, DeepseekV41CompressorStateSpec)]
+    assert len(state_names) == 3
+    for name in state_names:
+        assert a5_specs[name] == a3_specs[name]
+        assert a5_specs[name].dtype == torch.float32
+        assert a5_specs[name].storage_block_size == 32
+
+    blocks, tensors = allocate_cache_config(runtime, a5_groups, 2 * 462848)
+    cfg = KVCacheConfig(num_blocks=blocks, kv_cache_tensors=tensors, kv_cache_groups=a5_groups)
+    _, caches = allocate_cache_views(cfg)
+    for name, spec in a5_specs.items():
+        cache = caches[name]
+        if isinstance(spec, DeepseekV41A5CompressedSpec):
+            assert cache.dtype == torch.uint8
+            assert cache.shape == (2, spec.storage_block_size, 1, A5_CMP_ROW_BYTES)
+        elif isinstance(spec, DeepseekV41A5IndexerSpec):
+            data, scale = cache
+            assert data.dtype == scale.dtype == torch.uint8
+            assert data.shape == (2, spec.storage_block_size, 1, A5_INDEX_DATA_BYTES)
+            assert scale.shape == (2, spec.storage_block_size, 1, A5_INDEX_SCALE_COUNT)
+        elif isinstance(spec, DeepseekV41A5SWASpec):
+            assert cache.dtype == torch.uint8
+            assert cache.shape == (2, 128, 1, A5_WIN_ROW_BYTES)
+
+
+def test_a5_packed_spec_rejects_abi_drift():
+    with pytest.raises(ValueError, match=r"U8\[320\]"):
+        DeepseekV41A5CompressedSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=A5_CMP_ROW_BYTES,
+            dtype=torch.uint8,
+            scale_dtype=torch.bfloat16,
+            quant_group_size=32,
+        )
+    with pytest.raises(ValueError, match=r"U8\[64\]"):
+        DeepseekV41A5IndexerSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=A5_INDEX_DATA_BYTES,
+            dtype=torch.uint8,
+            scale_dim=1,
+            scale_dtype=torch.uint8,
+        )
+    with pytest.raises(ValueError, match=r"U8\[544\]"):
+        DeepseekV41A5SWASpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=A5_WIN_ROW_BYTES,
+            dtype=torch.uint8,
+            sliding_window=128,
+            scale_dtype=torch.float16,
+        )
+
+
 def test_shared_slots_isolate_groups_and_recycled_ids(config, runtime):
     groups = make_cache_groups(group_cache_specs(collect_specs(runtime)))
     count = len(groups) + 1
@@ -331,12 +418,14 @@ def test_model_registration_and_binding(runtime):
     assert len(owned_names) == 51
 
 
-@pytest.mark.parametrize("feature", ["spec", "pp", "graph"])
+@pytest.mark.parametrize("feature", ["spec", "pp", "v2", "graph"])
 def test_unsupported_runtime_fails_before_registration(runtime, feature):
     if feature == "spec":
         runtime.speculative_config = object()
     elif feature == "pp":
         runtime.parallel_config.pipeline_parallel_size = 2
+    elif feature == "v2":
+        runtime.use_v2_model_runner = True
     else:
         runtime.model_config.enforce_eager = False
     with pytest.raises(NotImplementedError):
@@ -344,6 +433,13 @@ def test_unsupported_runtime_fails_before_registration(runtime, feature):
 
         validate_cache_runtime(runtime)
     assert not runtime.compilation_config.static_forward_context
+
+
+def test_pd_cache_transfer_runtime_is_supported(runtime):
+    from vllm_ascend.core.deepseek_v41 import validate_cache_runtime
+
+    runtime.kv_transfer_config = object()
+    validate_cache_runtime(runtime)
 
 
 def test_prefix_cache_runtime_is_supported(runtime):
@@ -369,7 +465,7 @@ def test_dspark_runtime_preserves_ring_retention_limit(runtime, mode, count):
     runtime.speculative_config = SimpleNamespace(use_dspark=lambda: True, num_speculative_tokens=count)
     runtime.compilation_config.cudagraph_mode = mode
     validate_cache_runtime(runtime)
-    assert runtime.cache_config.cache_dtype == "bfloat16"
+    assert runtime.cache_config.cache_dtype == "auto"
 
 
 @pytest.mark.parametrize("count", [0, 32, 63])
@@ -576,19 +672,14 @@ def test_scatter_cache_sk_consumes_prepared_coordinates_and_preserves_stride(
     def scatter(var, indices, updates):
         calls.append((var, indices, updates))
 
-    monkeypatch.setattr(
-        torch.ops._C_ascend,
-        "npu_scatter_nd_update_sk",
-        scatter,
-        raising=False,
-    )
+    monkeypatch.setattr(torch_npu, "npu_scatter_nd_update_", scatter)
     scatter_cache_sk(cache, indices, values)
 
     var, actual_indices, updates = calls[0]
     assert var.shape == (3, 4, 2)
     assert var.stride() == (32, 2, 1)
-    assert actual_indices.data_ptr() == indices.data_ptr()
-    torch.testing.assert_close(actual_indices, indices)
+    assert actual_indices.dtype == torch.int64
+    torch.testing.assert_close(actual_indices, indices.to(torch.int64))
     assert updates.tolist() == [[9.0, 9.0], [7.0, 8.0]]
 
 
@@ -620,13 +711,63 @@ def test_supported_ratios_route_to_native_sparse_flash_mla(monkeypatch, compress
     monkeypatch.setattr(impl, "_native_attention", native)
 
     actual = impl._attention(
-        SimpleNamespace(),
+        SimpleNamespace(uses_a5_packed_cache=False),
         object(),
         SimpleNamespace(swa=object(), attention=object()),
         object() if compress_ratio else None,
     )
 
     assert actual is expected
+
+
+def test_native_attention_uses_packaged_sparse_flash_mla(monkeypatch):
+    impl = DeepseekV41EagerAttentionImpl.__new__(DeepseekV41EagerAttentionImpl)
+    impl.role = SimpleNamespace(compress_ratio=0)
+    impl.topology = SimpleNamespace(index_topk=512)
+    expected = torch.empty((2, 64, 512), dtype=torch.bfloat16)
+    op = Mock(return_value=(expected, torch.empty(0)))
+    monkeypatch.setattr(dsa_v41, "sparse_flash_mla", op)
+    monkeypatch.setattr(dsa_v41, "wait_for_device_metadata", Mock())
+    cache = torch.empty((2, 128, 1, 512), dtype=torch.bfloat16)
+    attn = SimpleNamespace(
+        head_dim=512,
+        window_size=128,
+        attn_sink=None,
+        softmax_scale=512**-0.5,
+        dsa_attn=SimpleNamespace(
+            swa_cache_layer=SimpleNamespace(kv_cache=[cache]),
+            dsa_attn=SimpleNamespace(impl=SimpleNamespace(vllm_config=object())),
+        ),
+    )
+    smla_metadata = torch.zeros(dsa_v41.V41_METADATA_BUFFER_SIZE, dtype=torch.int32)
+    swa = SimpleNamespace(
+        num_reqs=1,
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([7], dtype=torch.int32),
+        block_table=torch.tensor([[1, 0]], dtype=torch.int32),
+        ori_sparse_indices=torch.tensor([[[0, 1]], [[0, 1]]], dtype=torch.int32),
+        ori_topk_length=torch.tensor([[2], [2]], dtype=torch.int32),
+        ori_mask_mode=0,
+        ori_win_left=-1,
+        ori_win_right=-1,
+        smla_metadata=smla_metadata,
+    )
+
+    actual = impl._native_attention(
+        attn,
+        torch.empty((2, 64, 512), dtype=torch.bfloat16),
+        SimpleNamespace(swa=swa, attention=None),
+        source_cache=None,
+        compressed_indices=None,
+    )
+
+    assert actual is expected
+    assert op.call_args.kwargs["metadata"] is smla_metadata
+    assert op.call_args.kwargs["ori_kv"] is cache
+    assert op.call_args.kwargs["ori_mask_mode"] == 0
+    assert op.call_args.kwargs["ori_win_left"] == -1
+    assert op.call_args.kwargs["ori_win_right"] == -1
+    assert op.call_args.kwargs["cmp_ratio"] == 1
 
 
 def test_candidate_blocks_pin_partial_tail_and_drop_unreachable_blocks():
@@ -811,7 +952,7 @@ def test_batch_metadata_reuses_work_and_keeps_group_slots_separate(runtime, monk
 
     smla = Mock(side_effect=native_metadata)
     qli = Mock(side_effect=native_metadata)
-    monkeypatch.setattr(torch.ops._C_ascend, "npu_sparse_flash_mla_metadata", smla, raising=False)
+    monkeypatch.setattr(dsa_v41, "sparse_flash_mla_metadata", smla)
     monkeypatch.setattr(torch.ops._C_ascend, "npu_quant_lightning_indexer_v2_metadata", qli, raising=False)
     for group_builders in builders:
         for builder in group_builders:
@@ -905,7 +1046,9 @@ def test_batch_metadata_reuses_work_and_keeps_group_slots_separate(runtime, monk
         swa = [metadata for group_results in results[2:] for metadata in group_results]
         assert all(metadata.cos is swa[0].cos and metadata.sin is swa[0].sin for metadata in swa)
         assert all(metadata.smla_metadata is swa[0].smla_metadata for metadata in swa)
-        assert int(swa[0].smla_metadata[0]) == sum(lengths)
+        # The public wheel ABI represents an uncompressed SWA plane as
+        # cmp_ratio=1 with has_cmp_kv=False; ratio 0 is rejected by tiling.
+        assert int(swa[0].smla_metadata[0]) == sum(lengths) + 1
         assert len({group_results[0].slot_mapping.data_ptr() for group_results in results[2:]}) == 10
         for group_results in results[2:]:
             assert group_results[0].slot_mapping is group_results[1].slot_mapping
@@ -925,6 +1068,135 @@ def test_batch_metadata_reuses_work_and_keeps_group_slots_separate(runtime, monk
             assert pointers == previous_pointers
             assert frontiers == previous_frontiers
         previous_pointers, previous_frontiers = pointers, frontiers
+
+
+def test_a5_metadata_does_not_require_legacy_a3_extension(config, runtime):
+    runtime.cache_config.block_size = 128
+    runtime.additional_config = {"dsv41_config": {"cache_format": "a5_packed"}}
+    specs = build_v41_cache_specs(dict(config, head_dim=512, index_head_dim=128), runtime)
+    common = SimpleNamespace(
+        slot_mapping=torch.tensor([0, 1]),
+        positions=torch.tensor([0, 1]),
+        block_table_tensor=torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2]),
+        query_start_loc_cpu=torch.tensor([0, 2]),
+        seq_lens=torch.tensor([2]),
+        seq_lens_cpu=torch.tensor([2]),
+        num_reqs=1,
+        num_actual_tokens=2,
+        num_input_tokens=2,
+        max_query_len=2,
+        max_seq_len=2,
+        is_prefilling=torch.tensor([True]),
+    )
+    for name, field in (
+        ("model.layers.2.self_attn.long_kv_cache", "smla_metadata"),
+        ("model.layers.2.self_attn.indexer.k_cache", "qli_metadata"),
+    ):
+        builder = DeepseekV41MetadataBuilder(specs[name], [name], runtime, torch.device("cpu"))
+        builder._supports_device_ops = True
+        metadata = builder.build(0, common)
+        assert getattr(metadata, field) is None
+        assert metadata.storage_block_size == 128
+        assert metadata.slot_mapping.tolist() == [[-1, -1], [0, 0]]
+        assert metadata.block_table.tolist() == [[0, 2]]
+        assert metadata.block_table.is_contiguous()
+
+
+def test_a5_smla_metadata_uses_actual_rows_not_graph_padding(config, runtime, monkeypatch):
+    runtime.cache_config.block_size = 128
+    runtime.additional_config = {"dsv41_config": {"cache_format": "a5_packed"}}
+    specs = build_v41_cache_specs(dict(config, head_dim=512, index_head_dim=128), runtime)
+    spec = specs["model.layers.0.self_attn.swa_cache"]
+    builder = DeepseekV41MetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    builder._supports_device_ops = True
+    builder._a5_smla_metadata = torch.empty(4, dtype=torch.int32)
+    builder._a5_smla_length_rows = torch.empty((32, 1), dtype=torch.int32)
+
+    row_shapes = []
+
+    def metadata_op(q_rows, kv_rows, **kwargs):
+        row_shapes.append((tuple(q_rows.shape), tuple(kv_rows.shape)))
+        return torch.arange(4, dtype=torch.int32)
+
+    monkeypatch.setattr(dsa_v41, "import_packaged_a5_module", lambda _name: None)
+    monkeypatch.setattr(
+        dsa_v41.torch.ops,
+        "cann_ops_transformer",
+        SimpleNamespace(ds41=SimpleNamespace(mixed_quant_sparse_flash_mla_metadata=metadata_op)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        dsa_v41,
+        "get_cos_and_sin_dsa",
+        lambda positions, **kwargs: (positions.float(), positions.float()),
+    )
+
+    actual_tokens = 6
+    padded_tokens = 32
+    positions = torch.arange(8192, 8192 + padded_tokens)
+    common = SimpleNamespace(
+        slot_mapping=torch.arange(padded_tokens),
+        positions=positions,
+        block_table_tensor=torch.arange(128, dtype=torch.int32).reshape(1, 128),
+        query_start_loc=torch.tensor([0, actual_tokens], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, actual_tokens], dtype=torch.int32),
+        seq_lens=torch.tensor([8192 + actual_tokens], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([8192 + actual_tokens], dtype=torch.int32),
+        num_reqs=1,
+        num_actual_tokens=actual_tokens,
+        num_input_tokens=padded_tokens,
+        max_query_len=actual_tokens,
+        max_seq_len=8192 + actual_tokens,
+        is_prefilling=torch.tensor([False]),
+        causal=True,
+    )
+
+    metadata = builder.build(0, common)
+
+    assert row_shapes == [((actual_tokens, 1), (actual_tokens, 1))]
+    assert metadata.num_actual_tokens == actual_tokens
+    assert metadata.num_input_tokens == padded_tokens
+
+    builder._a5_smla_metadata.fill_(7)
+    common.num_actual_tokens = 0
+    common.query_start_loc = torch.tensor([0, 0], dtype=torch.int32)
+    common.query_start_loc_cpu = common.query_start_loc
+    idle = builder.build(0, common)
+    assert row_shapes == [((actual_tokens, 1), (actual_tokens, 1))]
+    assert torch.count_nonzero(idle.smla_metadata).item() == 0
+
+
+def test_a5_paired_block_table_keeps_address_and_refreshes_contents(config, runtime):
+    runtime.cache_config.block_size = 128
+    runtime.additional_config = {"dsv41_config": {"cache_format": "a5_packed"}}
+    specs = build_v41_cache_specs(dict(config, head_dim=512, index_head_dim=128), runtime)
+    spec = specs["model.layers.2.self_attn.long_kv_cache"]
+    builder = DeepseekV41MetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    common = SimpleNamespace(
+        slot_mapping=torch.tensor([0, 1]),
+        positions=torch.tensor([0, 1]),
+        block_table_tensor=torch.tensor([[7, 19, 3, 11]], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2]),
+        query_start_loc_cpu=torch.tensor([0, 2]),
+        seq_lens=torch.tensor([2]),
+        seq_lens_cpu=torch.tensor([2]),
+        num_reqs=1,
+        num_actual_tokens=2,
+        num_input_tokens=2,
+        max_query_len=2,
+        max_seq_len=2,
+        is_prefilling=torch.tensor([True]),
+    )
+
+    first = builder.build(0, common)
+    first_ptr = first.block_table.data_ptr()
+    assert first.block_table.tolist() == [[7, 3]]
+
+    common.block_table_tensor.copy_(torch.tensor([[5, 23, 13, 29]]))
+    second = builder.build(0, common)
+    assert second.block_table.data_ptr() == first_ptr
+    assert second.block_table.tolist() == [[5, 13]]
 
 
 @pytest.mark.parametrize("end", [127, 128, 129, 255, 256, 257])
@@ -1076,6 +1348,7 @@ def test_ring_source_reuses_prepared_store_coordinates(monkeypatch, num_tokens, 
     monkeypatch.setattr(dsa_v41, "scatter_cache_sk", store)
     monkeypatch.setattr(torch.ops._C_ascend, "inplace_partial_rotary_mul", lambda *args, **kwargs: None, raising=False)
     attn = SimpleNamespace(
+        uses_a5_packed_cache=False,
         compressor=SimpleNamespace(wkv=lambda x: x, wgate=lambda x: x, pool_projected=pool),
         indexer=SimpleNamespace(update_keys=update_keys),
         long_kv_cache=SimpleNamespace(kv_cache=[torch.empty(0)]),
@@ -1254,9 +1527,7 @@ def test_v41_cp_metadata_preserves_global_compression_and_local_causality(
     )
     spec = collect_specs(runtime)["model.layers.2.self_attn.long_kv_cache"]
     builder = DeepseekV41CPMetadataBuilder(spec, [], runtime, torch.device("cpu"))
-    metadata = builder.build(
-        0, _cp_common(), common_v41_metadata={}, common_v41_batch_metadata={}
-    )
+    metadata = builder.build(0, _cp_common(), common_v41_metadata={}, common_v41_batch_metadata={})
     assert metadata.query_start_loc.tolist() == query_offsets
     assert metadata.query_start_loc.dtype == torch.int32
     pointer = metadata.query_start_loc.data_ptr()
@@ -1309,9 +1580,7 @@ def test_v41_cp_rope_preserves_global_rows_across_builds(runtime, monkeypatch, r
     state = rope.RopeGlobalState()
     full = torch.arange(128, dtype=torch.float32).reshape(128, 1, 1, 1)
     state.full_rope_cache["test"] = (full, full + 1000)
-    state.runtime_buffer["test"] = {
-        "default": (torch.zeros(8, 1, 1, 1), torch.zeros(8, 1, 1, 1))
-    }
+    state.runtime_buffer["test"] = {"default": (torch.zeros(8, 1, 1, 1), torch.zeros(8, 1, 1, 1))}
     state.registry_summary["test"] = {"default"}
     state.layer_info["test.layer"] = ("test", ["default"])
     monkeypatch.setattr(rope, "_ROPE_STATE", state)
@@ -1329,9 +1598,13 @@ def test_v41_cp_rope_preserves_global_rows_across_builds(runtime, monkeypatch, r
         positions = torch.tensor([10, 20, 30, 40]) + step
         offsets = torch.arange(5, dtype=torch.int32)
         common = _cp_common().replace(
-            positions=positions, num_reqs=4, query_start_loc=offsets,
-            query_start_loc_cpu=offsets, seq_lens=(positions + 1).int(),
-            seq_lens_cpu=(positions + 1).int(), max_query_len=1,
+            positions=positions,
+            num_reqs=4,
+            query_start_loc=offsets,
+            query_start_loc_cpu=offsets,
+            seq_lens=(positions + 1).int(),
+            seq_lens_cpu=(positions + 1).int(),
+            max_query_len=1,
             max_seq_len=int(positions.max()) + 1,
             block_table_tensor=torch.zeros(4, 2, dtype=torch.int32),
             is_prefilling=torch.full((4,), prefill),
@@ -1340,7 +1613,7 @@ def test_v41_cp_rope_preserves_global_rows_across_builds(runtime, monkeypatch, r
         global_cos = metadata.global_metadata.cos["test.layer"]
         local_cos = metadata.cos["test.layer"]
         local_sin = metadata.sin["test.layer"]
-        expected = positions[rank:rank + 1].float()
+        expected = positions[rank : rank + 1].float()
         torch.testing.assert_close(global_cos.flatten(), positions.float())
         torch.testing.assert_close(local_cos.flatten(), expected)
         torch.testing.assert_close(local_sin.flatten(), expected + 1000)
@@ -1435,8 +1708,9 @@ def test_v41_cp_consumers_reuse_local_topk_and_candidates():
     indices = torch.tensor([[0, 2], [1, 3]])
     candidates = torch.tensor([[True, False]])
     shared = SimpleNamespace(topk_indices=indices, candidates=candidates)
+    metadata = SimpleNamespace(swa=SimpleNamespace(cp_token_range=(0, 2, 2, 2), num_actual_tokens=2))
     actual = impl._select_sparse_indices(
-        SimpleNamespace(shared_state=shared), torch.empty(2, 1), None, None, None, None, None
+        SimpleNamespace(shared_state=shared), torch.empty(2, 1), None, None, None, None, metadata
     )
     assert actual.data_ptr() == indices.data_ptr()
     torch.testing.assert_close(actual, indices)
@@ -1464,8 +1738,10 @@ def test_v41_backend_routes_metadata_and_execution_together(monkeypatch, pcp, cp
 def test_v41_cp_accepts_async_seq_lens_mirror(runtime, monkeypatch):
     from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPMetadataBuilder
 
-    monkeypatch.setattr("vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
-                        lambda: SimpleNamespace(world_size=2, rank_in_group=1))
+    monkeypatch.setattr(
+        "vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
+        lambda: SimpleNamespace(world_size=2, rank_in_group=1),
+    )
     common = _cp_common()
     common._seq_lens_cpu = common.seq_lens_cpu
     common.seq_lens_cpu = None
@@ -1506,6 +1782,7 @@ def test_v41_runtime_rejects_pcp_and_mrv2(runtime, v2, pcp):
 @pytest.mark.parametrize("overlap", [False, True])
 def test_v41_query_preparation_keeps_mainline_preprocess(overlap):
     from unittest.mock import Mock
+
     from vllm_ascend.attention.dsa_v41 import DeepseekV41EagerAttentionImpl
 
     impl = DeepseekV41EagerAttentionImpl.__new__(DeepseekV41EagerAttentionImpl)
@@ -1513,8 +1790,9 @@ def test_v41_query_preparation_keeps_mainline_preprocess(overlap):
     impl.preprocess = Mock(return_value=("q", "qr"))
     impl.multistream_preprocess = Mock(return_value=("q", "qr"))
     impl._write_compressed_source = Mock()
-    attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(
-        impl=SimpleNamespace(multistream_dsv4_dsa_overlap=overlap))))
+    attn = SimpleNamespace(
+        dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=SimpleNamespace(multistream_dsv4_dsa_overlap=overlap)))
+    )
     metadata = SimpleNamespace(swa=SimpleNamespace(num_actual_tokens=6))
     assert impl._prepare_queries(attn, "hidden", "positions", "cos", "sin", metadata) == ("q", "qr")
     selected = impl.multistream_preprocess if overlap else impl.preprocess
@@ -1527,18 +1805,18 @@ def test_v41_query_preparation_keeps_mainline_preprocess(overlap):
 @pytest.mark.parametrize("overlap", [False, True])
 def test_v41_cp_query_preparation_uses_full_inputs_only_for_overlap(overlap):
     from unittest.mock import Mock
+
     from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
 
     impl = DeepseekV41CPImpl.__new__(DeepseekV41CPImpl)
     impl._project_q = Mock(return_value=("q", "qr"))
     impl.multistream_preprocess = Mock(return_value=("q", "qr"))
     impl._write_compressed_source = Mock()
-    attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(
-        impl=SimpleNamespace(multistream_dsv4_dsa_overlap=overlap))))
+    attn = SimpleNamespace(
+        dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=SimpleNamespace(multistream_dsv4_dsa_overlap=overlap)))
+    )
     metadata = SimpleNamespace(swa=SimpleNamespace(num_actual_tokens=2, cp_token_range=(2, 4, 2, 6)))
-    assert impl._prepare_queries(
-        attn, "abcdef", "positions", "cos", "sin", metadata
-    ) == ("q", "qr")
+    assert impl._prepare_queries(attn, "abcdef", "positions", "cos", "sin", metadata) == ("q", "qr")
     if overlap:
         impl.multistream_preprocess.assert_called_once_with(attn, "abcdef", "cos", "sin", metadata.swa)
         impl._project_q.assert_not_called()
@@ -1552,6 +1830,7 @@ def test_v41_cp_query_preparation_uses_full_inputs_only_for_overlap(overlap):
 @pytest.mark.parametrize("local_tokens", [0, 2])
 def test_v41_cp_input_preparation_updates_empty_rank_cache(overlap, local_tokens):
     from unittest.mock import Mock
+
     from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
 
     impl = DeepseekV41CPImpl.__new__(DeepseekV41CPImpl)
@@ -1559,8 +1838,9 @@ def test_v41_cp_input_preparation_updates_empty_rank_cache(overlap, local_tokens
     global_metadata = SimpleNamespace(swa=SimpleNamespace(num_actual_tokens=5))
     impl._global_layer_metadata = Mock(return_value=global_metadata)
     impl._update_caches = Mock()
-    attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(
-        impl=SimpleNamespace(multistream_dsv4_dsa_overlap=overlap))))
+    attn = SimpleNamespace(
+        dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=SimpleNamespace(multistream_dsv4_dsa_overlap=overlap)))
+    )
     metadata = SimpleNamespace(swa=SimpleNamespace(cp_token_range=(3, 6, 3, 6), num_actual_tokens=local_tokens))
     assert impl._prepare_inputs_and_caches(attn, full, metadata, {}) is None
     if not overlap or local_tokens == 0:
@@ -1572,8 +1852,8 @@ def test_v41_cp_input_preparation_updates_empty_rank_cache(overlap, local_tokens
 
 
 def test_v41_cp_inherits_forward():
-    from vllm_ascend.attention.dsa_v41 import DeepseekV41EagerAttentionImpl
     from vllm_ascend.attention.context_parallel.dsa_v41_cp import DeepseekV41CPImpl
+    from vllm_ascend.attention.dsa_v41 import DeepseekV41EagerAttentionImpl
 
     assert DeepseekV41CPImpl.forward is DeepseekV41EagerAttentionImpl.forward
 
@@ -1585,9 +1865,17 @@ def test_dspark_v41_noncausal_metadata_preserves_full_visible_block(runtime, mon
     from vllm_ascend.core.deepseek_v41 import DeepseekV41DraftSWASpec
 
     runtime.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    # The target model uses A5 packed/quantized KV, but the draft cache remains
+    # BF16 and must use the packaged SparseFlashMla metadata ABI independently.
+    runtime.additional_config = {"dsv41_config": {"cache_format": "a5_packed"}}
     spec = DeepseekV41DraftSWASpec(
-        block_size=128, num_kv_heads=1, head_size=8, dtype=torch.bfloat16,
-        sliding_window=128, cache_dtype_str="bfloat16", model_version="deepseek_v4",
+        block_size=128,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.bfloat16,
+        sliding_window=128,
+        cache_dtype_str="bfloat16",
+        model_version="deepseek_v4",
     )
     common = _cp_common().replace(
         causal=False,
@@ -1600,7 +1888,7 @@ def test_dspark_v41_noncausal_metadata_preserves_full_visible_block(runtime, mon
         positions=torch.tensor([first_seq_len - 3, first_seq_len - 2, first_seq_len - 1, 4]),
     )
     native = Mock(return_value=torch.zeros(dsa_v41.V41_METADATA_BUFFER_SIZE, dtype=torch.int32))
-    monkeypatch.setattr(torch.ops._C_ascend, "npu_sparse_flash_mla_metadata", native, raising=False)
+    monkeypatch.setattr(dsa_v41, "sparse_flash_mla_metadata", native)
     builder = DeepseekV41MetadataBuilder(spec, [], runtime, torch.device("cpu"))
     builder._supports_device_ops = True
     full = builder.build_for_drafting(common, 1)
@@ -1609,13 +1897,15 @@ def test_dspark_v41_noncausal_metadata_preserves_full_visible_block(runtime, mon
         (full.ori_sparse_indices >= 0).sum(-1, dtype=torch.int32),
     )
     assert full.ori_topk_length is native.call_args.kwargs["ori_topk_length"]
+    assert native.call_args.kwargs["cmp_ratio"] == 1
     assert full.ori_mask_mode == 0
+    assert full.ori_win_left == full.ori_win_right == -1
     assert full.ori_sparse_indices.shape[0] == 4
     # Every query of the first request can see its complete draft block.
     torch.testing.assert_close(full.ori_sparse_indices[0], full.ori_sparse_indices[2])
     expected = list(range(max(0, first_seq_len - 3 - 128), first_seq_len))
-    assert full.ori_sparse_indices[0, 0, :len(expected)].tolist() == expected
-    assert torch.all(full.ori_sparse_indices[0, 0, len(expected):] == -1)
+    assert full.ori_sparse_indices[0, 0, : len(expected)].tolist() == expected
+    assert torch.all(full.ori_sparse_indices[0, 0, len(expected) :] == -1)
     assert full.ori_sparse_indices[3, 0, :5].tolist() == list(range(5))
     assert full.ori_topk_length[:, 0].tolist() == [len(expected)] * 3 + [5]
     if rank is None:
@@ -1637,6 +1927,55 @@ def test_dspark_v41_noncausal_metadata_preserves_full_visible_block(runtime, mon
             native.call_args.kwargs["ori_topk_length"],
             (local.ori_sparse_indices >= 0).sum(-1, dtype=torch.int32),
         )
-    torch.testing.assert_close(local.ori_sparse_indices, full.ori_sparse_indices[rank:rank + 1])
+    torch.testing.assert_close(local.ori_sparse_indices, full.ori_sparse_indices[rank : rank + 1])
     assert local.seq_lens.tolist() == ([first_seq_len, 0] if rank < 3 else [0, 0])
     assert local.ori_mask_mode == 0
+
+
+def test_a5_dspark_metadata_uses_mqsmla_without_cmp(runtime, monkeypatch):
+    runtime.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    runtime.additional_config = {
+        "dsv41_config": {
+            "cache_format": "a5_packed",
+        }
+    }
+    spec = DeepseekV41A5DraftSWASpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=A5_WIN_ROW_BYTES,
+        dtype=torch.uint8,
+        sliding_window=128,
+        cache_dtype_str="a5_fp8_g32_bf16_scale",
+        model_version="deepseek_v4",
+    )
+    common = _cp_common().replace(causal=False)
+    calls = []
+
+    def metadata_op(win_lengths, cmp_lengths, **kwargs):
+        calls.append((win_lengths.shape, cmp_lengths.shape, kwargs))
+        return torch.arange(4, dtype=torch.int32)
+
+    monkeypatch.setattr(dsa_v41, "import_packaged_a5_module", lambda _name: None)
+    monkeypatch.setattr(
+        dsa_v41.torch.ops,
+        "cann_ops_transformer",
+        SimpleNamespace(ds41=SimpleNamespace(mixed_quant_sparse_flash_mla_metadata=metadata_op)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        dsa_v41,
+        "get_cos_and_sin_dsa",
+        lambda positions, **kwargs: (positions.float(), positions.float()),
+    )
+    builder = DeepseekV41MetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    builder._supports_device_ops = True
+    builder._a5_smla_metadata = torch.empty(4, dtype=torch.int32)
+    builder._a5_smla_length_rows = torch.empty((4, 1), dtype=torch.int32)
+
+    metadata = builder.build_for_drafting(common, 1)
+
+    assert calls[0][0] == calls[0][1] == (4, 1)
+    assert calls[0][2]["has_cmp_kv"] is False
+    assert metadata.smla_metadata is builder._a5_smla_metadata
+    assert metadata.ori_sparse_indices.shape[0] == 4
+    torch.testing.assert_close(metadata.ori_sparse_indices[0], metadata.ori_sparse_indices[2])

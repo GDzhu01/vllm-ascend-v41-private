@@ -8,11 +8,19 @@ import torch
 import torch.nn.functional as F
 
 from vllm_ascend.core.deepseek_v41 import (
+    A5_CMP_ROW_BYTES,
+    A5_INDEX_DATA_BYTES,
+    A5_INDEX_SCALE_COUNT,
+    A5_WIN_ROW_BYTES,
     STATE_RING_ROWS,
+    DeepseekV41A5CompressedSpec,
+    DeepseekV41A5IndexerSpec,
+    DeepseekV41A5SWASpec,
     DeepseekV41CompressorStateSpec,
     DeepseekV41FullSpec,
     DeepseekV41IndexerSpec,
     DeepseekV41SWASpec,
+    uses_a5_packed_cache,
 )
 from vllm_ascend.models.deepseek_v41.compressor import _read, text_config_of
 from vllm_ascend.models.deepseek_v41.model import build_layer_plan
@@ -27,33 +35,69 @@ def build_v41_cache_specs(config: Any, vllm_config: Any, prefix: str = "model"):
     width = _read(config, "head_dim")
     index_width = _read(config, "index_head_dim")
     window = _read(config, "sliding_window")
+    a5_packed = uses_a5_packed_cache(vllm_config)
+    if a5_packed and (width != 512 or index_width != 128):
+        raise ValueError("A5 packed-cache reference requires head_dim=512 and index_head_dim=128")
     specs = {}
     for role in build_layer_plan(config).layers:
         attn_prefix = f"{prefix}.layers.{role.layer_idx}.self_attn"
-        specs[f"{attn_prefix}.swa_cache"] = DeepseekV41SWASpec(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=width,
-            dtype=torch.bfloat16,
-            sliding_window=window,
+        specs[f"{attn_prefix}.swa_cache"] = (
+            DeepseekV41A5SWASpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=A5_WIN_ROW_BYTES,
+                dtype=torch.uint8,
+                sliding_window=window,
+            )
+            if a5_packed
+            else DeepseekV41SWASpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=width,
+                dtype=torch.bfloat16,
+                sliding_window=window,
+            )
         )
         if not role.is_kv_source:
             continue
-        specs[f"{attn_prefix}.long_kv_cache"] = DeepseekV41FullSpec(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=width,
-            dtype=torch.bfloat16,
-            compress_ratio=role.compress_ratio,
+        specs[f"{attn_prefix}.long_kv_cache"] = (
+            DeepseekV41A5CompressedSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=A5_CMP_ROW_BYTES,
+                dtype=torch.uint8,
+                scale_dtype=torch.bfloat16,
+                compress_ratio=role.compress_ratio,
+            )
+            if a5_packed
+            else DeepseekV41FullSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=width,
+                dtype=torch.bfloat16,
+                compress_ratio=role.compress_ratio,
+            )
         )
-        specs[f"{attn_prefix}.indexer.k_cache"] = DeepseekV41IndexerSpec(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=index_width,
-            dtype=torch.int8,
-            compress_ratio=role.compress_ratio,
-            scale_dim=1,
-            scale_dtype=torch.float16,
+        specs[f"{attn_prefix}.indexer.k_cache"] = (
+            DeepseekV41A5IndexerSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=A5_INDEX_DATA_BYTES,
+                dtype=torch.uint8,
+                compress_ratio=role.compress_ratio,
+                scale_dim=A5_INDEX_SCALE_COUNT,
+                scale_dtype=torch.uint8,
+            )
+            if a5_packed
+            else DeepseekV41IndexerSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=index_width,
+                dtype=torch.int8,
+                compress_ratio=role.compress_ratio,
+                scale_dim=1,
+                scale_dtype=torch.float16,
+            )
         )
         if role.compress_ratio == 2:
             specs[f"{attn_prefix}.compressor.state_cache"] = DeepseekV41CompressorStateSpec(

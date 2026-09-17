@@ -58,5 +58,17 @@ def deepseek_v41_triton_warmup(worker: NPUWorker) -> None:
     for tokens in token_counts:
         selected = torch.zeros(tokens, config.index_topk, dtype=torch.int32, device=device)
         positions = torch.zeros(tokens, dtype=torch.int64, device=device)
+        topk_indices = torch.empty_like(selected)
+        topk_lengths = torch.empty(tokens, 1, dtype=torch.int32, device=device)
         for ratio in ratios:
+            # Keep the compatibility variant warm for standalone A3 callers,
+            # and warm the V4.1 A5 production variant that also publishes the
+            # MQSMLA length side channel.
             prepare_indexer_indices(selected, positions, ratio)
+            prepare_indexer_indices(
+                selected,
+                positions,
+                ratio,
+                indices_output=topk_indices,
+                lengths_output=topk_lengths,
+            )
