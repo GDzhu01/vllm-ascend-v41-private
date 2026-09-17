@@ -21,16 +21,28 @@ from types import ModuleType
 
 _triton_available = importlib.util.find_spec("triton") is not None
 
-if "triton.experimental" not in sys.modules:
-    _experimental = ModuleType("triton.experimental")
-    _experimental.__path__ = []
-    sys.modules["triton.experimental"] = _experimental
-for _gluon_stub in (
-    "triton.experimental.gluon",
-    "triton.experimental.gluon.language",
-):
-    if _gluon_stub not in sys.modules:
-        sys.modules[_gluon_stub] = ModuleType(_gluon_stub)
+try:
+    _triton_gluon_available = (
+        _triton_available
+        and importlib.util.find_spec("triton.experimental.gluon") is not None
+    )
+except (AttributeError, ModuleNotFoundError):
+    _triton_gluon_available = False
+
+# Older triton-ascend releases do not ship Gluon while newer releases do.
+# Only create the compatibility stubs for the former: shadowing a real Gluon
+# package breaks Triton's generated launchers when they import backend types.
+if not _triton_gluon_available:
+    if "triton.experimental" not in sys.modules:
+        _experimental = ModuleType("triton.experimental")
+        _experimental.__path__ = []
+        sys.modules["triton.experimental"] = _experimental
+    for _gluon_stub in (
+        "triton.experimental.gluon",
+        "triton.experimental.gluon.language",
+    ):
+        if _gluon_stub not in sys.modules:
+            sys.modules[_gluon_stub] = ModuleType(_gluon_stub)
 
 # main2main compat: `_aggregate` was added to triton.language.core in
 # vllm main post-0.26.0. Stub it here so vllm.triton_utils can import it
