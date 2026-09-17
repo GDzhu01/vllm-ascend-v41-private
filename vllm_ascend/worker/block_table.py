@@ -18,6 +18,25 @@ from vllm_ascend.ops.triton.compute_slot_mapping import (
 )
 
 
+class _CpuGpuBufferRow:
+    """A row view that preserves the small ``CpuGpuBuffer`` interface."""
+
+    def __init__(self, backing: CpuGpuBuffer, row: int) -> None:
+        self.cpu = backing.cpu[row]
+        self.gpu = backing.gpu[row]
+        self.np = backing.np[row]
+
+    def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
+        if n is None:
+            return self.gpu.copy_(self.cpu, non_blocking=True)
+        return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
+
+    def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
+        if n is None:
+            return self.cpu.copy_(self.gpu, non_blocking=True)
+        return self.cpu[:n].copy_(self.gpu[:n], non_blocking=True)
+
+
 class BlockTable:
     def __init__(
         self,
@@ -31,6 +50,7 @@ class BlockTable:
         cp_kv_cache_interleave_size: int = 1,
         num_speculative_tokens: int = 0,
         kv_cache_group: KVCacheGroupSpec = None,
+        slot_mapping: _CpuGpuBufferRow | None = None,
     ):
         self.max_num_reqs = max_num_reqs
         self.dcp_world_size = get_dcp_group().world_size
@@ -91,8 +111,9 @@ class BlockTable:
         # MTP slot preparation appends up to num_speculative_tokens - 1
         # draft positions for every request beyond the scheduler token limit.
         num_mtp_draft_slots = max(num_speculative_tokens - 1, 0) * self.max_num_reqs
-        self.slot_mapping = self._make_buffer(
-            self.max_num_batched_tokens + num_mtp_draft_slots,
+        slot_mapping_capacity = self.max_num_batched_tokens + num_mtp_draft_slots
+        self.slot_mapping = slot_mapping or self._make_buffer(
+            slot_mapping_capacity,
             dtype=torch.int32,
         )
 
@@ -365,6 +386,24 @@ class MultiGroupBlockTable:
                 f"max_num_blocks length ({len(max_num_blocks)}) must match block_sizes length ({len(block_sizes)})"
             )
 
+        # Keep every group's slot mapping in one allocation. Besides reducing
+        # allocator/object overhead, this lets A5 publish all cache-address
+        # layouts with a two-dimensional Triton launch and no gather/copy.
+        slot_mapping_capacity = max_num_batched_tokens + max(
+            num_speculative_tokens - 1, 0
+        ) * max_num_reqs
+        self.slot_mapping = CpuGpuBuffer(
+            len(block_sizes),
+            slot_mapping_capacity,
+            dtype=torch.int32,
+            device=device,
+            pin_memory=pin_memory,
+        )
+        slot_mapping_rows = [
+            _CpuGpuBufferRow(self.slot_mapping, row)
+            for row in range(len(block_sizes))
+        ]
+
         # Use zip to pair block_sizes with kernel_sizes one-to-one
         if kv_cache_groups is not None:
             self.block_tables = [
@@ -379,9 +418,20 @@ class MultiGroupBlockTable:
                     cp_kv_cache_interleave_size,
                     num_speculative_tokens,
                     kv_cache_group,
+                    slot_mapping_row,
                 )
-                for block_size, kernel_size_list, max_num_blocks_per_req, kv_cache_group in zip(
-                    block_sizes, kernel_sizes, max_num_blocks, kv_cache_groups
+                for (
+                    block_size,
+                    kernel_size_list,
+                    max_num_blocks_per_req,
+                    kv_cache_group,
+                    slot_mapping_row,
+                ) in zip(
+                    block_sizes,
+                    kernel_sizes,
+                    max_num_blocks,
+                    kv_cache_groups,
+                    slot_mapping_rows,
                 )
             ]
         else:
@@ -396,9 +446,18 @@ class MultiGroupBlockTable:
                     kernel_size_list,
                     cp_kv_cache_interleave_size,
                     num_speculative_tokens,
+                    slot_mapping=slot_mapping_row,
                 )
-                for block_size, kernel_size_list, max_num_blocks_per_req in zip(
-                    block_sizes, kernel_sizes, max_num_blocks
+                for (
+                    block_size,
+                    kernel_size_list,
+                    max_num_blocks_per_req,
+                    slot_mapping_row,
+                ) in zip(
+                    block_sizes,
+                    kernel_sizes,
+                    max_num_blocks,
+                    slot_mapping_rows,
                 )
             ]
 

@@ -104,6 +104,42 @@ class TestBlockTableComputeSlotMapping(TestBase):
         self.assertEqual(block_table.slot_mapping.cpu.numel(), 128)
         self.assertEqual(block_table.slot_mapping.cpu[: req_indices.size].numel(), 110)
 
+    def test_multigroup_slot_mappings_share_contiguous_backing(self):
+        from vllm_ascend.worker.block_table import MultiGroupBlockTable
+
+        with (
+            patch(
+                "vllm_ascend.worker.block_table.get_dcp_group",
+                return_value=SimpleNamespace(world_size=1, rank_in_group=0),
+            ),
+            patch(
+                "vllm_ascend.worker.block_table.get_decode_context_model_parallel_world_size",
+                return_value=1,
+            ),
+        ):
+            tables = MultiGroupBlockTable(
+                max_num_reqs=4,
+                max_model_len=1024,
+                max_num_batched_tokens=64,
+                pin_memory=False,
+                device=torch.device("cpu"),
+                block_sizes=[128, 128, 128],
+                num_speculative_tokens=5,
+                kernel_sizes=[[128], [128], [128]],
+            )
+
+        self.assertEqual(tables.slot_mapping.gpu.shape, (3, 80))
+        for group_id, table in enumerate(tables.block_tables):
+            self.assertEqual(
+                table.slot_mapping.gpu.data_ptr(),
+                tables.slot_mapping.gpu[group_id].data_ptr(),
+            )
+            table.slot_mapping.cpu.fill_(group_id + 1)
+        torch.testing.assert_close(
+            tables.slot_mapping.cpu[:, 0],
+            torch.tensor([1, 2, 3], dtype=torch.int32),
+        )
+
     def test_mamba_table_preserves_speculative_capacity_with_dcp(self):
         from vllm_ascend.worker.block_table import BlockTable
 

@@ -981,6 +981,25 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         self._device_metadata_tasks = ()
         return tasks
 
+    def a5_slot_mapping_layout(
+        self,
+    ) -> tuple[str, str, int, int] | None:
+        """Return the reusable address-layout keys for the batched A5 path."""
+        spec = self.kv_cache_spec
+        if not self._uses_a5_packed_cache or isinstance(
+            spec, DeepseekV41CompressorStateSpec
+        ):
+            return None
+        compressed = isinstance(spec, (DeepseekV41FullSpec, DeepseekV41IndexerSpec))
+        ratio = getattr(spec, "compress_ratio", 1) if compressed else 1
+        page_size = spec.storage_block_size
+        return (
+            f"slot:coordinates:c{ratio}:b{page_size}",
+            f"slot:flat:c{ratio}:b{page_size}",
+            page_size,
+            ratio,
+        )
+
     def _publish_task(
         self,
         shared: dict[str, Any],

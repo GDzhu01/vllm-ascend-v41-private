@@ -163,6 +163,7 @@ from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.models.glm5next.kv_cache import KpoolTailSpec
 from vllm_ascend.ops.fused_moe.force_eplb import build_force_eplb_topk
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
+from vllm_ascend.ops.triton.a5_slot_mapping import build_a5_slot_mapping_batch
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
@@ -310,6 +311,24 @@ class ExecuteModelState(NamedTuple):
     batch_desc: BatchDescriptor
 
 
+@dataclass(frozen=True)
+class _A5SlotMappingLayout:
+    group_id: int
+    coordinates_key: str
+    flat_key: str
+    page_size: int
+    compress_ratio: int
+
+
+@dataclass(frozen=True)
+class _A5SlotMappingBatch:
+    start: int
+    end: int
+    page_size: int
+    compress_ratio: int
+    group_ids: torch.Tensor
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Must be set before super().__init__() because parent init may call
@@ -335,6 +354,17 @@ class NPUModelRunner(GPUModelRunner):
         self._attention_group_view_cache: dict[
             tuple[int, int, int, int],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
+        self._a5_slot_mapping_layouts: tuple[_A5SlotMappingLayout, ...] = ()
+        self._a5_slot_mapping_batches: tuple[_A5SlotMappingBatch, ...] = ()
+        self._a5_slot_coordinates: torch.Tensor | None = None
+        self._a5_flat_slots: torch.Tensor | None = None
+        self._a5_slot_mapping_view_cache: dict[
+            int,
+            tuple[
+                tuple[tuple[torch.Tensor, torch.Tensor], ...],
+                tuple[dict[str, torch.Tensor], ...],
+            ],
         ] = {}
         self.pin_memory = PIN_MEMORY
 
@@ -3579,12 +3609,22 @@ class NPUModelRunner(GPUModelRunner):
         # in the same group share the same metadata.
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
         common_v41_batch_metadata: dict[str, Any] = {}
+        a5_group_slot_metadata = self._build_a5_slot_mapping_batch(
+            num_tokens_padded,
+            num_reqs,
+            num_tokens,
+            skip_gdn_state_update,
+        )
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             # V4.1 cache coordinates are shared only inside one framework KV
             # cache group. This lets a source's LongKV and Indexer reuse the
             # same [T, 2] mapping without aliasing any SWA group's mapping.
-            common_v41_metadata: dict[str, Any] = {}
+            common_v41_metadata: dict[str, Any] = (
+                a5_group_slot_metadata[kv_cache_gid]
+                if a5_group_slot_metadata
+                else {}
+            )
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -4261,6 +4301,142 @@ class NPUModelRunner(GPUModelRunner):
 
         self.debugger.step(**kwargs)
 
+    def _initialize_a5_slot_mapping_batch(self) -> None:
+        self._a5_slot_mapping_layouts = ()
+        self._a5_slot_mapping_batches = ()
+        self._a5_slot_coordinates = None
+        self._a5_flat_slots = None
+        self._a5_slot_mapping_view_cache.clear()
+
+        shared_slot_mapping = getattr(
+            self.input_batch.block_table,
+            "slot_mapping",
+            None,
+        )
+        slots = getattr(shared_slot_mapping, "gpu", None)
+        if not isinstance(slots, torch.Tensor) or slots.ndim != 2:
+            return
+
+        layouts = set()
+        for group_id, attn_groups in enumerate(self.attn_groups):
+            for attn_group in attn_groups:
+                for builder in attn_group.metadata_builders:
+                    if not isinstance(builder, DeepseekV41MetadataBuilder):
+                        continue
+                    layout = builder.a5_slot_mapping_layout()
+                    if layout is not None:
+                        layouts.add((group_id, *layout))
+        if not layouts:
+            return
+
+        ordered = tuple(
+            _A5SlotMappingLayout(*layout)
+            for layout in sorted(
+                layouts,
+                key=lambda layout: (layout[4], layout[3], layout[0], layout[1]),
+            )
+        )
+        self._a5_slot_mapping_layouts = ordered
+        self._a5_slot_coordinates = torch.empty(
+            (len(ordered), self.max_num_tokens, 2),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._a5_flat_slots = torch.empty(
+            (len(ordered), self.max_num_tokens),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        batches = []
+        start = 0
+        while start < len(ordered):
+            layout = ordered[start]
+            end = start + 1
+            while (
+                end < len(ordered)
+                and ordered[end].page_size == layout.page_size
+                and ordered[end].compress_ratio == layout.compress_ratio
+            ):
+                end += 1
+            batches.append(
+                _A5SlotMappingBatch(
+                    start=start,
+                    end=end,
+                    page_size=layout.page_size,
+                    compress_ratio=layout.compress_ratio,
+                    group_ids=torch.tensor(
+                        [entry.group_id for entry in ordered[start:end]],
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                )
+            )
+            start = end
+        self._a5_slot_mapping_batches = tuple(batches)
+
+    def _build_a5_slot_mapping_batch(
+        self,
+        num_tokens: int,
+        num_actual_reqs: int,
+        num_actual_tokens: int,
+        skip_update: bool,
+    ) -> tuple[dict[str, torch.Tensor], ...]:
+        if not self._a5_slot_mapping_layouts:
+            return ()
+        assert self._a5_slot_coordinates is not None
+        assert self._a5_flat_slots is not None
+
+        cached = self._a5_slot_mapping_view_cache.get(num_tokens)
+        if cached is None:
+            batch_views = tuple(
+                (
+                    self._a5_slot_coordinates[
+                        batch.start : batch.end,
+                        :num_tokens,
+                    ],
+                    self._a5_flat_slots[
+                        batch.start : batch.end,
+                        :num_tokens,
+                    ],
+                )
+                for batch in self._a5_slot_mapping_batches
+            )
+            group_views = [{} for _ in self.kv_cache_config.kv_cache_groups]
+            for row, layout in enumerate(self._a5_slot_mapping_layouts):
+                group_views[layout.group_id][layout.coordinates_key] = (
+                    self._a5_slot_coordinates[row, :num_tokens]
+                )
+                group_views[layout.group_id][layout.flat_key] = (
+                    self._a5_flat_slots[row, :num_tokens]
+                )
+            cached = batch_views, tuple(group_views)
+            self._a5_slot_mapping_view_cache[num_tokens] = cached
+
+        batch_views, group_views = cached
+        slots = self.input_batch.block_table.slot_mapping.gpu
+        for batch, (coordinates, flat_slots) in zip(
+            self._a5_slot_mapping_batches,
+            batch_views,
+        ):
+            build_a5_slot_mapping_batch(
+                slots,
+                batch.group_ids,
+                self.positions,
+                self.query_start_loc.gpu,
+                num_tokens,
+                num_actual_reqs,
+                num_actual_tokens,
+                batch.page_size,
+                batch.compress_ratio,
+                skip_update=skip_update,
+                coordinates_output=coordinates,
+                flat_output=flat_slots,
+            )
+        # Builders append group-local operator metadata, so retain only the
+        # address views in the persistent cache and hand out fresh mappings.
+        return tuple(dict(views) for views in group_views)
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -4283,6 +4459,7 @@ class NPUModelRunner(GPUModelRunner):
         self.need_accepted_tokens = kv_cache_config.has_mamba_layers
 
         self.may_reinitialize_input_batch(kv_cache_config)
+        self._initialize_a5_slot_mapping_batch()
         if self.sparse_kv_offload_enabled:
             self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
                 self.vllm_config,
