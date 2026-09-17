@@ -1709,7 +1709,18 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
     def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)
         runner.device = torch.device("cpu")
-        runner._pending_spec_decode_metadata_copies = deque()
+        runner.max_num_reqs = 4
+        runner.num_spec_tokens = 3
+        runner._spec_decode_metadata_buffer = None
+        runner._spec_decode_metadata_offsets = ()
+        runner._make_buffer = lambda *size, dtype, numpy=True: CpuGpuBuffer(
+            *size,
+            dtype=dtype,
+            device=runner.device,
+            pin_memory=False,
+            with_numpy=numpy,
+        )
+        runner._init_spec_decode_metadata_buffer()
         runner.vllm_config = MagicMock()
         runner.model_config = MagicMock()
         runner.use_compress = False
@@ -1834,35 +1845,32 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
         self.assertEqual(runner.input_ids.gpu.tolist(), [11, 0, 0, 0])
         self.assertEqual(runner.input_ids.cpu.tolist(), [11, -1, -1, -1])
 
-    def test_spec_decode_metadata_keeps_cpu_sources_until_h2d_completes(self):
+    def test_spec_decode_metadata_reuses_one_packed_buffer(self):
         runner = self._build_runner()
-        runner.device = SimpleNamespace(type="npu")
-        sources = tuple(MagicMock() for _ in range(5))
-        device_values = tuple(MagicMock() for _ in range(5))
-        for source, device_value in zip(sources, device_values):
-            source.to.return_value = device_value
-        copy_done = MagicMock()
-        copy_done.query.return_value = False
-        fake_npu = SimpleNamespace(
-            Event=MagicMock(return_value=copy_done),
-            current_stream=MagicMock(),
+        first_values = (
+            np.array([1, 3], dtype=np.int32),
+            np.array([2, 5], dtype=np.int32),
+            np.array([0, 1, 4, 5, 6], dtype=np.int32),
+            np.array([0, 4, 5], dtype=np.int32),
+            np.array([1, 4], dtype=np.int32),
+        )
+        pointers = tuple(
+            value.data_ptr()
+            for value in runner._copy_spec_decode_metadata_to_device(first_values)
         )
 
-        with patch.object(torch, "npu", fake_npu, create=True):
-            result = runner._copy_spec_decode_metadata_to_device(sources)
+        second_values = tuple(value + 10 for value in first_values)
+        with patch.object(
+            runner._spec_decode_metadata_buffer,
+            "copy_to_gpu",
+            wraps=runner._spec_decode_metadata_buffer.copy_to_gpu,
+        ) as packed_copy:
+            result = runner._copy_spec_decode_metadata_to_device(second_values)
+            packed_copy.assert_called_once_with()
 
-            self.assertEqual(result, device_values)
-            pending_sources, event = runner._pending_spec_decode_metadata_copies[0]
-            self.assertIs(pending_sources, sources)
-            self.assertIs(event, copy_done)
-            for source in sources:
-                source.to.assert_called_once_with(runner.device, non_blocking=True)
-            fake_npu.current_stream.assert_called_once_with()
-            copy_done.record.assert_called_once_with(fake_npu.current_stream.return_value)
-
-            copy_done.query.return_value = True
-            runner._copy_spec_decode_metadata_to_device(sources)
-        self.assertEqual(len(runner._pending_spec_decode_metadata_copies), 1)
+        self.assertEqual(tuple(value.data_ptr() for value in result), pointers)
+        for actual, expected in zip(result, second_values):
+            torch.testing.assert_close(actual, torch.from_numpy(expected))
 
 
 class TestNPUModelRunnerDebugger(unittest.TestCase):

@@ -654,13 +654,10 @@ class NPUModelRunner(GPUModelRunner):
         self._pending_encoder_cache_copies: deque[
             tuple[torch.Tensor, torch.npu.Event]
         ] = deque()
-        # Keep the pinned CPU sources for speculative-decode metadata alive
-        # until their asynchronous H2D copies have completed.  Creating the
-        # sources as temporaries in ``_calc_spec_decode_metadata`` lets the
-        # pinned allocator reuse their storage while DMA is still reading it.
-        self._pending_spec_decode_metadata_copies: deque[
-            tuple[tuple[torch.Tensor, ...], torch.npu.Event]
-        ] = deque()
+        self._spec_decode_metadata_buffer = None
+        self._spec_decode_metadata_offsets: tuple[int, ...] = ()
+        if self.num_spec_tokens:
+            self._init_spec_decode_metadata_buffer()
 
         self.sparse_kv_offload_config = self.ascend_config.sparse_kv_offload_config
         self.sparse_kv_offload_enabled = self.sparse_kv_offload_config.enabled
@@ -1659,22 +1656,39 @@ class NPUModelRunner(GPUModelRunner):
         input_ids = self.input_ids.gpu[:num_forward_tokens]
         input_ids.masked_fill_(input_ids == PLACEHOLDER_TOKEN_ID, 0)
 
-    def _copy_spec_decode_metadata_to_device(
-        self, cpu_metadata: tuple[torch.Tensor, ...]
-    ) -> tuple[torch.Tensor, ...]:
-        device_metadata = tuple(
-            value.to(self.device, non_blocking=True) for value in cpu_metadata
+    def _init_spec_decode_metadata_buffer(self) -> None:
+        capacities = (
+            self.max_num_reqs,
+            self.max_num_reqs,
+            self.max_num_reqs * (self.num_spec_tokens + 1),
+            self.max_num_reqs * self.num_spec_tokens,
+            self.max_num_reqs,
         )
-        if self.device.type == "cpu":
-            return device_metadata
+        offsets = np.cumsum((0, *capacities), dtype=np.int32)
+        self._spec_decode_metadata_offsets = tuple(int(value) for value in offsets)
+        self._spec_decode_metadata_buffer = self._make_buffer(
+            int(offsets[-1]),
+            dtype=torch.int32,
+        )
 
-        pending_copies = self._pending_spec_decode_metadata_copies
-        while pending_copies and pending_copies[0][1].query():
-            pending_copies.popleft()
-        copy_done = torch.npu.Event()
-        copy_done.record(torch.npu.current_stream())
-        pending_copies.append((cpu_metadata, copy_done))
-        return device_metadata
+    def _copy_spec_decode_metadata_to_device(
+        self, cpu_metadata: tuple[np.ndarray, ...]
+    ) -> tuple[torch.Tensor, ...]:
+        buffer = self._spec_decode_metadata_buffer
+        assert buffer is not None
+        offsets = self._spec_decode_metadata_offsets
+        device_metadata = []
+        for index, value in enumerate(cpu_metadata):
+            start = offsets[index]
+            end = start + value.size
+            buffer.np[start:end] = value
+            device_metadata.append(buffer.gpu[start:end])
+
+        # ``synchronize_input_prep`` waits for the previous step before these
+        # persistent pinned bytes are overwritten, then records completion of
+        # this single packed H2D at the end of input preparation.
+        buffer.copy_to_gpu()
+        return tuple(device_metadata)
 
     def _calc_spec_decode_metadata(
         self,
@@ -1721,15 +1735,12 @@ class NPUModelRunner(GPUModelRunner):
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += arange
 
-        cpu_metadata = tuple(
-            torch.from_numpy(value).pin_memory()
-            for value in (
-                cu_num_draft_tokens,
-                cu_num_sampled_tokens,
-                logits_indices,
-                target_logits_indices,
-                bonus_logits_indices,
-            )
+        cpu_metadata = (
+            cu_num_draft_tokens,
+            cu_num_sampled_tokens,
+            logits_indices,
+            target_logits_indices,
+            bonus_logits_indices,
         )
         (
             cu_num_draft_tokens,
