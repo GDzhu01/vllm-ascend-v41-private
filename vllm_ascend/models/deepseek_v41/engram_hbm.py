@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Node-local BF16/INT8 Engram storage, independent of model TP."""
+"""Node-local Engram storage, independent of model TP."""
 
 import json
 import socket
@@ -117,10 +117,15 @@ class NodeShardedEngram(nn.Module):
 
     def __init__(self, rows, width, query_group, device=None, storage_format="bf16"):
         super().__init__()
-        if storage_format not in ("bf16", "int8", "fp8", "mxfp8"):
-            raise ValueError("Engram storage_format must be bf16, int8, fp8, or mxfp8")
-        if storage_format in ("int8", "fp8", "mxfp8") and width % 32:
+        if storage_format not in ("bf16", "int8", "fp8", "mxfp8", "mxfp8_hbm"):
+            raise ValueError(
+                "Engram storage_format must be bf16, int8, fp8, mxfp8, "
+                "or mxfp8_hbm"
+            )
+        if storage_format in ("int8", "fp8", "mxfp8", "mxfp8_hbm") and width % 32:
             raise ValueError("INT8 Engram requires a width divisible by 32")
+        if storage_format == "mxfp8_hbm" and (width // 32) % 2:
+            raise ValueError("MXFP8 HBM Engram requires an even number of group32 scales")
         self.storage_format = storage_format
         self.rows, self.width = rows, width
         self.query_group = query_group
@@ -154,9 +159,13 @@ class NodeShardedEngram(nn.Module):
                     torch.int8
                     if storage_format == "int8"
                     else (
-                        torch.float8_e4m3fn
-                        if storage_format in ("fp8", "mxfp8")
-                        else torch.bfloat16
+                        torch.uint8
+                        if storage_format == "mxfp8_hbm"
+                        else (
+                            torch.float8_e4m3fn
+                            if storage_format in ("fp8", "mxfp8")
+                            else torch.bfloat16
+                        )
                     )
                 ),
                 device=(torch.device("cpu") if storage_format in ("fp8", "mxfp8") else device),
@@ -177,6 +186,19 @@ class NodeShardedEngram(nn.Module):
                     dtype=torch.float8_e8m0fnu,
                     device="cpu",
                     pin_memory=False,
+                ),
+            )
+        elif storage_format == "mxfp8_hbm":
+            # Keep checkpoint bits in byte tensors because NPU embedding/index
+            # kernels do not accept native float8 tensors.  Reinterpret the
+            # selected rows only when the fused MX dequant kernel consumes them.
+            self.register_buffer(
+                "weight_scale",
+                torch.empty(
+                    self.end - self.start,
+                    width // 32,
+                    dtype=torch.uint8,
+                    device=device,
                 ),
             )
 
@@ -259,6 +281,25 @@ class NodeShardedEngram(nn.Module):
                 rows = decoded_slot
             else:
                 rows = decoded.bfloat16()
+        elif self.storage_format == "mxfp8_hbm":
+            codes = torch.index_select(self.weight, 0, flat_ids)
+            scales = torch.index_select(self.weight_scale, 0, flat_ids)
+            if codes.device.type == "npu":
+                # Import lazily so the standalone CPU routing tests do not
+                # require torch_npu.
+                import torch_npu
+
+                rows = torch_npu.npu_anti_mx_quant(
+                    codes.view(torch.float8_e4m3fn),
+                    scales.view(torch.float8_e8m0fnu).unflatten(-1, (-1, 2)),
+                    axis=-1,
+                    dst_type=torch.bfloat16,
+                    src_type=torch.float8_e4m3fn,
+                ).reshape(-1, self.width)
+            else:
+                values = codes.view(torch.float8_e4m3fn).float().unflatten(-1, (-1, 32))
+                powers = torch.pow(2.0, scales.float() - 127.0).unsqueeze(-1)
+                rows = (values * powers).flatten(-2).bfloat16()
         else:
             rows = torch.index_select(self.weight, 0, flat_ids)
         return rows.view(*original_shape, self.width)
@@ -278,7 +319,10 @@ class NodeShardedEngram(nn.Module):
         enter the node-local all-to-all response buffer.
         """
         root = Path(model_path)
-        index = json.loads((root / "quant_model_weights.safetensors.index.json").read_text())["weight_map"]
+        index_path = root / "quant_model_weights.safetensors.index.json"
+        if not index_path.is_file():
+            index_path = root / "model.safetensors.index.json"
+        index = json.loads(index_path.read_text())["weight_map"]
         scale_key = key.removesuffix(".weight") + ".scale"
         with safe_open(root / index[key], framework="pt", device="cpu") as file:
             tensor = file.get_slice(key)
@@ -308,6 +352,27 @@ class NodeShardedEngram(nn.Module):
                         stop = min(start + chunk_rows, self.end)
                         self.weight.data[start-self.start:stop-self.start].copy_(tensor[start:stop])
                         self.weight_scale[start-self.start:stop-self.start].copy_(scale[start:stop])
+                return
+            if self.storage_format == "mxfp8_hbm":
+                if source_dtype not in ("F8_E4M3", "F8_E4M3FN") or scale_key not in index:
+                    raise ValueError(f"{key}: mxfp8_hbm requires FP8 weight and .scale")
+                with safe_open(root / index[scale_key], framework="pt", device="cpu") as sf:
+                    scale = sf.get_slice(scale_key)
+                    if (
+                        scale.get_shape() != [self.rows, self.width // 32]
+                        or scale.get_dtype() != "F8_E8M0"
+                    ):
+                        raise ValueError(
+                            f"{scale_key}: expected E8M0 [{self.rows}, {self.width // 32}]"
+                        )
+                    for start in range(self.start, self.end, chunk_rows):
+                        stop = min(start + chunk_rows, self.end)
+                        self.weight.data[start-self.start:stop-self.start].copy_(
+                            tensor[start:stop].view(torch.uint8)
+                        )
+                        self.weight_scale[start-self.start:stop-self.start].copy_(
+                            scale[start:stop].view(torch.uint8)
+                        )
                 return
             if source_dtype != "BF16":
                 raise ValueError(f"{key}: expected BF16 source for {self.storage_format}")

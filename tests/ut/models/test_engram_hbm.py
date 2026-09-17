@@ -239,6 +239,46 @@ def test_shard_loader(tmp_path):
     assert torch.equal(torch.cat(pieces), weights)
 
 
+def test_mxfp8_hbm_loader_uses_release_index_and_preserves_bits(tmp_path):
+    rows, width = 17, 64
+    key = "layers.1.engram.embed.weight"
+    scale_key = "layers.1.engram.embed.scale"
+    weight = torch.linspace(-4, 4, rows * width).reshape(rows, width).to(torch.float8_e4m3fn)
+    scale = torch.tensor(
+        [[1.0, 2.0]] * rows,
+        dtype=torch.float8_e8m0fnu,
+    )
+    save_file({key: weight, scale_key: scale}, tmp_path / "weights.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": {key: "weights.safetensors", scale_key: "weights.safetensors"}}
+        )
+    )
+    q = type("QueryGroup", (), {"size": 2, "rank": 1})()
+    table = hbm.NodeShardedEngram(
+        rows,
+        width,
+        q,
+        device="cpu",
+        storage_format="mxfp8_hbm",
+    )
+    table.load_checkpoint(tmp_path, key, chunk_rows=3)
+    assert torch.equal(table.weight, weight[table.start : table.end].view(torch.uint8))
+    assert torch.equal(table.weight_scale, scale[table.start : table.end].view(torch.uint8))
+
+    ids = torch.tensor([0, table.end - table.start - 1])
+    actual = table.lookup_local(ids)
+    expected = (
+        weight[table.start : table.end][ids]
+        .float()
+        .unflatten(-1, (-1, 32))
+        .mul(scale[table.start : table.end][ids].float().unsqueeze(-1))
+        .flatten(-2)
+        .bfloat16()
+    )
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
 def test_cached_metadata_stays_on_cpu_with_device_context():
     q = type("QueryGroup", (), {"size": 4, "rank": 1, "is_source": False})()
     with torch.device("meta"):
@@ -270,6 +310,21 @@ def test_gate_preserves_masked_rows():
                torch.tensor([True, False, True]), 1e-5)
     assert torch.equal(out[1], hidden[1])
     assert torch.isfinite(out.float()).all()
+
+
+def test_a5_checkpoint_without_quarot_uses_native_basis(tmp_path):
+    block = gate_mod.load_engram_rotation_block(tmp_path, hidden_size=64)
+    assert torch.equal(block, torch.eye(32))
+
+
+def test_a3_checkpoint_rotation_is_still_loaded(tmp_path):
+    optional = tmp_path / "optional"
+    optional.mkdir()
+    block = torch.linalg.qr(torch.randn(32, 32)).Q
+    rotation = torch.block_diag(block, block)
+    save_file({"global_rotation": rotation}, optional / "quarot.safetensors")
+    actual = gate_mod.load_engram_rotation_block(tmp_path, hidden_size=64)
+    assert torch.equal(actual, block)
 
 
 @pytest.mark.parametrize("barrier_token", [98, 99])
