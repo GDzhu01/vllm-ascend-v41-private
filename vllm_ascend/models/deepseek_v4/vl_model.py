@@ -249,6 +249,13 @@ class AscendDeepseekV4ForConditionalGeneration(
                     yield name, loaded_weight
                     continue
                 if vision_name not in params:
+                    # ``--limit-mm-per-prompt {\"image\": 0}`` intentionally
+                    # omits the tower while the checkpoint still contains its
+                    # tensors.  Text-only serving must skip those tensors;
+                    # retain the strict error when a requested tower is only
+                    # partially or incorrectly constructed.
+                    if self.vision is None:
+                        continue
                     raise KeyError(f"Vision weight {name!r} has no parameter {vision_name!r}.")
                 param = params[vision_name]
                 loader = getattr(param, "weight_loader", default_weight_loader)

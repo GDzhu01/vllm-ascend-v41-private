@@ -732,11 +732,18 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     def rms_norm_cast(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Normalize once and provide the exact FP32 routing input."""
-        return torch.ops._C_ascend.npu_rms_norm_cast(
-            hidden_states,
-            self.post_attention_layernorm.weight,
-            self.post_attention_layernorm.variance_epsilon,
-        )
+        op = getattr(torch.ops._C_ascend, "npu_rms_norm_cast", None)
+        if op is not None:
+            return op(
+                hidden_states,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+            )
+        # The fused operator is an A3/CANN 9.1 extension and is not present in
+        # every 950DT/CANN 9.2 image.  Preserve the pre-fusion equation and the
+        # exact rounded FP32 router input when the capability is absent.
+        normalized = self.post_attention_layernorm(hidden_states)
+        return normalized, normalized.float()
 
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         y, post, comb, _ = torch.ops._C_ascend.npu_hc_pre_v2(
