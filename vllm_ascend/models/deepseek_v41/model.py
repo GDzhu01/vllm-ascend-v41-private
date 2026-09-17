@@ -4,15 +4,14 @@
 
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import torch
 import vllm.envs as envs
-from safetensors import safe_open
 from transformers import AutoTokenizer
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.model_executor.layers.linear import ReplicatedLinear
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v41 import (
@@ -20,9 +19,20 @@ from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
 )
 from vllm_ascend.core.deepseek_v41 import (
+    A5_CMP_ROW_BYTES,
+    A5_WIN_ROW_BYTES,
+    DeepseekV41A5CompressedSpec,
+    DeepseekV41A5SWASpec,
     DeepseekV41FullSpec,
     DeepseekV41SWASpec,
+    uses_a5_packed_cache,
     validate_cache_runtime,
+)
+from vllm_ascend.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_reduce_scatter,
+    sp_shard,
 )
 from vllm_ascend.models.deepseek_v4.model import (
     AscendDeepseekV4ForCausalLM,
@@ -31,15 +41,11 @@ from vllm_ascend.models.deepseek_v4.model import (
     DeepseekV4Attention,
     DeepseekV4Model,
 )
-from vllm_ascend.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_padding_mask,
-    sp_reduce_scatter,
-    sp_shard,
-)
+from vllm_ascend.ops.dsv41_a5 import hc_post as a5_hc_post
+from vllm_ascend.ops.dsv41_a5 import hc_pre as a5_hc_pre
 
 from .compressor import DeepseekV41Compressor, _read, text_config_of
-from .engram_gate import engram_gate
+from .engram_gate import engram_gate, load_engram_rotation_block
 from .engram_hash import PagedNgramHistory, engram_history_metadata
 from .engram_hbm import EngramQueryGroup, NodeShardedEngram
 from .indexer import DeepseekV41Indexer
@@ -89,9 +95,17 @@ class DeepseekV41Topology:
 class DeepseekV41SharedAttentionState:
     """Per-forward handoff between index sources and their consumer layers."""
 
-    def __init__(self, topk_indices, candidates):
+    def __init__(
+        self,
+        topk_indices,
+        candidates,
+        candidate_lengths=None,
+        topk_lengths=None,
+    ):
         self.topk_indices = topk_indices
         self.candidates = candidates
+        self.candidate_lengths = candidate_lengths
+        self.topk_lengths = topk_lengths
 
     def reset(self):
         # Source layers overwrite the active rows before any consumer reads
@@ -206,6 +220,17 @@ class AscendDeepseekV41SWACache(AscendDeepseekV4SWACache):
 
     def get_kv_cache_spec(self, vllm_config):
         spec = super().get_kv_cache_spec(vllm_config)
+        if uses_a5_packed_cache(vllm_config):
+            return DeepseekV41A5SWASpec(
+                block_size=spec.block_size,
+                num_kv_heads=1,
+                head_size=A5_WIN_ROW_BYTES,
+                dtype=torch.uint8,
+                sliding_window=spec.sliding_window,
+                cache_dtype_str="a5_fp8_bf16_scale",
+                model_version="deepseek_v4",
+                alignment=spec.alignment,
+            )
         return DeepseekV41SWASpec(
             block_size=spec.block_size,
             num_kv_heads=spec.num_kv_heads,
@@ -291,19 +316,32 @@ class DeepseekV41Attention(DeepseekV4Attention):
         self.topology = topology
         self.shared_state = None
         self.prefix = prefix
+        self.uses_a5_packed_cache = uses_a5_packed_cache(vllm_config)
         width = _read(config, "head_dim")
         self.softmax_scale = width**-0.5
         if role.is_kv_source:
-            self.long_kv_cache = DeepseekV41CacheLayer(
-                vllm_config,
-                f"{prefix}.long_kv_cache",
-                DeepseekV41FullSpec(
+            long_kv_spec = (
+                DeepseekV41A5CompressedSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=A5_CMP_ROW_BYTES,
+                    dtype=torch.uint8,
+                    scale_dtype=torch.bfloat16,
+                    compress_ratio=role.compress_ratio,
+                )
+                if uses_a5_packed_cache(vllm_config)
+                else DeepseekV41FullSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=width,
                     dtype=torch.bfloat16,
                     compress_ratio=role.compress_ratio,
-                ),
+                )
+            )
+            self.long_kv_cache = DeepseekV41CacheLayer(
+                vllm_config,
+                f"{prefix}.long_kv_cache",
+                long_kv_spec,
             )
         self.compressor = (
             DeepseekV41Compressor(config, role.compress_ratio, vllm_config, f"{prefix}.compressor")
@@ -355,22 +393,26 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
 
     def __init__(self, vllm_config, prefix, **kwargs):
         super().__init__(vllm_config, prefix, **kwargs)
-        self.use_sequence_parallel = (
-            vllm_config.parallel_config.use_sequence_parallel_moe
-        )
+        self.use_sequence_parallel = vllm_config.parallel_config.use_sequence_parallel_moe
         # Leave the TP partial sums for the reduce-scatter below. The mHC
         # and MoE paths then stay sharded between attention calls.
         if self.use_sequence_parallel:
             self.self_attn.wo_b.reduce_results = False
+        self.uses_a5_packed_cache = uses_a5_packed_cache(vllm_config)
         config = vllm_config.model_config.hf_config
-        engram_enabled = get_ascend_config().enable_engram
+        # Engram belongs to the target backbone.  DSpark reuses this decoder
+        # class for its MTP layers, but the draft checkpoint intentionally has
+        # no Engram parameters of its own.
+        engram_enabled = get_ascend_config().enable_engram and not kwargs.get("is_draft_layer", False)
         if engram_enabled and self.layer_idx in config.engram_layer_ids:
             self.engram = torch.nn.Module()
-            self.engram.wkv = torch.nn.Linear(
+            self.engram.wkv = ReplicatedLinear(
                 (config.engram_max_ngram_size - 1) * config.engram_n_heads * config.engram_head_dim,
                 (config.hc_mult + 1) * config.hidden_size,
                 bias=False,
-                dtype=torch.bfloat16,
+                quant_config=vllm_config.quant_config,
+                prefix=f"{prefix}.engram.wkv",
+                return_bias=False,
             )
             self.engram.q_weight = torch.nn.Parameter(
                 torch.empty(config.hc_mult, config.hidden_size, dtype=torch.bfloat16)
@@ -386,6 +428,18 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
         return (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
 
     def hc_pre(self, x, hc_fn, hc_scale, hc_base, pre_mix=None):
+        if self.uses_a5_packed_cache:
+            return a5_hc_pre(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                pre_mix,
+                hc_mult=self.hc_mult,
+                hc_sinkhorn_iters=self.hc_sinkhorn_iters,
+                norm_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+            )
         return torch.ops._C_ascend.npu_hc_pre_v2(
             x,
             hc_fn,
@@ -399,6 +453,13 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
         )
 
     def hc_post(self, x, residual, post, comb):
+        if self.uses_a5_packed_cache:
+            return a5_hc_post(
+                x,
+                residual,
+                post,
+                comb,
+            )
         return torch.ops._C_ascend.npu_hc_post(
             x.unsqueeze(0),
             residual.unsqueeze(0),
@@ -463,9 +524,7 @@ class DeepseekV41Model(DeepseekV4Model):
         ):
             raise ValueError("Engram HBM shards require --safetensors-load-strategy lazy")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self.use_sequence_parallel = (
-            vllm_config.parallel_config.use_sequence_parallel_moe
-        )
+        self.use_sequence_parallel = vllm_config.parallel_config.use_sequence_parallel_moe
         # V4.1 collapses with the last block's ffn_pre; it has no hc_head
         # projection in the checkpoint.
         del self.hc_head_fn, self.hc_head_base, self.hc_head_scale, self.hc_norm
@@ -478,9 +537,23 @@ class DeepseekV41Model(DeepseekV4Model):
             device=self.topk_indices_buffer.device,
         )
         self.candidate_indices_buffer = candidate_buffer
+        candidate_lengths = torch.zeros(
+            (max_tokens, 1),
+            dtype=torch.int32,
+            device=self.topk_indices_buffer.device,
+        )
+        self.candidate_lengths_buffer = candidate_lengths
+        topk_lengths = torch.zeros(
+            (max_tokens, 1),
+            dtype=torch.int32,
+            device=self.topk_indices_buffer.device,
+        )
+        self.topk_lengths_buffer = topk_lengths
         self.shared_attention_state = DeepseekV41SharedAttentionState(
             self.topk_indices_buffer,
             candidate_buffer,
+            candidate_lengths,
+            topk_lengths,
         )
         for layer in self.layers:
             if isinstance(layer, DeepseekV41DecoderLayer):
@@ -512,11 +585,7 @@ class DeepseekV41Model(DeepseekV4Model):
             with torch.device("cpu"):
                 tokenizer = AutoTokenizer.from_pretrained(self.engram_root)
                 self.engram_history = PagedNgramHistory(config, tokenizer)
-                with safe_open(Path(self.engram_root) / "optional/quarot.safetensors", framework="pt") as file:
-                    rotation = file.get_tensor("global_rotation")
-                block = rotation[:32, :32].contiguous()
-                if not torch.equal(rotation, torch.block_diag(*[block] * (config.hidden_size // 32))):
-                    raise ValueError("Engram gate requires repeated block32 global rotation")
+                block = load_engram_rotation_block(self.engram_root, config.hidden_size)
             self.engram_rotation.copy_(block)
 
     def prepare_engram(self, input_ids, positions):
@@ -610,12 +679,14 @@ class DeepseekV41Model(DeepseekV4Model):
             hidden_states = sp_shard(hidden_states)
             input_ids = sp_shard(input_ids)
             token_mask = sp_shard(token_mask)
-            lookups = {
-                layer_idx: sp_shard(lookup)
-                for layer_idx, lookup in lookups.items()
-            }
+            lookups = {layer_idx: sp_shard(lookup) for layer_idx, lookup in lookups.items()}
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
+        # Preserve the runtime token dimension in compiled decode ranges.  A
+        # shape tuple built from ``hidden_states.shape[0]`` is specialized to
+        # the capture batch (usually 1) by NPUGraph EX, while the profile run
+        # can execute the same range at the static token capacity (for example
+        # 1024).  zeros_like keeps that leading dimension data-dependent.
+        pre_mix = torch.zeros_like(hidden_states[..., 0], dtype=torch.float32)
         pre_mix[:, 0] = 1.0
         last_layer = None
         aux_hidden_states = []
@@ -702,24 +773,23 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
                 if ".engram." in name:
                     # Bypass V4's generic embed -> embed_tokens remapping and TP loader.
                     local_name = name.removeprefix("model.")
-                    # FP8/MXFP8 Engram scales are consumed by the CPU loader.
+                    # Embedding scales are consumed directly by the sharded
+                    # table loader; the quantized WKV scale still goes through
+                    # the normal ReplicatedLinear loader.
                     if local_name.endswith(".engram.embed.scale"):
                         continue
-                    parameter_name = "model." + local_name
                     if local_name.endswith(".engram.embed.weight"):
                         layer_id = int(local_name.split(".")[1])
                         self.model.layers[layer_id].engram.embed.load_checkpoint(self.model.engram_root, local_name)
+                        engram_loaded.add("model." + local_name)
                     else:
-                        param = self.get_parameter(parameter_name)
-                        if tensor.dtype != torch.bfloat16 or tensor.shape != param.shape:
-                            raise ValueError(f"Unexpected BF16 Engram parameter: {name}")
-                        param.data.copy_(tensor)
-                    engram_loaded.add(parameter_name)
+                        yield name, tensor
                 elif self._is_milestone_weight(name):
                     yield name, tensor
 
         loaded = super().load_weights(milestone_weights())
+        loaded.update(engram_loaded)
         expected = {name for name, _ in self.named_parameters() if ".engram." in name}
-        if engram_loaded != expected:
-            raise ValueError(f"Missing Engram weights: {expected - engram_loaded}")
-        return loaded | engram_loaded
+        if missing := expected - loaded:
+            raise ValueError(f"Missing Engram weights: {missing}")
+        return loaded

@@ -61,6 +61,30 @@ class Draft(Resource):
     pass
 
 
+class A5SWA(SWA):
+    @property
+    def logical_head_size(self):
+        return 512
+
+
+class A5Draft(Draft):
+    @property
+    def logical_head_size(self):
+        return 512
+
+
+class A5Full(Full):
+    @property
+    def storage_block_size(self):
+        return self.block_size // self.compress_ratio
+
+
+class A5Index(Index):
+    @property
+    def storage_block_size(self):
+        return self.block_size // self.compress_ratio
+
+
 @dataclasses.dataclass(frozen=True)
 class Uniform:
     kv_cache_specs: dict
@@ -77,7 +101,10 @@ symbols = {
     "DeepseekV41CompressorStateSpec": State,
     "DeepseekV41SWASpec": SWA,
     "DeepseekV41DraftSWASpec": Draft,
+    "DeepseekV41A5SWASpec": A5SWA,
+    "DeepseekV41A5DraftSWASpec": A5Draft,
     "is_v41_spec": lambda s: isinstance(s, (Full, Index, State, SWA, Draft)),
+    "is_v41_draft_swa_spec": lambda s: isinstance(s, Draft),
     "replace": dataclasses.replace,
     "UniformTypeKVCacheSpecs": Uniform,
     "KVCacheGroupSpec": lambda **kw: SimpleNamespace(**kw),
@@ -209,6 +236,41 @@ print(
     )
 )
 
+# A5 changes only physical payloads. Exercise the actual planner with MXFP4
+# compressed/index rows and FP8 window rows while retaining the A3 topology.
+a5_specs = {}
+for layer in range(40):
+    prefix = f"language_model.model.layers.{layer}.self_attn"
+    a5_specs[prefix + ".swa_cache"] = A5SWA(128, 544, ItemSize(1))
+    if layer in (2, 8, 14, 20):
+        ratio = 1 if layer == 20 else 2
+        a5_specs[prefix + ".long_kv_cache"] = A5Full(128, 320, ItemSize(1), ratio)
+        a5_specs[prefix + ".indexer.k_cache"] = A5Index(
+            128,
+            64,
+            ItemSize(1),
+            ratio,
+            scale_dim=4,
+            scale_dtype=ItemSize(1),
+        )
+        if ratio == 2:
+            a5_specs[prefix + ".compressor.state_cache"] = State(32, 1024, ItemSize(4))
+a5_slots = plan(a5_specs)
+assert len(a5_specs) == len(specs) == 51
+assert [slot.page_size_bytes for slot in a5_slots] == [131072, 131072, 131072, 69632]
+assert sum(slot.page_size_bytes for slot in a5_slots) == 462848
+assert [slot.placements[1].offset for slot in a5_slots] == [20480, 20480, 20480, 40960]
+assert [slot.placements[1].page_size_bytes for slot in a5_slots] == [110592, 110592, 110592, 28672]
+assert [p.name for slot in a5_slots for p in slot.placements] == [p.name for slot in slots for p in slot.placements]
+for idx, slot in enumerate(a5_slots):
+    for placement in slot.placements:
+        assert placement.offset + sum(planes(a5_specs[placement.name])) <= slot.page_size_bytes
+    cmp_kv, index_k = slot.placements[:2]
+    ratio = a5_specs[cmp_kv.name].compress_ratio
+    assert sum(planes(a5_specs[cmp_kv.name])) == 40960 // ratio
+    assert sum(planes(a5_specs[index_k.name])) == 8704 // ratio
+print("PASS: A5 keeps 12 groups/51 specs/four slots and uses 462848 bytes/global ID; FP32 ring is unchanged.")
+
 # Execute the actual grouping and allocator for the optional G12 overlay.
 draft_specs = dict(specs)
 for stage in range(3):
@@ -249,6 +311,15 @@ for stage in range(3):
 assert len(draft_intervals) == 58
 print("PASS: DSpark has 13 groups, 54 specs, four buffers, 540928 bytes/ID and 58 disjoint payload planes.")
 
+a5_draft_specs = dict(a5_specs)
+for stage in range(3):
+    a5_draft_specs[f"mtp.{stage}.self_attn.swa_cache"] = A5Draft(128, 544, ItemSize(1))
+a5_draft_groups = symbols["make_cache_groups"](symbols["group_cache_specs"](a5_draft_specs))
+assert len(a5_draft_groups) == 13
+assert [group.layer_names for group in a5_draft_groups[:12]] == [group.layer_names for group in target_groups]
+assert sum(slot.page_size_bytes for slot in plan(a5_draft_specs)) == 462848
+print("PASS: A5 DSpark overlay keeps G0-G12 membership and fits the three packed draft planes without slot growth.")
+
 # A verifier writes anchor P and S speculative input rows. After A acceptances
 # the next forward starts at P+A+1. Its previous row must survive if that start
 # is odd. Test every acceptance count, including complete rejection.
@@ -286,7 +357,7 @@ for mode in ("none", "decode"):
         except ValueError:
             assert proposed == 32
         else:
-            assert proposed < 32 and config.cache_config.cache_dtype == "bfloat16"
+            assert proposed < 32 and config.cache_config.cache_dtype == "auto"
 config.speculative_config.num_speculative_tokens = 31
 config.speculative_config.num_speculative_tokens_per_batch_size = [(1, 8, 32)]
 try:
@@ -295,7 +366,7 @@ except ValueError:
     pass
 else:
     raise AssertionError("Per-batch draft length escaped the ring retention limit")
-print("PASS: actual runtime guards enforce the retention bound and BF16 draft backend in both target modes.")
+print("PASS: runtime guards enforce retention and select the draft cache format from the target mode.")
 
 # Model the read-before-write schedule with token identities, including ring wraps.
 cases = 0

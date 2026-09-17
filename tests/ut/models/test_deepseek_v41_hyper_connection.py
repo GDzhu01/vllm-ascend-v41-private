@@ -17,6 +17,7 @@ def _layer() -> DeepseekV41DecoderLayer:
     layer.hc_sinkhorn_iters = 3
     layer.norm_eps = 1e-6
     layer.hc_eps = 1e-6
+    layer.uses_a5_packed_cache = False
     return layer
 
 
@@ -54,6 +55,25 @@ def test_v41_hc_pre_dispatches_fused_operator_with_pre_mix():
         norm_eps=1e-6,
         hc_eps=1e-6,
     )
+
+
+def test_v41_a5_hc_dispatches_packaged_adapters():
+    layer = _layer()
+    layer.uses_a5_packed_cache = True
+    x = torch.randn(2, 4, 8, dtype=torch.bfloat16)
+    hc_fn = torch.randn(24, 32, dtype=torch.float32)
+    hc_scale = torch.randn(3, dtype=torch.float32)
+    hc_base = torch.randn(24, dtype=torch.float32)
+    pre_mix = torch.randn(2, 4, dtype=torch.float32)
+    expected = tuple(torch.tensor(index) for index in range(4))
+    restored = torch.randn_like(x)
+    with patch.object(deepseek_v41_module, "a5_hc_pre", return_value=expected) as pre_op:
+        actual = layer.hc_pre(x, hc_fn, hc_scale, hc_base, pre_mix)
+    assert actual is expected
+    pre_op.assert_called_once()
+    with patch.object(deepseek_v41_module, "a5_hc_post", return_value=restored) as post_op:
+        assert layer.hc_post(actual[0], x, actual[1], actual[2]) is restored
+    post_op.assert_called_once()
 
 
 def test_v41_forward_threads_pre_mix_through_fused_hc_pre():
@@ -157,6 +177,24 @@ def test_v41_rms_norm_cast_preserves_rounded_routing_input(dtype):
     op.assert_called_once_with(x, norm.weight, norm.variance_epsilon)
     assert actual_fp32 is normalized_fp32
     norm.assert_not_called()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_v41_rms_norm_cast_falls_back_when_a3_op_is_absent(dtype):
+    layer = _layer()
+    x = torch.randn(2, 8, dtype=dtype)
+    normalized = torch.randn_like(x)
+    norm = MagicMock(return_value=normalized)
+    norm.weight = torch.ones(8, dtype=dtype)
+    norm.variance_epsilon = 1e-6
+    layer.post_attention_layernorm = norm
+
+    with patch.object(torch.ops._C_ascend, "npu_rms_norm_cast", None, create=True):
+        actual, actual_fp32 = layer.rms_norm_cast(x)
+
+    assert actual is normalized
+    torch.testing.assert_close(actual_fp32, normalized.float(), rtol=0, atol=0)
+    norm.assert_called_once_with(x)
 
 
 def test_v41_hc_reference_supports_hidden_size_5120():
@@ -276,10 +314,15 @@ def test_v41_target_emits_input_residual_for_selected_aux_layers():
 
     model.layers = torch.nn.ModuleList([Layer(i) for i in range(3)])
     ids = torch.tensor([0, 1])
-    with patch("vllm_ascend.models.deepseek_v41.model.get_pp_group",
-               return_value=MagicMock(is_first_rank=True, is_last_rank=True)):
+    with patch(
+        "vllm_ascend.models.deepseek_v41.model.get_pp_group",
+        return_value=MagicMock(is_first_rank=True, is_last_rank=True),
+    ):
         output, aux = model.forward(
-            ids, torch.tensor([0, 1]), None, engram_lookups={},
+            ids,
+            torch.tensor([0, 1]),
+            None,
+            engram_lookups={},
             engram_mask=torch.empty(0, dtype=torch.bool),
         )
     embedded = model.embed_tokens(ids)
@@ -297,16 +340,24 @@ def test_v41_dspark_decoder_uses_draft_experts_instead_of_target_config():
     from vllm_ascend.models.deepseek_v41.dspark import DeepseekV41DSparkModel
 
     draft = SimpleNamespace(
-        hc_mult=4, hidden_size=8, dspark_block_size=5, num_nextn_predict_layers=3,
-        dspark_target_layer_ids=[37, 38, 39], num_hidden_layers=40,
-        vocab_size=16, rms_norm_eps=1e-6, hc_eps=1e-6,
-        n_routed_experts=128, num_experts_per_tok=3,
+        hc_mult=4,
+        hidden_size=8,
+        dspark_block_size=5,
+        num_nextn_predict_layers=3,
+        dspark_target_layer_ids=[37, 38, 39],
+        num_hidden_layers=40,
+        vocab_size=16,
+        rms_norm_eps=1e-6,
+        hc_eps=1e-6,
+        n_routed_experts=128,
+        num_experts_per_tok=3,
     )
     config = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=SimpleNamespace(n_routed_experts=384)),
         speculative_config=SimpleNamespace(draft_model_config=SimpleNamespace(hf_text_config=draft)),
         quant_config=None,
     )
+
     def make_layer(*args, **kwargs):
         layer = torch.nn.Module()
         layer.mlp = SimpleNamespace(gate=SimpleNamespace(tid2eid=None, bias_vl=None))
@@ -314,7 +365,13 @@ def test_v41_dspark_decoder_uses_draft_experts_instead_of_target_config():
 
     factory = MagicMock(side_effect=make_layer)
     with ExitStack() as stack:
-        for name in ("VocabParallelEmbedding", "ColumnParallelLinear", "RMSNorm", "DSparkMarkovHead", "DSparkConfidenceHead"):
+        for name in (
+            "VocabParallelEmbedding",
+            "ColumnParallelLinear",
+            "RMSNorm",
+            "DSparkMarkovHead",
+            "DSparkConfidenceHead",
+        ):
             stack.enter_context(patch.object(shared, name, side_effect=lambda *args, **kwargs: torch.nn.Identity()))
         stack.enter_context(patch.object(shared, "DeepseekV41DSparkDecoderLayer", factory))
         stack.enter_context(patch.object(shared, "validate_cache_runtime"))
