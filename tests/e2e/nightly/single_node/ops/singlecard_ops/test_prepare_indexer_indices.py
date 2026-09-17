@@ -31,9 +31,25 @@ def test_prepare_indexer_indices(topk, tokens, compress_ratio):
     selected = torch.randint(-3, 1000, (tokens, topk), dtype=torch.int32, device="npu")
     positions = torch.randint(-1, 2000, (tokens,), dtype=torch.int64, device="npu")
     original = selected.clone()
-    actual = prepare_indexer_indices(selected, positions, compress_ratio)
+    actual_indices = torch.empty_like(selected)
+    actual_lengths = torch.empty((tokens, 1), dtype=torch.int32, device="npu")
+    actual = prepare_indexer_indices(
+        selected,
+        positions,
+        compress_ratio,
+        indices_output=actual_indices,
+        lengths_output=actual_lengths,
+    )
+    expected = reference(selected.cpu(), positions.cpu(), compress_ratio)
     assert actual.is_contiguous()
-    torch.testing.assert_close(actual.cpu(), reference(selected.cpu(), positions.cpu(), compress_ratio), rtol=0, atol=0)
+    assert actual.data_ptr() == actual_indices.data_ptr()
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual_lengths.cpu(),
+        (expected >= 0).sum(-1, dtype=torch.int32).unsqueeze(-1),
+        rtol=0,
+        atol=0,
+    )
     torch.testing.assert_close(selected, original, rtol=0, atol=0)
 
 
@@ -68,16 +84,30 @@ def test_prepare_indexer_indices_noncontiguous():
 
 
 @pytest.mark.parametrize("compress_ratio", [1, 2])
-@pytest.mark.parametrize("tokens", [41, 129])
+@pytest.mark.parametrize("tokens,topk", [(41, 2048), (129, 2048), (2048, 512)])
 @torch.inference_mode()
-def test_prepare_indexer_indices_graph_replay(compress_ratio, tokens):
-    selected = torch.randint(-1, 4096, (tokens, 2048), dtype=torch.int32, device="npu")
+def test_prepare_indexer_indices_graph_replay(compress_ratio, tokens, topk):
+    selected = torch.randint(-1, 4096, (tokens, topk), dtype=torch.int32, device="npu")
     positions = torch.full((tokens,), 4095, dtype=torch.int64, device="npu")
-    prepare_indexer_indices(selected, positions, compress_ratio)
+    lengths = torch.empty((tokens, 1), dtype=torch.int32, device="npu")
+    indices = torch.empty_like(selected)
+    prepare_indexer_indices(
+        selected,
+        positions,
+        compress_ratio,
+        indices_output=indices,
+        lengths_output=lengths,
+    )
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph, capture_error_mode="thread_local", auto_dispatch_capture=True):
-        actual = prepare_indexer_indices(selected, positions, compress_ratio)
+        actual = prepare_indexer_indices(
+            selected,
+            positions,
+            compress_ratio,
+            indices_output=indices,
+            lengths_output=lengths,
+        )
     pointer = actual.data_ptr()
     for last_position in (0, 127, 8191):
         selected.copy_(torch.randint_like(selected, -1, 4096))
@@ -85,8 +115,13 @@ def test_prepare_indexer_indices_graph_replay(compress_ratio, tokens):
         graph.replay()
         torch.npu.synchronize()
         assert actual.data_ptr() == pointer
+        expected = reference(selected.cpu(), positions.cpu(), compress_ratio)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
         torch.testing.assert_close(
-            actual.cpu(), reference(selected.cpu(), positions.cpu(), compress_ratio), rtol=0, atol=0
+            lengths.cpu(),
+            (expected >= 0).sum(-1, dtype=torch.int32).unsqueeze(-1),
+            rtol=0,
+            atol=0,
         )
 
 
@@ -141,6 +176,21 @@ def test_indexer_warmup_prevents_shape_recompilation(monkeypatch):
             torch.testing.assert_close(scale, expected_scale, rtol=0, atol=0)
         selected = torch.randint(-3, 8192, (tokens, config.index_topk), dtype=torch.int32, device="npu")
         positions = torch.randint(-1, 16384, (tokens,), dtype=torch.int64, device="npu")
+        topk_indices = torch.empty_like(selected)
+        topk_lengths = torch.empty((tokens, 1), dtype=torch.int32, device="npu")
         for ratio in (1, 2):
-            actual = prepare_indexer_indices(selected, positions, ratio)
-            torch.testing.assert_close(actual.cpu(), reference(selected.cpu(), positions.cpu(), ratio), rtol=0, atol=0)
+            actual = prepare_indexer_indices(
+                selected,
+                positions,
+                ratio,
+                indices_output=topk_indices,
+                lengths_output=topk_lengths,
+            )
+            expected = reference(selected.cpu(), positions.cpu(), ratio)
+            torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                topk_lengths.cpu(),
+                (expected >= 0).sum(-1, dtype=torch.int32).unsqueeze(-1),
+                rtol=0,
+                atol=0,
+            )
