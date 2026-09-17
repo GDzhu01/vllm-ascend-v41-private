@@ -15,7 +15,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import torch
@@ -103,6 +103,46 @@ class TestBlockTableComputeSlotMapping(TestBase):
 
         self.assertEqual(block_table.slot_mapping.cpu.numel(), 128)
         self.assertEqual(block_table.slot_mapping.cpu[: req_indices.size].numel(), 110)
+
+    def test_commit_block_table_uploads_only_dirty_row_spans(self):
+        block_table = self.create_block_table(
+            dcp_world_size=1,
+            dcp_rank=0,
+            cp_kv_cache_interleave_size=1,
+        )
+
+        with patch.object(block_table, "_copy_block_table_rows") as copy_rows:
+            block_table.commit_block_table(3)
+            copy_rows.assert_called_once_with(0, 3)
+
+            copy_rows.reset_mock()
+            block_table.commit_block_table(3)
+            copy_rows.assert_not_called()
+
+            block_table.append_row([7], 1)
+            block_table.commit_block_table(3)
+            copy_rows.assert_called_once_with(1, 2)
+
+            copy_rows.reset_mock()
+            block_table.append_row([8], 0)
+            block_table.append_row([9], 2)
+            block_table.commit_block_table(3)
+            self.assertEqual(
+                copy_rows.call_args_list,
+                [call(0, 1), call(2, 3)],
+            )
+
+    def test_commit_block_table_force_uploads_full_active_prefix(self):
+        block_table = self.create_block_table(
+            dcp_world_size=1,
+            dcp_rank=0,
+            cp_kv_cache_interleave_size=1,
+        )
+        block_table.commit_block_table(2)
+
+        with patch.object(block_table, "_copy_block_table_rows") as copy_rows:
+            block_table.commit_block_table(2, force=True)
+            copy_rows.assert_called_once_with(0, 2)
 
     def test_multigroup_slot_mappings_share_contiguous_backing(self):
         from vllm_ascend.worker.block_table import MultiGroupBlockTable

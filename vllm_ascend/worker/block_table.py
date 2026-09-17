@@ -108,6 +108,10 @@ class BlockTable:
             duplicate_size += num_speculative_tokens
         self.block_table = self._make_buffer(max_num_reqs * duplicate_size, logical_table_size, dtype=torch.int32)
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
+        # Scheduler mutations are sparse during decode. Keep the device mirror
+        # current by uploading only rows whose block IDs changed instead of the
+        # full active prefix for every cache group on every step.
+        self._dirty_rows = set(range(max_num_reqs))
         # MTP slot preparation appends up to num_speculative_tokens - 1
         # draft positions for every request beyond the scheduler token limit.
         num_mtp_draft_slots = max(num_speculative_tokens - 1, 0) * self.max_num_reqs
@@ -136,21 +140,25 @@ class BlockTable:
 
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
         self.num_blocks_per_row[row_idx] += num_blocks
+        self._dirty_rows.add(row_idx)
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
         self.append_row(block_ids, row_idx)
+        self._dirty_rows.add(row_idx)
 
     def clear_row(self, row_idx: int) -> None:
         num_blocks = self.num_blocks_per_row[row_idx]
         if num_blocks > 0:
             self.block_table.np[row_idx, :num_blocks] = 0
+            self._dirty_rows.add(row_idx)
         self.num_blocks_per_row[row_idx] = 0
 
     def move_row(self, src: int, tgt: int) -> None:
         num_blocks = self.num_blocks_per_row[src]
         self.block_table.np[tgt, :num_blocks] = self.block_table.np[src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
+        self._dirty_rows.add(tgt)
 
     def swap_row(self, src: int, tgt: int) -> None:
         num_blocks_src = self.num_blocks_per_row[src]
@@ -159,6 +167,7 @@ class BlockTable:
         self.num_blocks_per_row[tgt] = num_blocks_src
 
         self.block_table.np[[src, tgt]] = self.block_table.np[[tgt, src]]
+        self._dirty_rows.update((src, tgt))
 
     def compute_slot_mapping(
         self,
@@ -304,12 +313,39 @@ class BlockTable:
             slot_mapping = block_numbers * self.block_size + block_offsets
             self.slot_mapping.cpu[: req_indices.shape[0]] = torch.where(mask, slot_mapping, -1)
 
-    def commit_block_table(self, num_reqs: int) -> None:
-        self.block_table.copy_to_gpu(num_reqs)
+    def _copy_block_table_rows(self, start: int, end: int) -> None:
+        self.block_table.gpu[start:end].copy_(
+            self.block_table.cpu[start:end],
+            non_blocking=True,
+        )
+
+    def commit_block_table(self, num_reqs: int, *, force: bool = False) -> None:
+        """Upload changed active rows, coalescing adjacent rows per H2D copy."""
+        if num_reqs <= 0:
+            return
+        if force:
+            self._copy_block_table_rows(0, num_reqs)
+            self._dirty_rows.difference_update(range(num_reqs))
+            return
+        if not self._dirty_rows:
+            return
+
+        dirty_rows = sorted(row for row in self._dirty_rows if row < num_reqs)
+        if not dirty_rows:
+            return
+        start = previous = dirty_rows[0]
+        for row in dirty_rows[1:]:
+            if row != previous + 1:
+                self._copy_block_table_rows(start, previous + 1)
+                start = row
+            previous = row
+        self._copy_block_table_rows(start, previous + 1)
+        self._dirty_rows.difference_update(dirty_rows)
 
     def clear(self) -> None:
         self.block_table.fill_(0)
         self.block_table.cpu.fill_(0)
+        self._dirty_rows.clear()
 
     def _convert_physical_to_logical_blocks(self, physical_blocks: np.ndarray) -> np.ndarray:
         """Convert physical block IDs to logical block IDs."""
@@ -512,9 +548,9 @@ class MultiGroupBlockTable:
             else:
                 block_table.compute_slot_mapping_draft(req_indices, positions)
 
-    def commit_block_table(self, num_reqs: int) -> None:
+    def commit_block_table(self, num_reqs: int, *, force: bool = False) -> None:
         for block_table in self.block_tables:
-            block_table.commit_block_table(num_reqs)
+            block_table.commit_block_table(num_reqs, force=force)
 
     def clear(self) -> None:
         for block_table in self.block_tables:

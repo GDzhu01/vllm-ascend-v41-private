@@ -3914,7 +3914,10 @@ class NPUModelRunner(GPUModelRunner):
                     context = self.compilation_config.static_forward_context
                     for name in group.layer_names:
                         context[name].kv_cache[0][1:num_reqs + 1].zero_()
-                self.input_batch.block_table.commit_block_table(num_reqs_padded)
+                self.input_batch.block_table.commit_block_table(
+                    num_reqs_padded,
+                    force=True,
+                )
 
                 # Invalidate real-request slots before attention backends derive
                 # or copy their backend-specific metadata for dummy execution.
