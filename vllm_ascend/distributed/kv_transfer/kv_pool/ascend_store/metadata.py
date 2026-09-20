@@ -13,6 +13,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashList
 from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
 
+from vllm_ascend.core.circular_buffer import prefix_cacheable
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import AttentionComputeStartGate
 
 
@@ -267,6 +268,12 @@ def infer_group_block_sizes(
     return block_sizes
 
 
+def infer_cacheable_group_ids(kv_cache_groups: Sequence[Any] | None) -> list[int]:
+    if not kv_cache_groups:
+        return [0]
+    return [i for i, group in enumerate(kv_cache_groups) if prefix_cacheable(group.kv_cache_spec)]
+
+
 def get_group_block_size(group_block_sizes: Sequence[int], group_id: int) -> int:
     return group_block_sizes[group_id] if group_id < len(group_block_sizes) else group_block_sizes[0]
 
@@ -501,6 +508,10 @@ class ChunkedTokenDatabase:
         shard_rank: int | None = None,
         shard_size: int | None = None,
     ) -> Iterable[tuple[int, int, BlockHash | str, int | None]]:
+        # Private circular state has no prefix key, even when its block size
+        # happens to be divisible by the request's hashing unit.
+        if self.cache_coordinator is not None and kv_cache_group_id not in self.cache_coordinator.cacheable_group_ids:
+            return
         if not block_hashes:
             return
         logical_block_size = self.get_block_size(kv_cache_group_id)
@@ -1023,7 +1034,9 @@ class ReqMeta:
             and target_token_len % cache_transfer_granularity == 0
             and full_block_count > available_full_block_count
         )
-        if boundary_without_hash:
+        # Scheduled draft tokens can cross a page before that page has a
+        # committed request hash. Do not mark an unsent page as saved.
+        if boundary_without_hash or (not save_partial_block and full_block_count > available_full_block_count):
             num_tokens_to_save = available_full_block_count * cache_transfer_granularity
         if tracker.last_block_gva is not None and (
             target_token_len % cache_transfer_granularity != 0 or boundary_without_hash
