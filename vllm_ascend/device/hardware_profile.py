@@ -49,6 +49,7 @@ class HardwareCapability(Enum):
     PAGED_ATTENTION = auto()
     RC_DEVICE_DISCOVERY = auto()
     REDUCED_CUDAGRAPH_CAPTURE_SIZES = auto()
+    RMS_NORM_CAST = auto()
     RUNTIME_CUSTOM_OPS = auto()
     SFA_DCP_REPLICATED_INDEXER = auto()
     STANDARD_WORKER_PATCHES = auto()
@@ -152,7 +153,10 @@ _STANDARD_CAPABILITIES = frozenset(
         HardwareCapability.TRITON_BATCH_MEMCPY,
     }
 )
-_A3_CAPABILITIES = _STANDARD_CAPABILITIES | {HardwareCapability.MC2_FULLMESH_V2_COMM}
+_A3_CAPABILITIES = _STANDARD_CAPABILITIES | {
+    HardwareCapability.MC2_FULLMESH_V2_COMM,
+    HardwareCapability.RMS_NORM_CAST,
+}
 _DEFAULT_WORKER_CLS = "vllm_ascend.worker.worker.NPUWorker"
 _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyType(
     {

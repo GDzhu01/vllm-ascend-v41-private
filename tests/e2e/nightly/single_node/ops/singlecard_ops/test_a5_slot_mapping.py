@@ -5,7 +5,10 @@ import pytest
 import torch
 import torch_npu  # noqa: F401
 
-from vllm_ascend.ops.triton.a5_slot_mapping import build_a5_slot_mapping
+from vllm_ascend.ops.triton.a5_slot_mapping import (
+    build_a5_slot_mapping,
+    build_a5_slot_mapping_batch,
+)
 
 
 def reference(slots, positions, query_start_loc, num_actual_reqs, num_actual_tokens, page_size, ratio, skip):
@@ -66,6 +69,61 @@ def test_a5_slot_mapping(ratio, page_size, skip, num_tokens):
     assert actual_flat.data_ptr() == flat.data_ptr()
     torch.testing.assert_close(actual_coordinates.cpu(), expected_coordinates, rtol=0, atol=0)
     torch.testing.assert_close(actual_flat.cpu(), expected_flat, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("ratio,page_size", [(1, 128), (2, 64)])
+@pytest.mark.parametrize("skip", [False, True])
+@torch.inference_mode()
+def test_a5_slot_mapping_batch(ratio, page_size, skip):
+    num_tokens = 257
+    slots = torch.arange(4 * num_tokens, dtype=torch.int32).view(4, num_tokens)
+    positions = torch.arange(num_tokens, dtype=torch.int64)
+    if ratio == 2:
+        slots = slots * 2 + 1
+    slots[1, ::11] = -1
+    slots[3, ::7] = -1
+    group_ids = torch.tensor([3, 1, 0], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, num_tokens - 3], dtype=torch.int32)
+    coordinates = torch.empty((3, num_tokens, 2), dtype=torch.int32, device="npu")
+    flat = torch.empty((3, num_tokens), dtype=torch.int32, device="npu")
+
+    actual_coordinates, actual_flat = build_a5_slot_mapping_batch(
+        slots.npu(),
+        group_ids.npu(),
+        positions.npu(),
+        query_start_loc.npu(),
+        num_tokens,
+        1,
+        num_tokens - 5,
+        page_size,
+        ratio,
+        skip_update=skip,
+        coordinates_output=coordinates,
+        flat_output=flat,
+    )
+    for output_row, group_id in enumerate(group_ids.tolist()):
+        expected_coordinates, expected_flat = reference(
+            slots[group_id],
+            positions,
+            query_start_loc,
+            1,
+            num_tokens - 5,
+            page_size,
+            ratio,
+            skip,
+        )
+        torch.testing.assert_close(
+            actual_coordinates[output_row].cpu(),
+            expected_coordinates,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            actual_flat[output_row].cpu(),
+            expected_flat,
+            rtol=0,
+            atol=0,
+        )
 
 
 @torch.inference_mode()

@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from tests.deepseek_v41_reference import hc_mixes_reference, hc_post_reference
+from vllm_ascend.models.deepseek_v4 import model as deepseek_v4_module
 from vllm_ascend.models.deepseek_v41 import model as deepseek_v41_module
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41DecoderLayer
 
@@ -164,12 +165,17 @@ def test_v41_rms_norm_cast_preserves_rounded_routing_input(dtype):
     norm.variance_epsilon = 1e-6
     layer.post_attention_layernorm = norm
 
-    with patch.object(
-        torch.ops._C_ascend,
-        "npu_rms_norm_cast",
-        create=True,
-        return_value=(normalized, normalized_fp32),
-    ) as op:
+    profile = MagicMock()
+    profile.supports.return_value = True
+    with (
+        patch.object(deepseek_v4_module, "get_current_hardware_profile", return_value=profile),
+        patch.object(
+            torch.ops._C_ascend,
+            "npu_rms_norm_cast",
+            create=True,
+            return_value=(normalized, normalized_fp32),
+        ) as op,
+    ):
         actual, actual_fp32 = layer.rms_norm_cast(x)
 
     assert actual is normalized
@@ -180,7 +186,7 @@ def test_v41_rms_norm_cast_preserves_rounded_routing_input(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_v41_rms_norm_cast_falls_back_when_a3_op_is_absent(dtype):
+def test_v41_rms_norm_cast_falls_back_when_hardware_does_not_support_it(dtype):
     layer = _layer()
     x = torch.randn(2, 8, dtype=dtype)
     normalized = torch.randn_like(x)
@@ -189,12 +195,19 @@ def test_v41_rms_norm_cast_falls_back_when_a3_op_is_absent(dtype):
     norm.variance_epsilon = 1e-6
     layer.post_attention_layernorm = norm
 
-    with patch.object(torch.ops._C_ascend, "npu_rms_norm_cast", None, create=True):
+    profile = MagicMock()
+    profile.supports.return_value = False
+    op = MagicMock(return_value=(normalized, normalized.float()))
+    with (
+        patch.object(deepseek_v4_module, "get_current_hardware_profile", return_value=profile),
+        patch.object(torch.ops._C_ascend, "npu_rms_norm_cast", op, create=True),
+    ):
         actual, actual_fp32 = layer.rms_norm_cast(x)
 
     assert actual is normalized
     torch.testing.assert_close(actual_fp32, normalized.float(), rtol=0, atol=0)
     norm.assert_called_once_with(x)
+    op.assert_not_called()
 
 
 def test_v41_hc_reference_supports_hidden_size_5120():
