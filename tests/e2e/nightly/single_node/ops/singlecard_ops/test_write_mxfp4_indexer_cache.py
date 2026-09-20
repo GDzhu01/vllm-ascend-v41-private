@@ -68,3 +68,38 @@ def test_write_mxfp4_indexer_cache_graph_replay():
     actual_scale = scale[slots[:5, 0].long(), slots[:5, 1].long(), 0]
     torch.testing.assert_close(actual_data.cpu(), expected_data.cpu(), rtol=0, atol=0)
     torch.testing.assert_close(actual_scale.cpu(), expected_scale.cpu(), rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_write_mxfp4_indexer_cache_crosses_int32_byte_offset_boundary():
+    """Page 16384 at a 128-KiB stride starts exactly at byte 2**31."""
+    page_stride = 128 * 1024
+    boundary_page = 16384
+    num_pages = boundary_page + 1
+    raw = torch.empty(num_pages * page_stride, dtype=torch.uint8, device="npu")
+    data = torch.as_strided(
+        raw,
+        (num_pages, 128, 1, 64),
+        (page_stride, 64, 64, 1),
+    )
+    scale = torch.as_strided(
+        raw,
+        (num_pages, 128, 1, 4),
+        (page_stride, 4, 4, 1),
+        storage_offset=64 * 1024,
+    )
+    values = torch.randn(2, 128, dtype=torch.bfloat16, device="npu")
+    slots = torch.tensor(
+        [[boundary_page - 1, 0], [boundary_page, 0]],
+        dtype=torch.int32,
+        device="npu",
+    )
+
+    write_mxfp4_indexer_cache(values, slots, data, scale)
+    torch.npu.synchronize()
+
+    expected_data, expected_scale = _mxfp4_quantize_e8m0_reference(values)
+    actual_data = data[slots[:, 0].long(), slots[:, 1].long(), 0]
+    actual_scale = scale[slots[:, 0].long(), slots[:, 1].long(), 0]
+    torch.testing.assert_close(actual_data.cpu(), expected_data.cpu(), rtol=0, atol=0)
+    torch.testing.assert_close(actual_scale.cpu(), expected_scale.cpu(), rtol=0, atol=0)

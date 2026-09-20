@@ -120,8 +120,12 @@ def _write_mxfp4_indexer_cache_kernel(
     GROUP_COUNT: tl.constexpr,
 ):
     row = tl.program_id(0)
-    page = tl.load(slots_ptr + row * 2)
-    slot = tl.load(slots_ptr + row * 2 + 1)
+    # Cache page strides can make the byte offset exceed INT32_MAX even when
+    # the page index itself fits in int32 (for example, page 16384 with a
+    # 128-KiB page starts at byte 2**31).  Widen before multiplying by the
+    # strides so Triton performs the address calculation in 64 bits.
+    page = tl.load(slots_ptr + row * 2).to(tl.int64)
+    slot = tl.load(slots_ptr + row * 2 + 1).to(tl.int64)
     valid = (page >= 0) & (slot >= 0)
     offsets = tl.arange(0, BLOCK_WIDTH)
     values = tl.load(input_ptr + row * BLOCK_WIDTH + offsets).to(tl.float32)
