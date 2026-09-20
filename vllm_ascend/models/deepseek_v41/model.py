@@ -24,18 +24,18 @@ from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41SWASpec,
     validate_cache_runtime,
 )
+from vllm_ascend.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_reduce_scatter,
+    sp_shard,
+)
 from vllm_ascend.models.deepseek_v4.model import (
     AscendDeepseekV4ForCausalLM,
     AscendDeepseekV4SWACache,
     DeepseekV2DecoderLayer,
     DeepseekV4Attention,
     DeepseekV4Model,
-)
-from vllm_ascend.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_padding_mask,
-    sp_reduce_scatter,
-    sp_shard,
 )
 
 from .compressor import DeepseekV41Compressor, _read, text_config_of
@@ -355,9 +355,7 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
 
     def __init__(self, vllm_config, prefix, **kwargs):
         super().__init__(vllm_config, prefix, **kwargs)
-        self.use_sequence_parallel = (
-            vllm_config.parallel_config.use_sequence_parallel_moe
-        )
+        self.use_sequence_parallel = vllm_config.parallel_config.use_sequence_parallel_moe
         # Leave the TP partial sums for the reduce-scatter below. The mHC
         # and MoE paths then stay sharded between attention calls.
         if self.use_sequence_parallel:
@@ -398,13 +396,17 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
             hc_eps=self.hc_eps,
         )
 
-    def hc_post(self, x, residual, post, comb):
-        return torch.ops._C_ascend.npu_hc_post(
+    def hc_post(self, x, residual, post, comb, *, return_mean=False):
+        inputs = (
             x.unsqueeze(0),
             residual.unsqueeze(0),
             post.unsqueeze(0),
             comb.unsqueeze(0),
-        ).squeeze(0)
+        )
+        if return_mean:
+            output, mean = torch.ops._C_ascend.npu_hc_post_with_mean(*inputs)
+            return output.squeeze(0), mean.squeeze(0)
+        return torch.ops._C_ascend.npu_hc_post(*inputs).squeeze(0), None
 
     def forward(
         self,
@@ -413,6 +415,7 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
         pre_mix,
         llama_4_scaling=None,
         input_ids=None,
+        capture_aux=False,
     ):
         use_sequence_parallel = getattr(self, "use_sequence_parallel", False)
         residual = hidden_states
@@ -429,7 +432,7 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
         x = self.self_attn(positions, x, llama_4_scaling)
         if use_sequence_parallel:
             x = sp_reduce_scatter(x)
-        hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
+        hidden_states, _ = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
         x, ffn_post, ffn_comb, ffn_pre = self.hc_pre(
@@ -446,8 +449,14 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
             hidden_states_fp32=x_fp32,
             already_sequence_parallel=use_sequence_parallel,
         )
-        hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
-        return hidden_states, ffn_pre
+        hidden_states, aux_hidden_state = self.hc_post(
+            x,
+            residual,
+            ffn_post,
+            ffn_comb,
+            return_mean=capture_aux,
+        )
+        return hidden_states, ffn_pre, aux_hidden_state
 
 
 class DeepseekV41Model(DeepseekV4Model):
@@ -463,9 +472,7 @@ class DeepseekV41Model(DeepseekV4Model):
         ):
             raise ValueError("Engram HBM shards require --safetensors-load-strategy lazy")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self.use_sequence_parallel = (
-            vllm_config.parallel_config.use_sequence_parallel_moe
-        )
+        self.use_sequence_parallel = vllm_config.parallel_config.use_sequence_parallel_moe
         # V4.1 collapses with the last block's ffn_pre; it has no hc_head
         # projection in the checkpoint.
         del self.hc_head_fn, self.hc_head_base, self.hc_head_scale, self.hc_norm
@@ -610,10 +617,7 @@ class DeepseekV41Model(DeepseekV4Model):
             hidden_states = sp_shard(hidden_states)
             input_ids = sp_shard(input_ids)
             token_mask = sp_shard(token_mask)
-            lookups = {
-                layer_idx: sp_shard(lookup)
-                for layer_idx, lookup in lookups.items()
-            }
+            lookups = {layer_idx: sp_shard(lookup) for layer_idx, lookup in lookups.items()}
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
         pre_mix[:, 0] = 1.0
@@ -624,9 +628,10 @@ class DeepseekV41Model(DeepseekV4Model):
             moe_input_ids = torch.where(input_ids == -1, 0, input_ids)
         for layer in self.layers:
             last_layer = layer
-            # DSpark consumes the residual stream entering its configured
-            # target layers. The runner expresses checkpoint IDs as one-based.
-            if layer.layer_idx + 1 in self.aux_hidden_state_layers:
+            # Target layer 1 has no preceding hc_post to fuse with. This is not
+            # used by the V4.1 dSPark checkpoint, but preserves the generic
+            # one-based aux-layer contract.
+            if layer.layer_idx == 0 and 1 in self.aux_hidden_state_layers:
                 aux_hidden_state = hidden_states.mean(dim=1)
                 if use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
@@ -648,7 +653,21 @@ class DeepseekV41Model(DeepseekV4Model):
                     active_mask,
                     self.config.rms_norm_eps,
                 )
-            hidden_states, pre_mix = layer(positions, hidden_states, pre_mix, None, input_ids=moe_input_ids)
+            # The FFN hc_post output of layer N is the residual stream entering
+            # layer N+1. Fuse the dSPark mean only at those producer layers.
+            capture_aux = layer.layer_idx + 2 in self.aux_hidden_state_layers
+            hidden_states, pre_mix, aux_hidden_state = layer(
+                positions,
+                hidden_states,
+                pre_mix,
+                None,
+                input_ids=moe_input_ids,
+                capture_aux=capture_aux,
+            )
+            if aux_hidden_state is not None:
+                if use_sequence_parallel:
+                    aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
+                aux_hidden_states.append(aux_hidden_state)
         assert last_layer is not None
         hidden_states = last_layer.hc_collapse(hidden_states, pre_mix)
         if use_sequence_parallel:
