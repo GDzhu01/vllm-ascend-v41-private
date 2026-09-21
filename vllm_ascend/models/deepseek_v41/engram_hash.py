@@ -193,6 +193,29 @@ class PagedNgramHistory:
         self.lookback = layout.max_ngram_size
         self.pages = {}
 
+    def restore_prefix(self, request_states, boundaries, positions, block_table, block_size):
+        """Restore the lookback skipped by a local or transferred prefix hit."""
+        for request, (begin, end) in enumerate(zip(boundaries[:-1].tolist(), boundaries[1:].tolist())):
+            if begin == end:
+                continue
+            start = positions[begin].item()
+            for position in range(max(0, start - self.lookback + 1), start):
+                token_id = request_states[request].get_token_id(position)
+                # Async decode can retain host placeholders; its actual tokens
+                # were already written by this worker's previous forward.
+                if token_id < 0:
+                    continue
+                token = (
+                    -1
+                    if token_id in (self.image_token_id, self.image_pad_token_id)
+                    else self.token_map[token_id].item()
+                )
+                page = block_table[request, position // block_size].item()
+                if page not in self.pages:
+                    self.pages[page] = torch.full((block_size,), -1, dtype=torch.int64, device="cpu")
+                # A reused physical page may still contain another request.
+                self.pages[page][position % block_size] = token
+
     def update(self, input_ids, positions, request_ids, block_table, block_size):
         """All arguments are CPU tensors; page numbers come from full SWA KV."""
         if input_ids.numel() == 0:

@@ -224,6 +224,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.hash_block_size = 128
         worker.num_kv_cache_groups = 1
         worker.cache_coordinator = MagicMock()
+        worker.cache_coordinator.cacheable_group_ids = [0]
         worker.cache_coordinator.lcm_block_size = 128
         worker.cache_coordinator.lookup_mask.return_value = ([True],)
         worker.cache_coordinator.store_mask.return_value = ([False],)
@@ -546,6 +547,7 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         mocks = {}
         for name, p in patches.items():
             mocks[name] = p.start()
+            self.addCleanup(p.stop)
         pcp_group = MagicMock()
         pcp_group.world_size = 1
         mocks["pcp_group"].return_value = pcp_group

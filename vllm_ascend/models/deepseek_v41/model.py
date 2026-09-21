@@ -526,7 +526,7 @@ class DeepseekV41Model(DeepseekV4Model):
                     raise ValueError("Engram gate requires repeated block32 global rotation")
             self.engram_rotation.copy_(block)
 
-    def prepare_engram(self, input_ids, positions):
+    def prepare_engram(self, input_ids, positions, request_states=None):
         """Eager boundary: every DP participates, including metadata-free dummies."""
         config = self.config
         if not get_ascend_config().enable_engram:
@@ -540,10 +540,13 @@ class DeepseekV41Model(DeepseekV4Model):
             meta = metadata[first.prefix]
             boundaries, block_table, block_size = engram_history_metadata(meta)
             n = int(boundaries[-1])
+            positions_cpu = positions[:n].cpu().long()
+            if request_states:
+                self.engram_history.restore_prefix(request_states, boundaries, positions_cpu, block_table, block_size)
             requests = torch.repeat_interleave(torch.arange(len(boundaries) - 1, device="cpu"), boundaries.diff())
             hashes, mask = self.engram_history.update(
                 input_ids[:n].cpu().long(),
-                positions[:n].cpu().long(),
+                positions_cpu,
                 requests,
                 block_table,
                 block_size,
@@ -559,9 +562,9 @@ class DeepseekV41Model(DeepseekV4Model):
             lookups[layer_id] = values.flatten(1)
         return lookups, mask.to(positions.device)
 
-    def prepare_engram_inputs(self, input_ids, positions, padded_tokens=None):
+    def prepare_engram_inputs(self, input_ids, positions, padded_tokens=None, request_states=None):
         """Refresh persistent inputs before main-model capture or replay."""
-        lookups, mask = self.prepare_engram(input_ids, positions)
+        lookups, mask = self.prepare_engram(input_ids, positions, request_states)
         num_tokens = positions.shape[0]
         # The compiled V4.1 backbone uses the scheduler's static token
         # capacity for decode graphs (typically max_num_batched_tokens), even
@@ -684,8 +687,8 @@ class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
     _DEFERRED_WEIGHT_MARKERS = ()
     _DEFERRED_WEIGHT_PREFIXES = ("aligner.", "vision.", "image_", "mtp.")
 
-    def prepare_engram_inputs(self, input_ids, positions, padded_tokens=None):
-        return self.model.prepare_engram_inputs(input_ids, positions, padded_tokens)
+    def prepare_engram_inputs(self, input_ids, positions, padded_tokens=None, request_states=None):
+        return self.model.prepare_engram_inputs(input_ids, positions, padded_tokens, request_states)
 
     def forward(
         self,
