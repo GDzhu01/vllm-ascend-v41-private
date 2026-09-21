@@ -201,12 +201,24 @@ def payload_value(tokens, end, name, plane):
     return (sum(tokens[:end]) + sum(name.encode()) + plane * 11) % 101 + 1
 
 
+@pytest.fixture
+def model_forward():
+    return None
+
+
 @pytest.mark.parametrize("prefix_unit", [None, 32, 128])
 @pytest.mark.parametrize("load_async", [False, True])
 @pytest.mark.parametrize("save_decode_cache", [False, True])
 @pytest.mark.parametrize("kv_role", ["kv_both", "kv_consumer"])
 def test_raw_sequence_lifecycle(
-    cache_layout, devices_and_store, prefix_unit, load_async, speculative_method, save_decode_cache, kv_role
+    cache_layout,
+    devices_and_store,
+    prefix_unit,
+    load_async,
+    speculative_method,
+    save_decode_cache,
+    kv_role,
+    model_forward,
 ):
     plan, allocate = cache_layout
     if len(plan.kv_cache_groups) == 1 and prefix_unit == 32:
@@ -312,6 +324,8 @@ def test_raw_sequence_lifecycle(
                 saw_decode |= start >= len(tokens)
                 # Model-compute leaf: write deterministic CPU bytes to allocated pages.
                 input_tokens = list(request.all_token_ids) + output.scheduled_spec_decode_tokens.get(req_id, [])
+                if model_forward is not None:
+                    model_forward(request, start, end, block_ids, plan, input_tokens)
                 for gid, name, plane, tensor in cache_entries(plan, caches):
                     if not prefix_cacheable(plan.kv_cache_groups[gid].kv_cache_spec):
                         continue

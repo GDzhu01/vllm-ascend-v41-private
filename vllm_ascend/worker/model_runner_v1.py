@@ -2986,7 +2986,8 @@ class NPUModelRunner(GPUModelRunner):
         # or replay; only its persistent BF16 inputs enter the model graph.
         prepare_engram = getattr(self.model, "prepare_engram_inputs", None)
         if prepare_engram is not None:
-            model_inputs.update(prepare_engram(input_ids, positions, num_tokens_padded))
+            request_states = [self.requests[req_id] for req_id in self.input_batch.req_ids]
+            model_inputs.update(prepare_engram(input_ids, positions, num_tokens_padded, request_states))
         run_model = partial(self.model, **model_inputs)
 
         if self.enable_enpu:

@@ -11,11 +11,34 @@ from tests.ut.distributed.ascend_store.test_request_lifecycle import (
     devices_and_store,  # noqa: F401
     test_raw_sequence_lifecycle,  # noqa: F401
 )
+from tests.ut.models.test_engram_prefix import engram_forward  # noqa: F401
 
 
 @pytest.fixture(params=[None, "dspark"], ids=["flash", "flash-dspark"])
 def speculative_method(request):
     return request.param
+
+
+@pytest.fixture
+def model_forward(engram_forward):  # noqa: F811
+    _, forward = engram_forward
+
+    def check(request, start, end, block_ids, plan, input_tokens):
+        group = next(
+            gid
+            for gid, group in enumerate(plan.kv_cache_groups)
+            if "model.layers.0.self_attn.swa_cache" in group.layer_names
+        )
+        forward(
+            request.prompt_token_ids,
+            start,
+            end,
+            block_ids[group],
+            output_tokens=input_tokens[len(request.prompt_token_ids) :],
+            host_outputs=request.output_token_ids,
+        )
+
+    return check
 
 
 @pytest.fixture

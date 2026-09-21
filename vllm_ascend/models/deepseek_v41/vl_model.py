@@ -219,11 +219,12 @@ class AscendDeepseekV41ForConditionalGeneration(
             is_multimodal=is_multimodal,
         )
 
-    def prepare_engram_inputs(self, input_ids, positions, padded_tokens=None):
+    def prepare_engram_inputs(self, input_ids, positions, padded_tokens=None, request_states=None):
         return self.language_model.prepare_engram_inputs(
             input_ids,
             positions,
             padded_tokens,
+            request_states,
         )
 
     def forward(
